@@ -6,6 +6,8 @@
 
 by Dr. Vijay Raghavan
 
+**Repository:** [github.com/vijaygwu/Ship-Scale-and-Govern-Autonomous-Systems](https://github.com/vijaygwu/Ship-Scale-and-Govern-Autonomous-Systems)
+
 ---
 
 ## About This Repository
@@ -62,8 +64,8 @@ book-2/code/
 
 ```bash
 # Clone the repository
-git clone <your-fork-url> agentic-ai-production-code
-cd agentic-ai-production-code
+git clone https://github.com/vijaygwu/Ship-Scale-and-Govern-Autonomous-Systems.git
+cd Ship-Scale-and-Govern-Autonomous-Systems
 
 # Create a virtual environment (Python 3.11+ recommended)
 python3 -m venv .venv
