@@ -849,6 +849,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from typing import Any, Optional
+import hashlib
 import json
 import os
 
@@ -986,7 +987,10 @@ class FeatureFlagManager:
         First backend with a value wins.
         """
         self.backends = backends
+        # Bounded cache prevents unbounded growth across per-user evaluation;
+        # callers needing strict TTL semantics should swap in cachetools.TTLCache.
         self._cache: dict[str, Any] = {}
+        self._cache_max_size = 100_000
     
     def _coerce_value(self, flag: FeatureFlag, raw_value: str) -> Any:
         """Convert string value to appropriate type."""
@@ -1029,10 +1033,20 @@ class FeatureFlagManager:
         
         # Handle percentage rollout
         if flag.flag_type == FlagType.PERCENTAGE and user_id:
-            # Deterministic hash for consistent user experience
-            user_hash = hash(f"{name}:{user_id}") % 100
+            # SHA-256 instead of builtin hash() because Python randomizes
+            # hash() per process (PYTHONHASHSEED), which would land the same
+            # user in different rollout buckets across replicas/restarts.
+            digest = hashlib.sha256(f"{name}:{user_id}".encode()).hexdigest()
+            user_hash = int(digest[:8], 16) % 100
             value = user_hash < value
         
+        # Evict an arbitrary entry once over the bound (simple FIFO via
+        # iteration order; replace with TTLCache if eviction policy matters).
+        if len(self._cache) >= self._cache_max_size:
+            try:
+                self._cache.pop(next(iter(self._cache)))
+            except StopIteration:
+                pass
         self._cache[cache_key] = value
         return value
     

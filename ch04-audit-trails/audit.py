@@ -315,7 +315,10 @@ class FileSink(AuditSink):
         
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         filename = f"{self._base_path}/audit_{timestamp}_{self._file_counter}.jsonl"
-        self._current_file = open(filename, "a")
+        # Explicit UTF-8 encoding (the audit log carries JSON with potentially
+        # non-ASCII PII); line buffering so each event is durable on flush even
+        # if the writer dies mid-buffer.
+        self._current_file = open(filename, "a", encoding="utf-8", buffering=1)
         self._current_size = 0
         self._file_counter += 1
     
@@ -918,7 +921,10 @@ from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
-from audit_logger import AuditSession, EventType, Severity
+# AuditSession, EventType, Severity are defined earlier in this same module
+# (Block 1 and Block 2). Earlier drafts imported them from a hypothetical
+# separate `audit_logger` package; that import is dropped here because the
+# symbols are already in scope when the chapter file is run end-to-end.
 
 
 class ReasoningStepType(Enum):
@@ -1318,10 +1324,14 @@ class IntegrityVerifier:
     
     def _calculate_event_hash(self, event: dict[str, Any]) -> str:
         """Calculate hash for an event."""
-        # Create copy without the event_hash field
+        # Match the writer's canonical serialization exactly: sorted keys and
+        # the same compact separators used by AuditLogger._create_event.
+        # Any drift here makes verification produce false-positive mismatches.
         event_copy = json.loads(json.dumps(event))
         event_copy["integrity"]["event_hash"] = ""
-        event_json = json.dumps(event_copy, sort_keys=True, default=str)
+        event_json = json.dumps(
+            event_copy, sort_keys=True, separators=(",", ":"), default=str
+        )
         return hashlib.sha256(event_json.encode()).hexdigest()
 
 
@@ -1376,7 +1386,7 @@ class PeriodicCheckpointer:
         """Create an integrity checkpoint."""
         checkpoint = {
             "checkpoint_type": "audit_integrity",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "sequence_num": sequence_num,
             "event_hash": event_hash,
             "previous_checkpoint_hash": self._last_checkpoint_hash,
@@ -1476,15 +1486,15 @@ class TimeRange:
     
     @classmethod
     def last_hours(cls, hours: int) -> TimeRange:
-        """Create a time range for the last N hours."""
-        end = datetime.now()
+        """Create a time range for the last N hours (UTC)."""
+        end = datetime.now(timezone.utc)
         start = end - timedelta(hours=hours)
         return cls(start=start, end=end)
-    
+
     @classmethod
     def last_days(cls, days: int) -> TimeRange:
-        """Create a time range for the last N days."""
-        end = datetime.now()
+        """Create a time range for the last N days (UTC)."""
+        end = datetime.now(timezone.utc)
         start = end - timedelta(days=days)
         return cls(start=start, end=end)
 
@@ -1794,10 +1804,19 @@ class ComplianceReporter:
         }
 
 # ============================================================================
-# Block 9 (chapter listing #9)
+# Block 9, 10, 11 (chapter listings, illustrative usage)
 # ============================================================================
+#
+# The three usage examples below appear in the chapter to show how an
+# AuditQuery API might be invoked. They reference a hypothetical richer
+# surface (.add_condition / .set_time_range with an external `storage`
+# binding) than the runnable AuditQuery class above (which exposes .where).
+# They are preserved here as a module-level docstring so this file stays
+# importable; readers should treat them as pseudocode and adapt them to
+# the actual AuditQuery surface in their own integration.
 
-# Find all audit events involving a specific customer
+_ILLUSTRATIVE_AUDITQUERY_USAGE = r"""
+# Block 9, find all audit events involving a specific customer
 query = AuditQuery()
 query.add_condition(QueryCondition(
     field="actor.id",
@@ -1805,16 +1824,12 @@ query.add_condition(QueryCondition(
     value="customer_12345"
 ))
 query.set_time_range(
-    start=datetime(2024, 1, 1),
-    end=datetime.now()
+    start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    end=datetime.now(timezone.utc),
 )
 customer_events = list(query.execute(storage))
 
-# ============================================================================
-# Block 10 (chapter listing #10)
-# ============================================================================
-
-# Find all access events to PII-tagged resources in Q1
+# Block 10, find all access events to PII-tagged resources in Q1
 query = AuditQuery()
 query.add_condition(QueryCondition(
     field="event_type",
@@ -1832,11 +1847,7 @@ query.set_time_range(
 )
 pii_access_events = list(query.execute(storage))
 
-# ============================================================================
-# Block 11 (chapter listing #11)
-# ============================================================================
-
-# Verify deletion was logged for compliance evidence
+# Block 11, verify deletion was logged for compliance evidence
 query = AuditQuery()
 query.add_condition(QueryCondition(
     field="event_type",
@@ -1850,3 +1861,4 @@ query.add_condition(QueryCondition(
 ))
 deletion_proof = list(query.execute(storage))
 # This provides auditable evidence that erasure was performed
+"""

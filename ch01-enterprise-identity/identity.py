@@ -184,9 +184,12 @@ Code Navigation (line numbers are approximate):
 
 import asyncio
 import hashlib
+import hmac
 import json
+import os
 import secrets
 import uuid
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -905,16 +908,25 @@ class AgentIdentityService:
             metadata={"purpose": "jwt_signing"}
         )
         
-        # For HS256, we need a symmetric secret.
-        # IMPORTANT: In production, load JWT_SECRET from environment variable
-        # or secrets manager. (Imports os/warnings are at module top.)
-        # secrets.token_urlsafe(32) yields ~256 bits of entropy, matching HS256's
-        # hash size; the 'DEMO_ONLY_' prefix is a deployment guard, not entropy.
-        self._jwt_secret = os.environ.get(
-            "JWT_SECRET", "DEMO_ONLY_" + secrets.token_urlsafe(32)
-        )
-        if self._jwt_secret.startswith("DEMO_ONLY_"):
-            warnings.warn("Using generated demo secret. Set JWT_SECRET env var in production.")
+        # For HS256, we need a symmetric secret shared by every replica that
+        # will verify tokens. A per-process random fallback would silently
+        # break verification across restarts and across replicas, so refuse to
+        # start without an explicit secret in production. Local development
+        # may opt in to a generated secret via ENVIRONMENT=development.
+        secret = os.environ.get("JWT_SECRET")
+        if not secret:
+            env = os.environ.get("ENVIRONMENT", "production").lower()
+            if env == "production":
+                raise RuntimeError(
+                    "JWT_SECRET must be set in production; a per-process "
+                    "fallback would break token verification across replicas."
+                )
+            secret = "DEMO_ONLY_" + secrets.token_urlsafe(32)
+            warnings.warn(
+                "Using generated demo JWT secret (ENVIRONMENT=" + env + "). "
+                "Set JWT_SECRET before going to production."
+            )
+        self._jwt_secret = secret
     
     # -------------------------------------------------------
     # Identity Lifecycle
@@ -1188,12 +1200,19 @@ class AgentIdentityService:
         
         token = jwt.encode(payload, self._jwt_secret, algorithm="HS256")
         
-        # Store credential record
+        # Store credential record. Use HMAC keyed on _jwt_secret instead of a
+        # bare SHA-256 so that a leak of the credential table alone does not
+        # let an attacker precompute hashes of stolen tokens; the verifier
+        # uses hmac.compare_digest to avoid timing leaks during lookup.
         credential = Credential(
             credential_id=token_id,
             agent_id=identity.agent_id,
             credential_type="jwt",
-            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            token_hash=hmac.new(
+                self._jwt_secret.encode(),
+                token.encode(),
+                hashlib.sha256,
+            ).hexdigest(),
             scopes=[s.value for s in (scopes or identity.permissions)],
             issued_at=now,
             expires_at=expires_at,

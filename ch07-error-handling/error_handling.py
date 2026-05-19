@@ -33,9 +33,10 @@ class ErrorCategory(Enum):
     TOOL_FAILURE = auto()        # A tool/integration returned an error
     TIMEOUT = auto()             # Wall-clock deadline exceeded
     VALIDATION = auto()          # Input failed schema validation
-    OUTPUT_VALIDATION = auto()   # Model output failed schema/safety validation;
-                                 # recover by reprompting with the validator
-                                 # error as feedback (retry-with-feedback).
+    # OUTPUT_VALIDATION: model output failed schema/safety validation;
+    # recover by reprompting with the validator error as feedback
+    # (retry-with-feedback).
+    OUTPUT_VALIDATION = auto()
     STATE_ERROR = auto()
     RESOURCE_ERROR = auto()
     UNKNOWN = auto()
@@ -398,8 +399,10 @@ class RetryPolicy:
                         f"Non-retryable error in {component}: {agent_error.message}",
                         extra={"error": agent_error.to_dict()}
                     )
-                    if agent_error.original_exception is not None:
-                        raise agent_error.original_exception from e
+                    # Re-raise the in-flight exception so the original
+                    # traceback is preserved. Re-raising `original_exception
+                    # from e` would self-reference (e IS that exception) and
+                    # build a malformed __cause__ chain.
                     raise
                 
                 delay = self.get_delay(attempt)
@@ -521,6 +524,74 @@ tool_retry_policy = RetryPolicy(
 @with_retry(policy=llm_retry_policy)
 async def generate_response(prompt: str) -> str:
     return await llm_client.complete(prompt)
+
+
+# Block 3b: RetryBudget primitive (gRPC-style retry-storm guard).
+# Shared across all RetryPolicy instances targeting the same downstream
+# dependency. See chapter section "Bounding Retries Globally: The Retry
+# Budget" for the motivation.
+from collections import deque
+import time as _time
+import threading as _threading
+
+
+@dataclass
+class RetryBudget:
+    """Rolling-window guard that caps the fraction of recent calls that
+    may be retries. When the budget is exhausted, retries are suppressed
+    and the caller surfaces the original failure instead of piling more
+    load on a struggling downstream.
+    """
+    retry_ratio: float = 0.10
+    window_seconds: float = 10.0
+    min_calls_per_window: int = 10
+
+    _calls: deque = field(default_factory=lambda: deque())
+    _retries: deque = field(default_factory=lambda: deque())
+    _lock: _threading.Lock = field(default_factory=_threading.Lock)
+
+    def record_call(self) -> None:
+        with self._lock:
+            now = _time.monotonic()
+            self._calls.append(now)
+            self._evict(now)
+
+    def can_retry(self) -> bool:
+        with self._lock:
+            now = _time.monotonic()
+            self._evict(now)
+            n_calls = len(self._calls)
+            if n_calls < self.min_calls_per_window:
+                return True
+            return len(self._retries) < self.retry_ratio * n_calls
+
+    def record_retry(self) -> None:
+        with self._lock:
+            now = _time.monotonic()
+            self._retries.append(now)
+            self._evict(now)
+
+    def _evict(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self._calls and self._calls[0] < cutoff:
+            self._calls.popleft()
+        while self._retries and self._retries[0] < cutoff:
+            self._retries.popleft()
+
+    def get_metrics(self) -> dict:
+        with self._lock:
+            n_calls = len(self._calls)
+            n_retries = len(self._retries)
+            ratio = n_retries / n_calls if n_calls else 0.0
+            return {
+                "calls_in_window": n_calls,
+                "retries_in_window": n_retries,
+                "retry_ratio": ratio,
+                "budget_remaining": max(
+                    0.0, self.retry_ratio * n_calls - n_retries
+                ),
+            }
+
 
 # ============================================================================
 # Block 4 (chapter listing #4)

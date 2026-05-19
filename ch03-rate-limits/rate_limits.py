@@ -186,6 +186,15 @@ class TokenBucket:
         with self._lock:
             self._tokens = min(self.capacity, self._tokens + tokens)
 
+    def adjust(self, delta: int) -> None:
+        """
+        Adjust the bucket's available tokens by `delta` (positive or negative),
+        clamped to [0, capacity]. Takes the bucket's own lock so callers do
+        not have to reach across the bucket boundary.
+        """
+        with self._lock:
+            self._tokens = max(0.0, min(float(self.capacity), self._tokens + delta))
+
 
 @dataclass
 class TokenRateLimiter:
@@ -309,11 +318,13 @@ class TokenRateLimiter:
         with self._lock:
             input_diff = actual_input - estimated_input
             output_diff = actual_output - estimated_output
-            
-            # Adjust buckets (may go negative temporarily if we underestimated)
-            self._input_bucket._tokens -= input_diff
-            self._output_bucket._tokens -= output_diff
-            self._total_bucket._tokens -= (input_diff + output_diff)
+
+            # Reconcile against each bucket through its own lock; underestimates
+            # subtract more tokens (delta<0), overestimates refund them. Each
+            # bucket clamps to [0, capacity].
+            self._input_bucket.adjust(-input_diff)
+            self._output_bucket.adjust(-output_diff)
+            self._total_bucket.adjust(-(input_diff + output_diff))
     
     def get_usage_stats(self, window_seconds: float = 60.0) -> Dict:
         """Return usage statistics for the specified time window."""
@@ -342,6 +353,17 @@ class TokenRateLimiter:
             ),
             "request_count": len(recent)
         }
+
+    def refund(self, input_tokens: int, output_tokens: int) -> None:
+        """
+        Return tokens to all internal buckets. Used by HierarchicalRateLimiter
+        to roll back partial acquisitions when a downstream limit fails. Each
+        bucket clamps to its own capacity through its own lock.
+        """
+        with self._lock:
+            self._input_bucket.refund(input_tokens)
+            self._output_bucket.refund(output_tokens)
+            self._total_bucket.refund(input_tokens + output_tokens)
 
 # ============================================================================
 # Block 3 (chapter listing #3)
@@ -729,7 +751,9 @@ class BudgetManager:
     alert_callback: Optional[Callable[[str, Dict], None]] = None
     
     _budgets: Dict[str, Budget] = field(default_factory=dict)
-    _spending_history: List[Dict] = field(default_factory=list)
+    # Bounded so a high-traffic gateway cannot OOM on history growth; the
+    # alerting / projection paths only need recent samples.
+    _spending_history: deque = field(default_factory=lambda: deque(maxlen=10_000))
     _lock: threading.Lock = field(default_factory=threading.Lock)
     
     # Alert thresholds (percentage of budget)

@@ -527,27 +527,56 @@ def test_tool_selection_is_stable(queries: list[str]):
 """
 Unit tests for agent decision-making logic.
 """
+import ast
+import operator
 import pytest
 from src.testing.mock_llm import MockLLM, MockLLMBuilder, MockResponse, MockToolCall
 from src.agent import Agent, AgentConfig
 from src.tools import ToolRegistry
 
 
+# Whitelisted arithmetic operators for the calculator fixture. Using a
+# tiny AST walker instead of eval() keeps the fixture safe even when test
+# inputs come from cassettes, captured prompts, or hypothesis strategies.
+_SAFE_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.Mod: operator.mod, ast.Pow: operator.pow,
+    ast.USub: operator.neg, ast.UAdd: operator.pos,
+}
+
+
+def _safe_arith(node: ast.AST) -> float:
+    """Evaluate a numeric arithmetic expression AST. Raises ValueError on
+    any node not in the whitelist (names, calls, attribute access, etc.)."""
+    if isinstance(node, ast.Expression):
+        return _safe_arith(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](
+            _safe_arith(node.left), _safe_arith(node.right)
+        )
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](_safe_arith(node.operand))
+    raise ValueError(f"unsupported expression: {ast.dump(node)}")
+
+
 @pytest.fixture
 def tool_registry() -> ToolRegistry:
     """Create a registry with mock tools."""
     registry = ToolRegistry()
-    
+
     @registry.register("search")
     def search(query: str) -> str:
         """Search for information."""
         return f"Results for: {query}"
-    
+
     @registry.register("calculate")
     def calculate(expression: str) -> str:
-        """Evaluate a mathematical expression."""
-        return str(eval(expression))  # Safe in tests only
-    
+        """Evaluate a numeric arithmetic expression (safe AST walker)."""
+        return str(_safe_arith(ast.parse(expression, mode="eval")))
+
     return registry
 
 
