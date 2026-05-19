@@ -147,14 +147,23 @@ def lambda_handler(event: dict, context: Any) -> dict:
         router = InquiryRouter(_get_anthropic_client())
         result = router.route(inquiry, customer_tier)
 
-        # Record metrics for monitoring
-        _get_metrics_table().put_item(Item={
-            "request_id": context.aws_request_id,
-            "customer_id": customer_id,
-            "department": result["department"],
-            "priority": result["priority"],
-            "remaining_time_ms": context.get_remaining_time_in_millis()
-        })
+        # Record metrics for monitoring. Best-effort: a slow or unavailable
+        # DynamoDB endpoint must not extend Lambda duration or fail the
+        # routing response that has already been computed. We log and
+        # proceed; the metrics gap will surface in the dashboards.
+        try:
+            _get_metrics_table().put_item(Item={
+                "request_id": context.aws_request_id,
+                "customer_id": customer_id,
+                "department": result["department"],
+                "priority": result["priority"],
+                "remaining_time_ms": context.get_remaining_time_in_millis()
+            })
+        except Exception as metrics_err:
+            logger.warning(
+                "Metrics write failed for request %s: %s",
+                context.aws_request_id, metrics_err,
+            )
         
         return {
             "statusCode": 200,
