@@ -1250,39 +1250,46 @@ class FallbackChain(Generic[T]):
 # Example: Setting up a production fallback chain for LLM calls
 
 async def create_production_fallback_chain() -> FallbackChain[str]:
-    """Create a production-ready fallback chain for LLM requests."""
-    
+    """Create an example fallback chain for LLM requests. Substitute your
+    current model tier (PRIMARY_MODEL / SECONDARY_MODEL) at deployment time
+    as Anthropic releases new generations; the structure below is what
+    survives a model rename, not the specific identifiers."""
+
+    # Adjust the literal model IDs below as the model family evolves.
+    PRIMARY_MODEL = "claude-sonnet-4-6"   # higher quality, primary path
+    SECONDARY_MODEL = "claude-haiku-4-5"  # faster, cheaper fallback
+
     registry = CircuitBreakerRegistry()
-    
-    # Primary: Claude 3 Opus
+
+    # Primary: higher-quality model
     primary_circuit = registry.register(
-        "claude_opus",
+        "llm_primary",
         CircuitBreakerConfig(
             failure_threshold=3,
             timeout=timedelta(seconds=30)
         )
     )
-    
-    # Secondary: Claude 3 Haiku (faster, cheaper)
+
+    # Secondary: faster, cheaper model
     secondary_circuit = registry.register(
-        "claude_haiku",
+        "llm_secondary",
         CircuitBreakerConfig(
             failure_threshold=5,
             timeout=timedelta(seconds=20)
         )
     )
-    
+
     providers = [
         LLMProvider(
             provider_name="anthropic",
-            model="claude-3-opus-20240229",
+            model=PRIMARY_MODEL,
             client=anthropic_client,
             _priority=0,
             circuit_breaker=primary_circuit
         ),
         LLMProvider(
             provider_name="anthropic",
-            model="claude-3-haiku-20240307",
+            model=SECONDARY_MODEL,
             client=anthropic_client,
             _priority=10,
             circuit_breaker=secondary_circuit

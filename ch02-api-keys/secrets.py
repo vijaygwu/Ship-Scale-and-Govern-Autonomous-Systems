@@ -289,9 +289,14 @@ class HashiCorpVaultProvider(SecretBackendProvider):
         with self._lock:
             # Check if we need to re-authenticate
             if self._client is None or self._is_token_expired():
+                # Explicit (connect, read) timeouts so a hung Vault doesn't
+                # freeze the calling agent; 5s connect / 10s read fits typical
+                # WAN deployments. Raise for high-latency network paths and
+                # tune in conjunction with the retry policy below.
                 self._client = hvac.Client(
                     url=self._vault_addr,
-                    namespace=self._namespace
+                    namespace=self._namespace,
+                    timeout=(5, 10),
                 )
                 
                 # Authenticate with AppRole
@@ -440,17 +445,28 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
         """Get or create a Secrets Manager client."""
         if self._client is None:
             import boto3
-            
-            kwargs = {'region_name': self._region_name}
-            
+            from botocore.config import Config
+
+            # Explicit timeouts and retry policy: a hung AWS endpoint
+            # would otherwise hold up every secret-read on the agent.
+            # 'adaptive' retry mode honors throttling responses with
+            # exponential backoff plus jitter.
+            client_config = Config(
+                connect_timeout=5,
+                read_timeout=10,
+                retries={"max_attempts": 3, "mode": "adaptive"},
+            )
+
+            kwargs = {"region_name": self._region_name, "config": client_config}
+
             # Only use explicit credentials if provided
             # Otherwise, rely on IAM role or environment
             if self._aws_access_key_id and self._aws_secret_access_key:
                 kwargs['aws_access_key_id'] = self._aws_access_key_id
                 kwargs['aws_secret_access_key'] = self._aws_secret_access_key
-                
+
             self._client = boto3.client('secretsmanager', **kwargs)
-            
+
         return self._client
         
     def get_secret(self, secret_id: str, version: Optional[str] = None) -> tuple[str, SecretMetadata]:
@@ -498,13 +514,22 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
             # Trigger the rotation Lambda
             client.rotate_secret(SecretId=secret_id)
             
-            # Wait for rotation to complete (with timeout)
-            max_attempts = 30
-            for _ in range(max_attempts):
+            # Wait for rotation to complete with exponential backoff + jitter
+            # so a flaky describe_secret endpoint does not get hammered by a
+            # tight 1-second poll loop. Total budget is roughly the same
+            # (~30s worst case) but the backoff distributes load.
+            import random
+            max_attempts = 8
+            base_delay = 0.5
+            cap = 8.0
+            for attempt in range(max_attempts):
                 response = client.describe_secret(SecretId=secret_id)
                 if not response.get('RotationInProgress', False):
                     break
-                time.sleep(1)
+                # Exponential backoff: 0.5, 1, 2, 4, 8, 8, 8, 8 seconds
+                # with full jitter per the AWS exponential-backoff guidance.
+                delay = min(cap, base_delay * (2 ** attempt))
+                time.sleep(random.uniform(0, delay))
             else:
                 raise SecretRotationError(
                     f"Rotation timeout for secret {secret_id}"

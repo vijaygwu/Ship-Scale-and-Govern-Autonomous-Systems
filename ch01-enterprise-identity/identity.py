@@ -569,7 +569,16 @@ class KeyVault:
         key_size: int = 2048,
         metadata: Optional[dict] = None
     ) -> rsa.RSAPublicKey:
-        """Generate and store a new key pair, return public key."""
+        """Generate and store a new RSA key pair, return the public key.
+
+        These keypairs serve two purposes in the wider identity service:
+          (a) signing X.509 agent certificates (the dominant use in this
+              chapter; see CertificateAuthority below), and
+          (b) signing higher-trust delegation tokens via
+              DelegationToken.to_jwt (RS256 path).
+        They are deliberately NOT used to sign regular agent JWTs, which
+        take the HS256 self-contained path explained in the chapter prose.
+        """
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=key_size,
@@ -1198,6 +1207,13 @@ class AgentIdentityService:
             "aud": "agent-platform"
         }
         
+        # Agent-issued JWTs use HS256 here (shared secret, single-issuer
+        # path) to keep the example self-contained, as the chapter prose
+        # on HS256 vs RS256 explains. The separate higher-trust delegation
+        # tokens (DelegationToken.to_jwt above) sign with RS256 using a
+        # KeyVault keypair. The RSA generation in KeyVault.generate_key_pair
+        # supports both X.509 certificate issuance and delegation-token
+        # signing; it is intentionally not wired into this regular JWT path.
         token = jwt.encode(payload, self._jwt_secret, algorithm="HS256")
         
         # Store credential record. Use HMAC keyed on _jwt_secret instead of a
