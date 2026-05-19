@@ -141,6 +141,7 @@ Mock LLM implementation for deterministic agent testing.
 
 import json
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Literal
 from collections.abc import Sequence
@@ -217,11 +218,14 @@ class MockLLM:
         # Second call returns a tool call
     """
     
-    def __init__(self) -> None:
+    def __init__(self, max_history: int = 1000) -> None:
         self._responses: list[MockResponse] = []
         self._pattern_responses: list[tuple[re.Pattern, MockResponse | Callable]] = []
         self._call_index: int = 0
-        self._call_history: list[dict[str, Any]] = []
+        # Bounded so long-running property-based / hypothesis tests don't
+        # accumulate unbounded call records. Default fits typical pytest
+        # suites; raise it for replay-heavy integration runs.
+        self._call_history: deque[dict[str, Any]] = deque(maxlen=max_history)
         self._default_response: MockResponse | None = None
         self._should_stream: bool = False
         self._error_on_call: int | None = None

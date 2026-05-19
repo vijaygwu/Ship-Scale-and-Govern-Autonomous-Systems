@@ -36,9 +36,40 @@ from anthropic import Anthropic
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-anthropic_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-dynamodb = boto3.resource("dynamodb")
-metrics_table = dynamodb.Table(os.environ["METRICS_TABLE"])
+
+# Lazy-initialized resources. We deliberately avoid touching
+# os.environ["ANTHROPIC_API_KEY"] at module import time: a missing env var
+# would otherwise crash the Lambda cold-start before logger emits anything,
+# leaving the operator with an opaque init failure. Instead we surface a
+# clean RuntimeError on the first call so CloudWatch shows the cause.
+_anthropic_client: Anthropic | None = None
+_metrics_table = None
+
+
+def _get_anthropic_client() -> Anthropic:
+    """Return a process-cached Anthropic client; raise if API key missing."""
+    global _anthropic_client
+    if _anthropic_client is None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is not set; the Lambda must be deployed "
+                "with this environment variable bound to a Secrets Manager "
+                "reference or KMS-encrypted parameter."
+            )
+        _anthropic_client = Anthropic(api_key=api_key)
+    return _anthropic_client
+
+
+def _get_metrics_table():
+    """Return the DynamoDB metrics table, lazy-initialized on first call."""
+    global _metrics_table
+    if _metrics_table is None:
+        table_name = os.environ.get("METRICS_TABLE")
+        if not table_name:
+            raise RuntimeError("METRICS_TABLE env var is not set.")
+        _metrics_table = boto3.resource("dynamodb").Table(table_name)
+    return _metrics_table
 
 
 class InquiryRouter:
@@ -113,11 +144,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
         customer_id = event["customer_id"]
         customer_tier = event.get("customer_tier", "standard")
         
-        router = InquiryRouter(anthropic_client)
+        router = InquiryRouter(_get_anthropic_client())
         result = router.route(inquiry, customer_tier)
-        
+
         # Record metrics for monitoring
-        metrics_table.put_item(Item={
+        _get_metrics_table().put_item(Item={
             "request_id": context.aws_request_id,
             "customer_id": customer_id,
             "department": result["department"],
@@ -139,7 +170,10 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "body": json.dumps({"error": f"Missing required field: {e}"})
         }
     except Exception as e:
-        # Log full traceback for debugging; return a safe, generic message.
+        # Outer safety net at the Lambda boundary: any unhandled exception
+        # is logged with full traceback and reported to the caller as a
+        # generic 500. The broad catch is deliberate; without it the
+        # runtime would surface internal stack frames to the API caller.
         logger.exception("Error processing request")
         return {
             "statusCode": 500,
