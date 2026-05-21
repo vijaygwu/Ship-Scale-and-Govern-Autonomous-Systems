@@ -298,6 +298,8 @@ class DecorrelatedJitter(BackoffStrategy):
         self.max_delay = max_delay
         # Per-thread state so that concurrent retry sequences do not
         # share _previous_delay through the same instance.
+        # NOTE: threading.local is sync-only; for asyncio use cases, a
+        # contextvars-based variant is recommended.
         self._local = threading.local()
 
     def calculate_delay(self, attempt: int, base_delay: float) -> float:
@@ -546,8 +548,10 @@ class RetryBudget:
     window_seconds: float = 10.0
     min_calls_per_window: int = 10
 
-    _calls: deque = field(default_factory=lambda: deque())
-    _retries: deque = field(default_factory=lambda: deque())
+    # Belt-and-suspenders: cap deque length to bound memory even if the
+    # time-window eviction logic ever fails to keep up under bursty load.
+    _calls: deque = field(default_factory=lambda: deque(maxlen=10_000))
+    _retries: deque = field(default_factory=lambda: deque(maxlen=10_000))
     _lock: _threading.Lock = field(default_factory=_threading.Lock)
 
     def record_call(self) -> None:

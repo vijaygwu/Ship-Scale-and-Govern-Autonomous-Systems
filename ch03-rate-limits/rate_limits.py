@@ -216,6 +216,10 @@ class TokenRateLimiter:
     _output_bucket: TokenBucket = field(init=False)
     _total_bucket: TokenBucket = field(init=False)
     _usage_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+    # Counter incremented whenever the bounded _usage_history evicts an
+    # oldest entry; callers can read this for observability (e.g. emit
+    # as a "rate_limiter.usage_history_dropped" gauge).
+    _usage_history_dropped: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
     
     def __post_init__(self):
@@ -291,7 +295,9 @@ class TokenRateLimiter:
                 self._output_bucket.refund(output_tokens)
                 return False, "Total token limit exceeded"
             
-            # Record usage
+            # Record usage; track FIFO evictions for observability.
+            if len(self._usage_history) == self._usage_history.maxlen:
+                self._usage_history_dropped += 1
             self._usage_history.append({
                 "timestamp": time.time(),
                 "input_tokens": input_tokens,
@@ -1404,7 +1410,7 @@ class GracefulDegradationManager:
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Callable
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+from collections import defaultdict, deque
 import threading
 import json
 import logging
@@ -1452,11 +1458,18 @@ class CostTracker:
         default_factory=lambda: STANDARD_PRICING.copy()
     )
     retention_hours: int = 168  # 7 days
-    
-    _events: List[CostEvent] = field(default_factory=list)
+    # Hard cap on retained cost events to bound memory growth in
+    # long-running trackers. Oldest events are dropped FIFO once the
+    # cap is reached.
+    max_cost_events: int = 100_000
+
+    _events: "deque[CostEvent]" = field(init=False)
     _aggregations: Dict[str, CostAggregation] = field(default_factory=dict)
     _subscribers: List[Callable[[CostEvent], None]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        self._events = deque(maxlen=self.max_cost_events)
     
     def record(
         self,
@@ -1546,7 +1559,12 @@ class CostTracker:
     def _cleanup_old_events(self) -> None:
         """Remove events older than retention period."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self.retention_hours)
-        self._events = [e for e in self._events if e.timestamp >= cutoff]
+        # Rebuild as a deque with the same maxlen so the bounded-memory
+        # guarantee from __post_init__ survives cleanup.
+        self._events = deque(
+            (e for e in self._events if e.timestamp >= cutoff),
+            maxlen=self.max_cost_events,
+        )
     
     def subscribe(self, callback: Callable[[CostEvent], None]) -> None:
         """Subscribe to real-time cost events."""

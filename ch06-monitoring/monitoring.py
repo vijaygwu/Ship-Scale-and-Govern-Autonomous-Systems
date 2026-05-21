@@ -426,6 +426,7 @@ class TokenBudget:
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from contextvars import ContextVar
+from collections import OrderedDict
 import uuid
 import time
 
@@ -554,11 +555,20 @@ R = TypeVar('R')
 
 class AgentTracer:
     """Tracer implementation for multi-agent systems."""
-    
-    def __init__(self, service_name: str, exporter: Optional[Callable[[Span], None]] = None):
+
+    def __init__(
+        self,
+        service_name: str,
+        exporter: Optional[Callable[[Span], None]] = None,
+        config: Optional[dict[str, Any]] = None,
+    ):
         self.service_name = service_name
         self.exporter = exporter or self._default_exporter
-        self._active_spans: dict[str, Span] = {}
+        # TODO: bound with OrderedDict + max_active_spans config to
+        # prevent orphaned-span leak in long-running tracers
+        config = config or {}
+        self._max_active_spans: int = config.get("max_active_spans", 10_000)
+        self._active_spans: "OrderedDict[str, Span]" = OrderedDict()
     
     def _default_exporter(self, span: Span) -> None:
         """Default exporter that prints spans (replace with real exporter)."""
@@ -586,7 +596,12 @@ class AgentTracer:
             attributes=attributes or {}
         )
         span.set_attribute("service.name", self.service_name)
-        
+
+        # Simple LRU-style eviction: drop the oldest active span when the
+        # bound is reached. Protects long-running tracers from unbounded
+        # growth if callers forget to end_span.
+        if len(self._active_spans) >= self._max_active_spans:
+            self._active_spans.popitem(last=False)
         self._active_spans[context.span_id] = span
         _current_span.set(context)
         
@@ -1218,9 +1233,12 @@ from typing import Any, Optional, Callable
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from collections import deque
+import logging
 import threading
 import time
 import statistics
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -1456,19 +1474,20 @@ class AgentMetrics:
                 self.prometheus.record_model_call(
                     model, self.agent_id, latency_seconds, True
                 )
-                
-        except Exception:
+
+        except Exception as exc:
             latency_seconds = time.perf_counter() - start_time
-            
+            logger.error("metric record failed", exc_info=True)
+
             with self._lock:
                 self._model_calls += 1
                 self._model_results.append(False)
-            
+
             if self.prometheus:
                 self.prometheus.record_model_call(
                     model, self.agent_id, latency_seconds, False
                 )
-            
+
             raise
     
     def record_cost(self, cost_usd: float, model: str, task_type: str) -> None:

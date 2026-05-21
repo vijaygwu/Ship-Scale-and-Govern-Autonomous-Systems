@@ -77,6 +77,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Optional
+import botocore.exceptions
 import hashlib
 import json
 import logging
@@ -536,8 +537,8 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
                 )
             
             return self.get_secret(secret_id)
-            
-        except Exception as e:
+
+        except botocore.exceptions.ClientError as e:
             raise SecretRotationError(f"Failed to rotate {secret_id}: {e}") from e
             
     def revoke_secret(self, secret_id: str, version: Optional[str] = None) -> None:
@@ -1000,7 +1001,9 @@ class SecretManager:
         # Clear all cached secrets from memory
         with self._cache_lock:
             for cached in self._cache.values():
-                # Overwrite secret value before clearing
+                # Overwrite secret value before clearing.
+                # NOTE: Python string immutability means this is BEST-EFFORT
+                # illustrative; use bytearray for true memory wipe.
                 cached.value = "0" * len(cached.value)
             self._cache.clear()
 

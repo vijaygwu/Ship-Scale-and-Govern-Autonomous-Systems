@@ -284,7 +284,9 @@ class MockLLM:
     @property
     def call_history(self) -> list[dict[str, Any]]:
         """History of all calls made to this mock."""
-        return self._call_history.copy()
+        # Return a list (not a deque) so the runtime type matches the
+        # declared annotation and callers can rely on list semantics.
+        return list(self._call_history)
     
     def get_last_call(self) -> dict[str, Any] | None:
         """Get the most recent call, if any."""
@@ -1061,12 +1063,15 @@ Test harness for end-to-end agent testing.
 """
 
 
+import logging
 import time
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 from pathlib import Path
 import yaml
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # `Agent` is the user-supplied agent class; import here so type
@@ -1219,6 +1224,9 @@ class AgentTestHarness:
                 outcome_results.append((outcome, passed))
             
         except Exception as e:
+            # Preserve the stack trace for postmortem analysis BEFORE we
+            # collapse it into the TestResult.error record below.
+            logger.exception("scenario failed: %s", scenario.name)
             error = e
         finally:
             if scenario.teardown:
