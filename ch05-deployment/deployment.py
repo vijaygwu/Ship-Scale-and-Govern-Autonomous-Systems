@@ -962,6 +962,21 @@ class RedisBackend(FlagBackend):
         key = f"{self.prefix}{name}"
         self.client.set(key, json.dumps(value) if isinstance(value, (dict, list)) else str(value))
 
+    def close(self) -> None:
+        """Release the underlying Redis connection pool."""
+        client = getattr(self, "client", None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                # Closing on shutdown should never raise.
+                pass
+            self.client = None
+
+    def __del__(self) -> None:
+        # Best-effort cleanup if callers forget to call close() explicitly.
+        self.close()
+
 
 class LaunchDarklyBackend(FlagBackend):
     """Feature flags from LaunchDarkly service."""

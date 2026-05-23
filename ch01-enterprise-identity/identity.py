@@ -15,6 +15,16 @@ To use a particular class or function, copy it into your own project and
 provide the surrounding context (imports, dependencies) as needed.
 """
 
+# Module-level imports needed by listings that appear before Block 5's
+# import section (e.g., the @dataclass decorator on DelegationToken in
+# Block 4 evaluates its `datetime` annotations at class-creation time,
+# and CertificateAuthority calls `logger.warning` inside Block 5).
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # Block 1 (chapter listing #1)
@@ -2121,7 +2131,7 @@ class GracefulRotation:
 # ============================================================================
 
 @dataclass
-class AuditEvent:
+class IdentityAuditEvent:
     """
     Comprehensive audit event structure.
     
@@ -2177,10 +2187,10 @@ class ComplianceAuditStore:
     """
     
     def __init__(self):
-        self._events: list[tuple[str, AuditEvent]] = []  # (hash, event)
+        self._events: list[tuple[str, IdentityAuditEvent]] = []  # (hash, event)
         self._last_hash: str = "genesis"
     
-    async def append(self, event: AuditEvent) -> str:
+    async def append(self, event: IdentityAuditEvent) -> str:
         """
         Append event with chain integrity.
         

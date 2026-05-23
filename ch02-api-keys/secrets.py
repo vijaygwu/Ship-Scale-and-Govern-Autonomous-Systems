@@ -86,6 +86,32 @@ import threading
 import time
 import weakref
 
+try:  # Optional provider SDK; keep this module importable without it.
+    import hvac  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - dependency not required for examples
+    class _HvacStub:
+        """Fallback shim so ``except hvac.exceptions.*`` clauses still resolve.
+
+        When the real ``hvac`` package is not installed, the Vault provider's
+        error-handling clauses (``except hvac.exceptions.Forbidden`` and
+        friends) would otherwise raise ``NameError`` at except-evaluation
+        time. The stub exposes the exception names this module references;
+        the stub classes never actually fire because no real call site can
+        raise them.
+        """
+
+        class exceptions:
+            class VaultError(Exception):
+                pass
+
+            class Forbidden(VaultError):
+                pass
+
+            class InvalidPath(VaultError):
+                pass
+
+    hvac = _HvacStub  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 
@@ -1376,6 +1402,27 @@ def create_client_agent(client_id: str) -> CustomerServiceAgent:
 # Block 9 (chapter listing #9)
 # ============================================================================
 
+import os
+import uuid  # noqa: F401  (used elsewhere in this module's examples)
+
+# Module identifier embedded with audit events; bump on platform releases.
+__version__ = "1.0.0"
+
+
+def send_to_siem(endpoint: str, event: dict) -> None:
+    """Sync stub; replace with your SIEM client.
+
+    If you wrap an async client, use ``asyncio.run()`` at the boundary or
+    convert ``SIEMAuditLogger.log`` itself to ``async``. Earlier drafts of
+    this stub were declared ``async`` with no ``await`` site in the sync
+    ``log`` caller, which silently dropped every audit event as an
+    un-awaited coroutine.
+
+    TODO: wire to your SIEM transport (HTTPS POST, syslog, Kafka topic, ...).
+    """
+    return None
+
+
 class SIEMAuditLogger(AuditLogger):
     """Audit logger that sends events to the SIEM system."""
     
@@ -1392,8 +1439,8 @@ class SIEMAuditLogger(AuditLogger):
             "platform_version": __version__
         }
         
-        # Async send to SIEM
-        send_to_siem_async(self._endpoint, enriched_event)
+        # Sync send to SIEM (see send_to_siem docstring for async wrapping)
+        send_to_siem(self._endpoint, enriched_event)
 
 # ============================================================================
 # Block 10 (chapter listing #10)

@@ -1026,32 +1026,38 @@ class TestStockPriceToolWithRecording:
 # Block 9 (chapter listing #9)
 # ============================================================================
 
-# Using the AgentTestHarness - simple and declarative
-harness = AgentTestHarness(agent_factory=create_customer_support_agent)
+if __name__ == "__main__":
+    # Placeholder for the user-supplied agent factory. Replace with your
+    # actual agent constructor (e.g., a function returning a configured
+    # Agent instance) when running this example.
+    create_customer_support_agent = lambda: None
 
-# Define what to test and what to expect
-result = harness.run_scenario(TestScenario(
-    name="order_lookup",
-    description="Agent should look up order status",
-    user_messages=["What's the status of my order #12345?"],
-    expected_outcomes=[
-        ExpectedOutcome("tool_called", "lookup_order"),
-        ExpectedOutcome("contains", "order"),
-    ],
-))
+    # Using the AgentTestHarness - simple and declarative
+    harness = AgentTestHarness(agent_factory=create_customer_support_agent)
 
-# Check results
-assert result.passed
-print(f"Scenario completed in {result.duration_seconds:.2f}s")
+    # Define what to test and what to expect
+    result = harness.run_scenario(TestScenario(
+        name="order_lookup",
+        description="Agent should look up order status",
+        user_messages=["What's the status of my order #12345?"],
+        expected_outcomes=[
+            ExpectedOutcome("tool_called", "lookup_order"),
+            ExpectedOutcome("contains", "order"),
+        ],
+    ))
 
-# ============================================================================
-# Block 10 (chapter listing #10)
-# ============================================================================
+    # Check results
+    assert result.passed
+    print(f"Scenario completed in {result.duration_seconds:.2f}s")
 
-# Run all scenarios from a YAML file
-results = harness.run_from_yaml(Path("scenarios/customer_support.yaml"))
-summary = harness.get_summary()
-print(f"Pass rate: {summary['pass_rate']:.1%}")
+    # ========================================================================
+    # Block 10 (chapter listing #10)
+    # ========================================================================
+
+    # Run all scenarios from a YAML file
+    results = harness.run_from_yaml(Path("scenarios/customer_support.yaml"))
+    summary = harness.get_summary()
+    print(f"Pass rate: {summary['pass_rate']:.1%}")
 
 # ============================================================================
 # Block 11 (chapter listing #11)

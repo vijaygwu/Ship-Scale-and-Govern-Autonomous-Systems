@@ -27,6 +27,31 @@ from datetime import datetime, timedelta, timezone
 import traceback
 
 
+# ---------------------------------------------------------------------------
+# Placeholder request/response models and collaborators used by the multi-agent
+# walkthrough in Block 15. Real deployments will replace these with concrete
+# implementations, but the stubs let this module import cleanly so every
+# chapter listing remains executable in isolation.
+# ---------------------------------------------------------------------------
+@dataclass
+class UserRequest:
+    query: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"query": self.query}
+
+
+@dataclass
+class Response:
+    content: str = ""
+    degraded: bool = False
+
+
+# TODO: wire to the real recommendation agent / error classifier in production.
+recommendation_agent = None
+classifier = None
+
+
 class ErrorCategory(Enum):
     """Primary classification of agent system errors."""
     LLM_ERROR = auto()           # Upstream model API failures (timeouts, 5xx)
@@ -226,6 +251,12 @@ from functools import wraps
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Placeholder for the LLM client used by the @with_retry-decorated example
+# functions (generate_response, get_product_recommendation). Replace with
+# your actual client instance (e.g., an anthropic.AsyncAnthropic() or
+# openai.AsyncOpenAI() handle) in your application before calling them.
+llm_client = None
 
 T = TypeVar('T')
 
@@ -507,25 +538,32 @@ def with_retry(
 # Block 3 (chapter listing #3)
 # ============================================================================
 
-# Example: Configuring different policies for different error types
+# Wrapped in an ``if __name__ == "__main__":`` guard (same pattern Block 15
+# uses) because ``generate_response`` calls ``llm_client.complete`` on the
+# module-top placeholder ``llm_client = None``; real applications must
+# supply a client. Keeping the policy + decorated example inside the guard
+# lets ``import error_handling`` succeed in test/import contexts that don't
+# provide a real client.
+if __name__ == "__main__":
+    # Example: Configuring different policies for different error types
 
-llm_retry_policy = RetryPolicy(
-    max_retries=5,
-    base_delay=1.0,
-    backoff_strategy=DecorrelatedJitter(max_delay=30.0),
-    retryable_categories={ErrorCategory.LLM_ERROR, ErrorCategory.TIMEOUT}
-)
+    llm_retry_policy = RetryPolicy(
+        max_retries=5,
+        base_delay=1.0,
+        backoff_strategy=DecorrelatedJitter(max_delay=30.0),
+        retryable_categories={ErrorCategory.LLM_ERROR, ErrorCategory.TIMEOUT}
+    )
 
-tool_retry_policy = RetryPolicy(
-    max_retries=3,
-    base_delay=0.5,
-    backoff_strategy=ExponentialBackoff(multiplier=2.0, max_delay=10.0),
-    retryable_categories={ErrorCategory.TOOL_FAILURE}
-)
+    tool_retry_policy = RetryPolicy(
+        max_retries=3,
+        base_delay=0.5,
+        backoff_strategy=ExponentialBackoff(multiplier=2.0, max_delay=10.0),
+        retryable_categories={ErrorCategory.TOOL_FAILURE}
+    )
 
-@with_retry(policy=llm_retry_policy)
-async def generate_response(prompt: str) -> str:
-    return await llm_client.complete(prompt)
+    @with_retry(policy=llm_retry_policy)
+    async def generate_response(prompt: str) -> str:
+        return await llm_client.complete(prompt)
 
 
 # Block 3b: RetryBudget primitive (gRPC-style retry-storm guard).
@@ -975,7 +1013,11 @@ def with_fallbacks(req, fallbacks):
     raise NoFallbackSucceeded()
 
 fallbacks = [call_primary_llm, call_secondary_llm, return_cached_answer]
-result = with_fallbacks(request, fallbacks)
+if __name__ == "__main__":
+    # Placeholder request object; replace with a real request instance when
+    # adapting this example for your own application.
+    request = None
+    result = with_fallbacks(request, fallbacks)
 
 # ============================================================================
 # Block 7 (chapter listing #7)
@@ -1251,74 +1293,80 @@ class FallbackChain(Generic[T]):
 # Block 8 (chapter listing #8)
 # ============================================================================
 
-# Example: Setting up a production fallback chain for LLM calls
+# Wrapped in an ``if __name__ == "__main__":`` guard (same pattern Block 15
+# uses) because the body references ``anthropic_client`` and ``vector_store``,
+# collaborators that real applications must supply. Keeping the example
+# inside the guard lets ``import error_handling`` succeed without forcing
+# module-top placeholders for every demo collaborator.
+if __name__ == "__main__":
+    # Example: Setting up a production fallback chain for LLM calls
 
-async def create_production_fallback_chain() -> FallbackChain[str]:
-    """Create an example fallback chain for LLM requests. Substitute your
-    current model tier (PRIMARY_MODEL / SECONDARY_MODEL) at deployment time
-    as Anthropic releases new generations; the structure below is what
-    survives a model rename, not the specific identifiers."""
+    async def create_production_fallback_chain() -> FallbackChain[str]:
+        """Create an example fallback chain for LLM requests. Substitute your
+        current model tier (PRIMARY_MODEL / SECONDARY_MODEL) at deployment time
+        as Anthropic releases new generations; the structure below is what
+        survives a model rename, not the specific identifiers."""
 
-    # Adjust the literal model IDs below as the model family evolves.
-    PRIMARY_MODEL = "claude-sonnet-4-6"   # higher quality, primary path
-    SECONDARY_MODEL = "claude-haiku-4-5"  # faster, cheaper fallback
+        # Adjust the literal model IDs below as the model family evolves.
+        PRIMARY_MODEL = "claude-sonnet-4-6"   # higher quality, primary path
+        SECONDARY_MODEL = "claude-haiku-4-5"  # faster, cheaper fallback
 
-    registry = CircuitBreakerRegistry()
+        registry = CircuitBreakerRegistry()
 
-    # Primary: higher-quality model
-    primary_circuit = registry.register(
-        "llm_primary",
-        CircuitBreakerConfig(
-            failure_threshold=3,
-            timeout=timedelta(seconds=30)
+        # Primary: higher-quality model
+        primary_circuit = registry.register(
+            "llm_primary",
+            CircuitBreakerConfig(
+                failure_threshold=3,
+                timeout=timedelta(seconds=30)
+            )
         )
-    )
 
-    # Secondary: faster, cheaper model
-    secondary_circuit = registry.register(
-        "llm_secondary",
-        CircuitBreakerConfig(
-            failure_threshold=5,
-            timeout=timedelta(seconds=20)
+        # Secondary: faster, cheaper model
+        secondary_circuit = registry.register(
+            "llm_secondary",
+            CircuitBreakerConfig(
+                failure_threshold=5,
+                timeout=timedelta(seconds=20)
+            )
         )
-    )
 
-    providers = [
-        LLMProvider(
-            provider_name="anthropic",
-            model=PRIMARY_MODEL,
-            client=anthropic_client,
-            _priority=0,
-            circuit_breaker=primary_circuit
-        ),
-        LLMProvider(
-            provider_name="anthropic",
-            model=SECONDARY_MODEL,
-            client=anthropic_client,
-            _priority=10,
-            circuit_breaker=secondary_circuit
-        ),
-        CachedResponseProvider(
-            cache_client=vector_store,
-            similarity_threshold=0.9,
-            _priority=100
-        ),
-        StaticFallbackProvider(
-            responses={
-                "help": "I can help you with various tasks. Please describe what you need.",
-                "greeting": "Hello! How can I assist you today?",
-                "error": "I encountered an issue. Please try rephrasing your request.",
-            },
-            _priority=1000
+        providers = [
+            LLMProvider(
+                provider_name="anthropic",
+                model=PRIMARY_MODEL,
+                client=anthropic_client,
+                _priority=0,
+                circuit_breaker=primary_circuit
+            ),
+            LLMProvider(
+                provider_name="anthropic",
+                model=SECONDARY_MODEL,
+                client=anthropic_client,
+                _priority=10,
+                circuit_breaker=secondary_circuit
+            ),
+            CachedResponseProvider(
+                cache_client=vector_store,
+                similarity_threshold=0.9,
+                _priority=100
+            ),
+            StaticFallbackProvider(
+                responses={
+                    "help": "I can help you with various tasks. Please describe what you need.",
+                    "greeting": "Hello! How can I assist you today?",
+                    "error": "I encountered an issue. Please try rephrasing your request.",
+                },
+                _priority=1000
+            )
+        ]
+        
+        return FallbackChain(
+            providers=providers,
+            on_fallback=lambda prev, curr, err: logger.warning(
+                f"Fallback from {prev} to {curr}: {err}"
+            )
         )
-    ]
-    
-    return FallbackChain(
-        providers=providers,
-        on_fallback=lambda prev, curr, err: logger.warning(
-            f"Fallback from {prev} to {curr}: {err}"
-        )
-    )
 
 # ============================================================================
 # Block 9 (chapter block #9) — Python fragment (incomplete, depends on surrounding context)
@@ -2209,46 +2257,58 @@ async def get_product_recommendation(user_query: str) -> str:
 # Block 15 (chapter listing #15)
 # ============================================================================
 
-async def handle_multi_agent_request(request: UserRequest) -> Response:
-    error_handler = MultiAgentErrorHandler(
-        max_concurrent_failures=2,
-        failure_window=timedelta(minutes=5)
-    )
-    
-    try:
-        recommendation = await recommendation_agent.process(request)
-    except Exception as e:
-        context = AgentErrorContext(
-            error=classifier.classify(e),
-            agent_id="recommendation_agent",
-            agent_type="recommendation"
+# Wrapped in an ``if __name__ == "__main__":`` guard because the body of this
+# example references collaborators (``recommendation_agent``, ``classifier``,
+# ``degraded_response``) that real applications must supply. Keeping the
+# function definition inside the guard lets ``import error_handling`` succeed
+# in test/import contexts that don't provide those collaborators.
+if __name__ == "__main__":
+    async def handle_multi_agent_request(request: UserRequest) -> Response:
+        error_handler = MultiAgentErrorHandler(
+            max_concurrent_failures=2,
+            failure_window=timedelta(minutes=5)
         )
-        error_handler.record_error(context)
         
-        if error_handler.should_halt_orchestration():
-            # Graceful degradation instead of cascade
-            return await degraded_response(request)
-        
-        raise
+        try:
+            recommendation = await recommendation_agent.process(request)
+        except Exception as e:
+            context = AgentErrorContext(
+                error=classifier.classify(e),
+                agent_id="recommendation_agent",
+                agent_type="recommendation"
+            )
+            error_handler.record_error(context)
+            
+            if error_handler.should_halt_orchestration():
+                # Graceful degradation instead of cascade
+                return await degraded_response(request)
+            
+            raise
 
 # ============================================================================
 # Block 16 (chapter listing #16)
 # ============================================================================
 
-aggregator = ErrorAggregator(
-    window_size=timedelta(minutes=10),
-    pattern_threshold=50
-)
+# Wrapped in an ``if __name__ == "__main__":`` guard (same pattern Block 15
+# uses) because the body executes at module import: ``aggregator.get_summary()``
+# returns an empty ``top_patterns`` list on a fresh aggregator, so
+# ``summary["top_patterns"][0]`` raises IndexError at import time, and
+# ``alert_ops_team`` / ``degradation_manager`` are undefined demo collaborators.
+if __name__ == "__main__":
+    aggregator = ErrorAggregator(
+        window_size=timedelta(minutes=10),
+        pattern_threshold=50
+    )
 
-# Pattern detection revealed:
-# - 500+ rate limit errors from LLM provider
-# - Strong correlation between recommendation and cart failures
-# - Error frequency: 100+ per minute
+    # Pattern detection revealed:
+    # - 500+ rate limit errors from LLM provider
+    # - Strong correlation between recommendation and cart failures
+    # - Error frequency: 100+ per minute
 
-summary = aggregator.get_summary()
-if summary["top_patterns"][0]["count"] > 100:
-    alert_ops_team(summary)
-    degradation_manager.set_level(DegradationLevel.MODERATE)
+    summary = aggregator.get_summary()
+    if summary["top_patterns"][0]["count"] > 100:
+        alert_ops_team(summary)
+        degradation_manager.set_level(DegradationLevel.MODERATE)
 
 # ============================================================================
 # Block 17 (chapter listing #17)

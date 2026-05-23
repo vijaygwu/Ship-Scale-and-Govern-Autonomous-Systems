@@ -947,6 +947,12 @@ class PrometheusAgentMetrics:
         self.namespace = namespace
         
         # Task metrics
+        # Cardinality decision: agent_id can grow without bound across
+        # tenants/replicas, which multiplies storage cost on every Prometheus
+        # histogram bucket. We keep agent_id on counters (cheap) but drop it
+        # from the duration histogram, which is the most label-expensive
+        # series, and expose a separate alerting-summary counter that does
+        # break out by agent_id.
         self.tasks_total = Counter(
             f"{namespace}_tasks_total",
             "Total number of tasks by outcome",
@@ -957,8 +963,17 @@ class PrometheusAgentMetrics:
         self.task_duration_seconds = Histogram(
             f"{namespace}_task_duration_seconds",
             "Task duration in seconds",
-            ["task_type", "agent_id"],
+            ["task_type", "outcome"],
             buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+            registry=self.registry
+        )
+        
+        # Low-cardinality companion for alert summaries that need per-agent
+        # breakdowns without paying the histogram bucket multiplier.
+        self.tasks_by_agent_total = Counter(
+            f"{namespace}_tasks_by_agent_total",
+            "Tasks completed per agent (for alerting summaries only)",
+            ["agent_id", "outcome"],
             registry=self.registry
         )
         
@@ -1079,8 +1094,13 @@ class PrometheusAgentMetrics:
         
         self.task_duration_seconds.labels(
             task_type=task_type,
-            agent_id=agent_id
+            outcome=outcome
         ).observe(duration_seconds)
+        
+        self.tasks_by_agent_total.labels(
+            agent_id=agent_id,
+            outcome=outcome
+        ).inc()
         
         self.tokens_per_task.labels(
             task_type=task_type,
@@ -1511,10 +1531,23 @@ class AgentMetrics:
                 if self._task_durations else 0.0
             )
             
-            p95_duration = (
-                sorted(self._task_durations)[int(len(self._task_durations) * 0.95)]
-                if len(self._task_durations) > 20 else avg_duration
-            )
+            # p95 with linear interpolation between adjacent ranks, matching
+            # NumPy's percentile(method='linear') / Excel PERCENTILE.INC. The
+            # previous int(len * 0.95) form rounded down and was off by one
+            # sample on small windows.
+            if len(self._task_durations) > 20:
+                sorted_durations = sorted(self._task_durations)
+                n = len(sorted_durations)
+                rank = 0.95 * (n - 1)
+                lower_idx = int(rank)
+                upper_idx = min(lower_idx + 1, n - 1)
+                weight = rank - lower_idx
+                p95_duration = (
+                    sorted_durations[lower_idx] * (1 - weight)
+                    + sorted_durations[upper_idx] * weight
+                )
+            else:
+                p95_duration = avg_duration
             
             avg_tokens = (
                 statistics.mean(self._task_tokens)
@@ -1556,7 +1589,7 @@ class AgentMetrics:
 
 from dataclasses import dataclass
 from typing import Optional
-from collections import deque
+from collections import deque, OrderedDict
 import math
 import statistics
 
@@ -1598,28 +1631,28 @@ class AgentAnomalyDetector:
         self.min_samples = min_samples
         self._max_metrics = max_metrics
 
-        # Metric baselines with LRU tracking
+        # Metric baselines with LRU tracking. Access order is recorded in an
+        # OrderedDict so updates and evictions are O(1) instead of the O(n)
+        # list.remove() / pop(0) pair the earlier draft used.
         self._baselines: dict[str, deque[float]] = {}
         self._hourly_baselines: dict[str, dict[int, deque[float]]] = {}
-        self._access_order: list[str] = []  # Track metric access order for LRU
+        self._access_order: "OrderedDict[str, None]" = OrderedDict()
     
     def _get_baseline(self, metric_name: str) -> deque[float]:
         """Get or create baseline for a metric with LRU eviction."""
         if metric_name in self._baselines:
-            # Update LRU order
-            if metric_name in self._access_order:
-                self._access_order.remove(metric_name)
-            self._access_order.append(metric_name)
+            # O(1) move to most-recently-used end.
+            self._access_order.move_to_end(metric_name)
             return self._baselines[metric_name]
 
         # Check capacity before adding new metric
         if len(self._baselines) >= self._max_metrics:
-            oldest = self._access_order.pop(0)
+            oldest, _ = self._access_order.popitem(last=False)
             del self._baselines[oldest]
             self._hourly_baselines.pop(oldest, None)
 
         self._baselines[metric_name] = deque(maxlen=self.baseline_window)
-        self._access_order.append(metric_name)
+        self._access_order[metric_name] = None
         return self._baselines[metric_name]
     
     def _get_hourly_baseline(

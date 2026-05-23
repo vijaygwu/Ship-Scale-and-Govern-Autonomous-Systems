@@ -57,8 +57,9 @@ fields @timestamp, @message
 # Block 4 (chapter listing #4)
 # ============================================================================
 
-Original: "Customer John Smith (ID: 12345) requested refund"
-Tokenized: "Customer [PII:CUST:abc123] requested refund"
+# Illustrative before/after pair for PII tokenization (not Python code):
+# Original:  "Customer John Smith (ID: 12345) requested refund"
+# Tokenized: "Customer [PII:CUST:abc123] requested refund"
 
 # ============================================================================
 # Block 5 (chapter listing #5)
@@ -1328,7 +1329,7 @@ class IntegrityVerifier:
         # the same compact separators used by AuditLogger._create_event.
         # Any drift here makes verification produce false-positive mismatches.
         event_copy = json.loads(json.dumps(event))
-        event_copy["integrity"]["event_hash"] = ""
+        event_copy.get("integrity", {}).pop("event_hash", None)
         event_json = json.dumps(
             event_copy, sort_keys=True, separators=(",", ":"), default=str
         )
@@ -1416,7 +1417,7 @@ and routine audits.
 
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Iterator
 import json

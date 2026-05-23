@@ -1022,10 +1022,17 @@ class BudgetManager:
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Callable, Any
 from enum import Enum
+from collections import deque, OrderedDict
 import time
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Bounds for in-memory degradation state. The queue is a deque to drop the
+# oldest pending request once full; the cache is an OrderedDict so we can
+# evict the least-recently-inserted entry when capacity is hit.
+MAX_QUEUE_SIZE = 10_000
+MAX_CACHE_SIZE = 1024
 
 
 class DegradationStrategy(Enum):
@@ -1101,8 +1108,15 @@ class GracefulDegradationManager:
     rate_limiter: Optional[HierarchicalRateLimiter] = None
     budget_manager: Optional[BudgetManager] = None
     
-    _request_queue: List[Dict] = field(default_factory=list)
-    _response_cache: Dict[str, Dict] = field(default_factory=dict)
+    # Bounded so a hot path can't grow these indefinitely; deque drops the
+    # oldest queued request once full and the OrderedDict gives O(1) FIFO
+    # eviction in cache_response().
+    _request_queue: deque = field(
+        default_factory=lambda: deque(maxlen=MAX_QUEUE_SIZE)
+    )
+    _response_cache: "OrderedDict[str, Dict]" = field(
+        default_factory=OrderedDict
+    )
     _degradation_stats: Dict[str, int] = field(default_factory=dict)
     
     def handle_rate_limit(
@@ -1315,7 +1329,9 @@ class GracefulDegradationManager:
 
         base_delay = 1.0
         cap = 60.0
-        # In production, track previous delay per scope
+        # _last_delay is an instance attribute (initialized lazily via getattr)
+        # so concurrent GracefulDegradationManager instances cannot stomp on a
+        # shared module-level value.
         previous_delay = getattr(self, '_last_delay', base_delay)
 
         delay = min(cap, random.uniform(base_delay, previous_delay * 3))
@@ -1350,10 +1366,15 @@ class GracefulDegradationManager:
     def cache_response(self, request: Dict, response: Dict) -> None:
         """Cache a response for potential future fallback."""
         cache_key = self._compute_cache_key(request)
+        # Refresh recency on hit, then enforce MAX_CACHE_SIZE via FIFO eviction.
+        if cache_key in self._response_cache:
+            self._response_cache.move_to_end(cache_key)
         self._response_cache[cache_key] = {
             "response": response,
             "cached_at": time.time()
         }
+        while len(self._response_cache) > MAX_CACHE_SIZE:
+            self._response_cache.popitem(last=False)
     
     def get_degradation_stats(self) -> Dict[str, int]:
         """Return statistics on degradation events."""
@@ -1375,11 +1396,12 @@ class GracefulDegradationManager:
         results = []
         now = time.time()
         
-        # Remove expired entries
-        self._request_queue = [
-            entry for entry in self._request_queue
-            if entry["expires_at"] > now
-        ]
+        # Remove expired entries while preserving the deque bound.
+        self._request_queue = deque(
+            (entry for entry in self._request_queue
+             if entry["expires_at"] > now),
+            maxlen=MAX_QUEUE_SIZE
+        )
         
         # Process what we can
         while self._request_queue:
@@ -1390,7 +1412,7 @@ class GracefulDegradationManager:
             if self._check_capacity_for_model(
                 request, request.get("model", "claude-3-opus")
             ):
-                self._request_queue.pop(0)
+                self._request_queue.popleft()
                 result = processor(request)
                 results.append({
                     "request": request,
@@ -2121,6 +2143,7 @@ class AlertManager:
 def slack_notification_channel(webhook_url: str) -> Callable[[Alert], None]:
     """Create a Slack notification channel."""
     import urllib.request
+    import urllib.error
     import json
     
     def send(alert: Alert) -> None:
@@ -2152,7 +2175,12 @@ def slack_notification_channel(webhook_url: str) -> Callable[[Alert], None]:
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}
         )
-        urllib.request.urlopen(req)
+        # The alerting path must never crash the caller, so a broken or slow
+        # webhook is logged and swallowed rather than re-raised.
+        try:
+            urllib.request.urlopen(req, timeout=5.0)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            logger.warning("Slack webhook delivery failed: %s", exc)
     
     return send
 
@@ -2163,6 +2191,7 @@ def pagerduty_notification_channel(
 ) -> Callable[[Alert], None]:
     """Create a PagerDuty notification channel."""
     import urllib.request
+    import urllib.error
     import json
     
     def send(alert: Alert) -> None:
@@ -2190,7 +2219,12 @@ def pagerduty_notification_channel(
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}
         )
-        urllib.request.urlopen(req)
+        # The alerting path must never crash the caller, so a broken or slow
+        # webhook is logged and swallowed rather than re-raised.
+        try:
+            urllib.request.urlopen(req, timeout=5.0)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            logger.warning("PagerDuty webhook delivery failed: %s", exc)
     
     return send
 
@@ -2201,6 +2235,7 @@ def pagerduty_notification_channel(
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Any
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -2465,10 +2500,13 @@ class AgentCostGovernor:
 def example_usage():
     """Demonstrate the cost governance system."""
     
-    # Create governor with default settings
+    # Create governor with default settings. Read the Slack webhook from
+    # an environment variable rather than embedding a literal URL: webhook
+    # URLs are secrets, and a single literal token can overflow the PDF
+    # code-block right margin (no break opportunity inside one token).
     governor = AgentCostGovernor.create_default(
         global_daily_budget=500.0,
-        slack_webhook="https://hooks.slack.com/services/xxx"
+        slack_webhook=os.environ["SLACK_WEBHOOK_URL"]
     )
     
     # Configure an organization
