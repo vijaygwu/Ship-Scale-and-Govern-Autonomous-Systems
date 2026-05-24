@@ -41,7 +41,12 @@ book-2/code/
 ├── ch07-error-handling/         # Retries, circuit breakers, fallback chains, DLQs
 │   └── error_handling.py
 ├── ch08-testing/                # MockLLM, behavioral evaluators, adversarial tests
+│   ├── scenarios/
+│   │   └── customer_support.yaml
 │   └── testing.py
+├── tests/                       # Companion regression tests for chapter listings
+├── pyproject.toml               # Pytest markers and local test configuration
+├── requirements-dev.txt
 ├── requirements.txt
 ├── .gitignore
 └── README.md
@@ -73,18 +78,30 @@ source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 # Open any chapter module and read top-to-bottom alongside the book
 $EDITOR ch01-enterprise-identity/identity.py
+
+# Run the companion regression suite
+python -m pytest tests
 ```
 
 Each chapter module is a valid, parseable Python file. Most blocks are runnable Python that builds incrementally through the chapter; the runnable blocks compile standalone but may reference external services (Vault, AWS Secrets Manager, Redis, Anthropic API). Provide credentials and infrastructure as appropriate when running.
+
+The test suite exercises the extracted listings as companion examples. Optional integration examples are guarded with skips when project-specific tools or services are not configured, so a local checkout can still validate the core examples without provisioning every external dependency.
 
 ## Conventions
 
 - **Block banners**: Each listing is preceded by a banner showing its sequential position in the file (`Block N`) and the corresponding listing number from the chapter.
 - **Wrapped listings**: Blocks that are not standalone Python (log samples, Dockerfile snippets, JSON examples, etc.) are wrapped in raw docstrings and labelled with a reason — they preserve the book content verbatim but are not meant to execute.
 - **Future imports**: `from __future__ import annotations` is hoisted to the top of each file when used anywhere in the chapter.
+
+## Runtime Notes
+
+- Chapter 3's `TokenBucket.wait_for_capacity()` uses a bounded default wait. Pass `timeout=None` only when an intentionally unbounded wait is acceptable for the caller.
+- Chapter 5's canary deployment flow cancels and awaits its external monitor task during cleanup, which avoids leaking a background coroutine after promotion or rollback.
+- Chapter 8's sample `Agent.run(timeout=...)` enforces the timeout through the model/tool loop and forwards the remaining time to the mock LLM. The packaged `ch08-testing/scenarios/customer_support.yaml` file supports the behavioral harness examples.
 
 ## Infrastructure Companion (Forthcoming)
 
