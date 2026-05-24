@@ -70,6 +70,34 @@ def _token_bucket_tokens(limiter):
     )
 
 
+def test_wait_for_capacity_default_timeout_is_bounded(monkeypatch):
+    class FakeTime:
+        def __init__(self):
+            self.now = 100.0
+            self.sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    fake_time = FakeTime()
+    monkeypatch.setattr(rate_limits, "time", fake_time)
+    limiter = rate_limits.RequestRateLimiter(
+        max_requests=1,
+        window_seconds=10_000.0,
+    )
+    limiter._timestamps.append(fake_time.now)
+
+    assert limiter.wait_for_capacity() is False
+    assert sum(fake_time.sleeps) == pytest.approx(
+        rate_limits.DEFAULT_REQUEST_WAIT_TIMEOUT_SECONDS
+    )
+    assert max(fake_time.sleeps) <= 1.0
+
+
 def test_wait_for_capacity_clamps_sleep_to_remaining_timeout(monkeypatch):
     class FakeTime:
         def __init__(self):
@@ -81,6 +109,9 @@ def test_wait_for_capacity_clamps_sleep_to_remaining_timeout(monkeypatch):
             if self.time_values:
                 return self.time_values.pop(0)
             return self.now
+
+        def monotonic(self):
+            return self.time()
 
         def sleep(self, seconds):
             self.sleeps.append(seconds)
@@ -498,3 +529,9 @@ def test_process_queue_preserves_queue_when_timeout_workers_are_saturated():
     stats = manager.get_degradation_stats()
     assert stats["queue_timeout"] == 1
     assert stats["queue_processor_saturated"] == 1
+
+
+def test_elapsed_time_paths_use_monotonic_clock():
+    source = MODULE_PATH.read_text()
+    assert "time.time()" not in source
+    assert "time.monotonic()" in source

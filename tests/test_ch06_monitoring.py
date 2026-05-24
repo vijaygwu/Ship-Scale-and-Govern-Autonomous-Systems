@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -218,6 +219,64 @@ def test_agent_logger_redacts_sensitive_tool_arguments(monitoring):
     }
     assert "sensitive body" not in stream.getvalue()
     assert "sk-secret" not in stream.getvalue()
+
+
+def test_metrics_server_uses_bounded_loopback_server(monitoring):
+    metrics = monitoring.PrometheusAgentMetrics(namespace="unit")
+
+    server_cls = monitoring.BoundedThreadingHTTPServer
+    assert issubclass(server_cls, monitoring.ThreadingHTTPServer)
+
+    class FakeBoundedThreadingHTTPServer:
+        daemon_threads = True
+
+        def __init__(
+            self,
+            server_address,
+            handler,
+            connection_timeout,
+            request_queue_size,
+        ):
+            self.server_address = server_address
+            self.handler = handler
+            self.connection_timeout = connection_timeout
+            self.request_queue_size = request_queue_size
+            self.was_shutdown = False
+            self.was_closed = False
+
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            self.was_shutdown = True
+
+        def server_close(self):
+            self.was_closed = True
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        monitoring,
+        "BoundedThreadingHTTPServer",
+        FakeBoundedThreadingHTTPServer,
+    )
+
+    handle = monitoring.start_metrics_server(
+        metrics,
+        port=0,
+        host="127.0.0.1",
+        request_queue_size=4,
+        connection_timeout=0.25,
+    )
+
+    try:
+        assert isinstance(handle.server, monitoring.BoundedThreadingHTTPServer)
+        assert handle.server.daemon_threads is True
+        assert handle.server.request_queue_size == 4
+        assert handle.server.connection_timeout == 0.25
+        assert handle.server.server_address[0] == "127.0.0.1"
+    finally:
+        handle.shutdown(timeout=1.0)
+        monkeypatch.undo()
 
 
 def test_task_metrics_and_token_budget_enforce_core_limits(monitoring):
@@ -545,12 +604,89 @@ def test_agent_metrics_backend_failures_do_not_abort_or_inflate_active(
         with metrics.track_task("task-2", task_type="research"):
             raise ValueError("business failure")
 
+    assert metrics.wait_for_callbacks(timeout=1.0)
     snapshot = metrics.get_snapshot()
 
     assert snapshot.tasks_completed == 1
     assert snapshot.tasks_failed == 1
     assert snapshot.active_tasks == 0
     assert snapshot.total_tokens == 12
+    assert snapshot.callback_errors == 2
+    metrics.close()
+
+
+def test_agent_metrics_callback_registry_is_bounded(monitoring):
+    metrics = monitoring.AgentMetrics(
+        agent_id="unit-test",
+        max_metric_callbacks=1,
+    )
+    try:
+        callback_id = metrics.add_callback(lambda *_args: None)
+
+        with pytest.raises(RuntimeError, match="registry is full"):
+            metrics.add_callback(lambda *_args: None)
+
+        assert metrics.remove_callback(callback_id) is True
+        assert metrics.remove_callback(callback_id) is False
+    finally:
+        metrics.close()
+
+
+def test_agent_metrics_callbacks_do_not_block_task_completion(monitoring):
+    metrics = monitoring.AgentMetrics(agent_id="unit-test")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_callback(_metric_name, _value):
+        started.set()
+        release.wait(timeout=1.0)
+
+    metrics.add_callback(slow_callback)
+
+    try:
+        begin = time.perf_counter()
+        with metrics.track_task("task-1"):
+            pass
+        elapsed = time.perf_counter() - begin
+
+        assert elapsed < 0.1
+        assert started.wait(timeout=1.0)
+        release.set()
+        assert metrics.wait_for_callbacks(timeout=1.0)
+    finally:
+        release.set()
+        metrics.close()
+
+
+def test_agent_metrics_callback_queue_drops_when_full(monitoring):
+    metrics = monitoring.AgentMetrics(
+        agent_id="unit-test",
+        callback_queue_size=1,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_callback(_metric_name, _value):
+        started.set()
+        release.wait(timeout=1.0)
+
+    metrics.add_callback(slow_callback)
+
+    try:
+        with metrics.track_task("task-1"):
+            pass
+        assert started.wait(timeout=1.0)
+
+        with metrics.track_task("task-2"):
+            pass
+        with metrics.track_task("task-3"):
+            pass
+
+        snapshot = metrics.get_snapshot()
+        assert snapshot.callback_notifications_dropped >= 1
+    finally:
+        release.set()
+        metrics.close()
 
 
 def test_agent_metrics_tool_and_model_backend_failures_do_not_leak(

@@ -87,12 +87,93 @@ def test_send_to_siem_is_sync_and_siem_logger_delivers_in_background(
     assert calls[0][1]["client_id"] == "unit-test"
 
 
+def test_siem_logger_context_manager_flushes_on_close(secrets_module):
+    calls: list[tuple[str, dict]] = []
+
+    def fake_sender(endpoint, event, connect_timeout, read_timeout):
+        calls.append((endpoint, event))
+        return 200
+
+    with secrets_module.SIEMAuditLogger(
+        siem_endpoint="https://siem.example/ingest",
+        client_id="unit-test",
+        sender=fake_sender,
+        max_retries=0,
+    ) as logger:
+        result = logger.log(make_siem_event(secrets_module, "prod/key"))
+        assert result.queued is True
+
+    assert len(calls) == 1
+    assert calls[0][1]["secret_id"] == "prod/key"
+    assert calls[0][1]["client_id"] == "unit-test"
+
+
+def test_siem_logger_close_timeout_buffers_undrained_queue(
+    secrets_module,
+    caplog,
+):
+    sender_started = threading.Event()
+    release_sender = threading.Event()
+    calls: list[str] = []
+
+    def blocking_sender(endpoint, event, connect_timeout, read_timeout):
+        calls.append(event["secret_id"])
+        sender_started.set()
+        release_sender.wait(timeout=2.0)
+        return 200
+
+    logger = secrets_module.SIEMAuditLogger(
+        siem_endpoint="https://siem.example/ingest",
+        client_id="unit-test",
+        sender=blocking_sender,
+        max_retries=0,
+        delivery_queue_size=10,
+        failure_buffer_size=10,
+    )
+
+    close_result = True
+    try:
+        for secret_id in ("prod/key-1", "prod/key-2", "prod/key-3"):
+            logger.log(make_siem_event(secrets_module, secret_id))
+
+        assert sender_started.wait(timeout=1.0)
+
+        with caplog.at_level(logging.ERROR):
+            close_result = logger.close(timeout=0.01)
+
+        buffered_secret_ids = {
+            item["event"]["secret_id"] for item in logger.failed_events
+        }
+    finally:
+        release_sender.set()
+        logger.close(timeout=1.0)
+
+    assert close_result is False
+    assert buffered_secret_ids == {"prod/key-2", "prod/key-3"}
+    assert calls == ["prod/key-1"]
+    assert "SIEM audit close timed out; queued events buffered" in caplog.text
+
+
 class CaptureAuditLogger:
     def __init__(self) -> None:
         self.events = []
 
     def log(self, event) -> None:
         self.events.append(event)
+
+
+class RejectingAuditLogger(CaptureAuditLogger):
+    def log(self, event):
+        super().log(event)
+        return type(
+            "AuditResult",
+            (),
+            {
+                "queued": False,
+                "delivered": False,
+                "error": "queue full",
+            },
+        )()
 
 
 def make_siem_event(secrets_module, secret_id: str, result: str = "success"):
@@ -279,6 +360,64 @@ def test_environment_secret_manager_caches_and_audits_reads(
         False,
     ]
     assert all(not hasattr(event, "value") for event in audit.events)
+
+
+def test_secret_manager_defaults_to_deny_all_without_scope_patterns(
+    secrets_module,
+    monkeypatch,
+):
+    audit = CaptureAuditLogger()
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("SECRET_RESEARCH_OPENAI_API_KEY", "first-value")
+    manager = secrets_module.SecretManager(
+        agent_id="agent-test",
+        agent_role="research",
+        backend=secrets_module.SecretBackend.ENVIRONMENT,
+        backend_config={"prefix": "SECRET_"},
+        audit_logger=audit,
+        rotation_check_interval=3600,
+    )
+
+    try:
+        with pytest.raises(secrets_module.SecretAccessDeniedError):
+            manager.get_secret("research/openai-api-key")
+    finally:
+        manager.shutdown()
+
+    assert audit.events[-1].operation == "read"
+    assert audit.events[-1].result == "denied"
+    assert audit.events[-1].error_message == "Access denied by scope policy"
+
+
+def test_secret_manager_can_require_successful_audit_before_returning_secret(
+    secrets_module,
+    monkeypatch,
+):
+    audit = RejectingAuditLogger()
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("SECRET_RESEARCH_OPENAI_API_KEY", "first-value")
+    manager = secrets_module.SecretManager(
+        agent_id="agent-test",
+        agent_role="research",
+        backend=secrets_module.SecretBackend.ENVIRONMENT,
+        backend_config={"prefix": "SECRET_"},
+        allowed_secret_patterns=["research/*"],
+        audit_logger=audit,
+        rotation_check_interval=3600,
+        require_audit_success=True,
+    )
+
+    try:
+        with pytest.raises(
+            secrets_module.SecretAccessDeniedError,
+            match="audit delivery failed",
+        ):
+            manager.get_secret("research/openai-api-key")
+    finally:
+        manager.shutdown()
+
+    assert audit.events[0].operation == "read"
+    assert audit.events[0].result == "success"
 
 
 def test_environment_backend_rejected_in_production_without_override(

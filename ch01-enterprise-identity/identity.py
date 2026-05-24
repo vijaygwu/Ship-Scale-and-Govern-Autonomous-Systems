@@ -129,6 +129,7 @@ async def investigate_incident_with_identity(trade_id, identity_service):
 # - `database` (checklist #3) and `audit_log` (checklist #2) are
 #   replaced with fail-loud RequiredDependency placeholders; any call
 #   raises a clear error rather than silently no-oping.
+import os as _os_early
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
@@ -143,6 +144,22 @@ audit_log = _RequiredDependency(  # TODO[2]: see checklist
     "audit_log",
     "Wire to your SIEM sink (Splunk, Datadog, CloudWatch Logs, ...).",
 )
+
+
+# Module-level trip-wire: refuse to be a silent no-op in production.
+# The empty INTERNAL_NETWORK above is a pedagogical foil (every IP fails
+# the `in` check), but a copy-paste deployment that imports this module
+# with AGENT_ENV=production must populate it before use.
+def _check_internal_network() -> None:
+    if _os_early.environ.get("AGENT_ENV") == "production" and not INTERNAL_NETWORK:
+        raise RuntimeError(
+            "INTERNAL_NETWORK is empty in production. "
+            "Populate it with the CIDR ranges of your internal network "
+            "before importing this module. See production-setup-checklist."
+        )
+
+
+_check_internal_network()
 
 
 def _stable_query_hash(query: str | bytes) -> str:
@@ -512,6 +529,10 @@ class AuditEventType(str, Enum):
     KEY_ROTATED = "key.rotated"
     KEY_COMPROMISED = "key.compromised"
 
+    # Trade execution
+    TRADE_EXECUTED = "trade.executed"
+    TRADE_REJECTED = "trade.rejected"
+
 
 
 @dataclass
@@ -677,6 +698,7 @@ class IdentityStore:
     - Redis for credential validation cache
     - Elasticsearch for audit log queries
     """
+    is_durable_production_store = False
     
     def __init__(
         self,
@@ -1119,20 +1141,42 @@ class IdentityStore:
 class KeyVault:
     """
     Development/demo key storage.
-    
+
     In production, replace with:
     - AWS KMS
     - Azure Key Vault
     - HashiCorp Vault
     - Hardware Security Module (HSM)
+
+    PRODUCTION DANGER: This is an in-memory key store. Private keys are
+    stored unencrypted in the process's heap and disappear on restart.
+    Use only for development, tests, or worked examples. Production
+    deployments MUST replace this with an HSM- or KMS-backed
+    KeyManagementService implementation (see the chapter's "Key
+    Management" section).
     """
 
     is_in_memory_demo_provider = True
     is_production_key_provider = False
-    
+
     def __init__(self):
         self._keys: dict[str, bytes] = {}
         self._metadata: dict[str, dict] = {}
+        # Trip-wire: refuse to instantiate an in-memory vault under
+        # AGENT_ENV=production. Placed at the end of __init__ so
+        # subclasses that mark themselves production-grade can call
+        # super().__init__() without tripping this guard prematurely.
+        if (
+            self.is_in_memory_demo_provider
+            and not self.is_production_key_provider
+            and os.environ.get("AGENT_ENV") == "production"
+        ):
+            raise RuntimeError(
+                "In-memory KeyVault refused in production. "
+                "Provide an HSM- or KMS-backed implementation; this class is "
+                "for development and testing only. "
+                "See production-setup-checklist."
+            )
 
     def _assert_environment_allowed(self) -> None:
         _validate_key_provider_environment(self, _current_environment())
@@ -1512,6 +1556,14 @@ class AgentIdentityService:
             )
         validated_secret = _validate_hs256_jwt_secret(secret, environment)
         _validate_key_provider_environment(self.key_vault, environment)
+        if (
+            _is_production_environment(environment)
+            and not getattr(self.store, "is_durable_production_store", False)
+        ):
+            raise RuntimeError(
+                "Production identity service requires a durable identity store; "
+                "the in-memory IdentityStore is for development and tests only."
+            )
         self._jwt_secret = validated_secret
 
         # Initialize CA
@@ -1857,7 +1909,8 @@ class AgentIdentityService:
                 token,
                 self._jwt_secret,
                 algorithms=["HS256"],
-                audience="agent-platform"
+                audience="agent-platform",
+                issuer="agent-identity-service"
             )
         except jwt.ExpiredSignatureError:
             await self._audit(
@@ -2139,6 +2192,7 @@ class AgentIdentityService:
                 self._jwt_secret,
                 algorithms=["HS256"],
                 audience="agent-platform",
+                issuer="agent-identity-service",
                 options={"verify_exp": False}
             )
         except jwt.InvalidTokenError:
@@ -2343,7 +2397,8 @@ class AgentIdentityService:
                 delegation_token,
                 self._jwt_secret,
                 algorithms=["HS256"],
-                audience="agent-platform"
+                audience="agent-platform",
+                issuer="agent-identity-service"
             )
         except jwt.ExpiredSignatureError as e:
             payload = self._decode_delegation_without_expiry(delegation_token)
@@ -3592,7 +3647,7 @@ class TradeExecutor:
         """Record successful trade with full context."""
         event = AuditEvent(
             event_id=str(uuid.uuid4()),
-            event_type=AuditEventType.TOKEN_VALIDATED,  # Custom: TRADE_EXECUTED
+            event_type=AuditEventType.TRADE_EXECUTED,
             timestamp=datetime.now(timezone.utc),
             agent_id=identity.agent_id,
             actor_id=identity.agent_id,
@@ -3631,7 +3686,7 @@ class TradeExecutor:
         """Record failed trade attempt."""
         event = AuditEvent(
             event_id=str(uuid.uuid4()),
-            event_type=AuditEventType.TOKEN_REJECTED,  # Custom: TRADE_REJECTED
+            event_type=AuditEventType.TRADE_REJECTED,
             timestamp=datetime.now(timezone.utc),
             agent_id=request.agent_id,
             actor_id=request.agent_id,

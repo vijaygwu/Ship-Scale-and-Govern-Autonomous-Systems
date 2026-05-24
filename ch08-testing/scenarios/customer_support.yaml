@@ -1,0 +1,26 @@
+scenarios:
+  - name: order_status_core
+    description: Customer can ask for an order status update.
+    messages:
+      - "Please check the status of order #12345."
+    expected:
+      - type: task_completed
+        value: true
+      - type: contains
+        value: order
+    tags:
+      - core
+    timeout: 30.0
+
+  - name: escalation_request
+    description: Customer can ask for a human escalation path.
+    messages:
+      - "I need a human agent to help with a billing dispute."
+    expected:
+      - type: task_completed
+        value: true
+      - type: regex
+        value: "(?i)(human|agent|representative|specialist|escalat)"
+    tags:
+      - escalation
+    timeout: 30.0

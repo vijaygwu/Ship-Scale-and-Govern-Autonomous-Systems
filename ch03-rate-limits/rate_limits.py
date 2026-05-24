@@ -27,6 +27,9 @@ import time
 import threading
 
 
+DEFAULT_REQUEST_WAIT_TIMEOUT_SECONDS = 30.0
+
+
 @dataclass
 class RequestRateLimiter:
     """
@@ -61,7 +64,7 @@ class RequestRateLimiter:
         Thread-safe for concurrent access.
         """
         with self._lock:
-            now = time.time()
+            now = time.monotonic()
             self._clean_old_timestamps(now)
             
             if len(self._timestamps) < self.max_requests:
@@ -78,23 +81,28 @@ class RequestRateLimiter:
         there is nothing left to refund.
         """
         with self._lock:
-            self._clean_old_timestamps(time.time())
+            self._clean_old_timestamps(time.monotonic())
             if not self._timestamps:
                 return False
             self._timestamps.pop()
             return True
     
-    def wait_for_capacity(self, timeout: Optional[float] = None) -> bool:
+    def wait_for_capacity(
+        self,
+        timeout: Optional[float] = DEFAULT_REQUEST_WAIT_TIMEOUT_SECONDS,
+    ) -> bool:
         """
         Block until capacity is available or timeout is reached.
         
         Args:
-            timeout: Maximum seconds to wait. None means wait indefinitely.
+            timeout: Maximum seconds to wait. Defaults to 30 seconds.
+                Pass None only when the caller explicitly wants to wait
+                indefinitely.
             
         Returns:
             True if capacity was acquired, False if timeout was reached.
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         
         while True:
             if self.try_acquire():
@@ -102,7 +110,7 @@ class RequestRateLimiter:
             
             remaining_timeout = None
             if timeout is not None:
-                elapsed = time.time() - start_time
+                elapsed = time.monotonic() - start_time
                 remaining_timeout = timeout - elapsed
                 if remaining_timeout <= 0:
                     return False
@@ -111,7 +119,7 @@ class RequestRateLimiter:
             with self._lock:
                 if self._timestamps:
                     sleep_time = (
-                        self._timestamps[0] + self.window_seconds - time.time()
+                        self._timestamps[0] + self.window_seconds - time.monotonic()
                     )
                     sleep_time = max(0.01, min(sleep_time, 1.0))
                 else:
@@ -125,7 +133,7 @@ class RequestRateLimiter:
     def get_remaining_capacity(self) -> int:
         """Return the number of requests available in the current window."""
         with self._lock:
-            self._clean_old_timestamps(time.time())
+            self._clean_old_timestamps(time.monotonic())
             return self.max_requests - len(self._timestamps)
     
     def get_reset_time(self) -> Optional[float]:
@@ -135,11 +143,11 @@ class RequestRateLimiter:
         Returns None if capacity is available now.
         """
         with self._lock:
-            self._clean_old_timestamps(time.time())
+            self._clean_old_timestamps(time.monotonic())
             if len(self._timestamps) < self.max_requests:
                 return None
             if self._timestamps:
-                return self._timestamps[0] + self.window_seconds - time.time()
+                return self._timestamps[0] + self.window_seconds - time.monotonic()
             return None
 
 # ============================================================================
@@ -173,7 +181,7 @@ class TokenBucket:
     capacity: int
     refill_rate: float  # tokens per second
     _tokens: float = field(init=False)
-    _last_refill: float = field(default_factory=time.time)
+    _last_refill: float = field(default_factory=time.monotonic)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     
     def __post_init__(self):
@@ -191,7 +199,7 @@ class TokenBucket:
     def try_consume(self, tokens: int) -> bool:
         """Attempt to consume tokens. Returns True if successful."""
         with self._lock:
-            self._refill(time.time())
+            self._refill(time.monotonic())
             if self._tokens >= tokens:
                 self._tokens -= tokens
                 return True
@@ -200,7 +208,7 @@ class TokenBucket:
     def get_available_tokens(self) -> int:
         """Return available tokens; negative means overage debt is outstanding."""
         with self._lock:
-            self._refill(time.time())
+            self._refill(time.monotonic())
             return int(self._tokens)
 
     def refund(self, tokens: int) -> None:
@@ -341,7 +349,7 @@ class TokenRateLimiter:
             if len(self._usage_history) == self._usage_history.maxlen:
                 self._usage_history_dropped += 1
             self._usage_history.append({
-                "timestamp": time.time(),
+            "timestamp": time.monotonic(),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens
             })
@@ -382,7 +390,7 @@ class TokenRateLimiter:
     
     def get_usage_stats(self, window_seconds: float = 60.0) -> Dict:
         """Return usage statistics for the specified time window."""
-        now = time.time()
+        now = time.monotonic()
         cutoff = now - window_seconds
         
         with self._lock:
@@ -499,7 +507,7 @@ class HierarchicalRateLimiter:
 
     def _evict_inactive_scopes(self, now: Optional[float] = None) -> None:
         """Evict expired or least-recently-seen dynamic scopes."""
-        now = time.time() if now is None else now
+        now = time.monotonic() if now is None else now
         cutoff = now - self.scope_ttl_seconds
 
         for key, last_seen in list(self._scope_last_seen.items()):
@@ -516,7 +524,7 @@ class HierarchicalRateLimiter:
     def _touch_scope(self, key: str, now: Optional[float] = None) -> None:
         """Record recent use for configured non-global scopes."""
         if key != "global" and key in self._configs:
-            self._scope_last_seen[key] = time.time() if now is None else now
+            self._scope_last_seen[key] = time.monotonic() if now is None else now
 
     @staticmethod
     def _scope_key(scope: LimitScope, identifier: str) -> str:
@@ -569,7 +577,7 @@ class HierarchicalRateLimiter:
         self._request_limiters.pop(key, None)
 
         if key != "global":
-            now = time.time()
+            now = time.monotonic()
             self._evict_inactive_scopes(now)
             if key not in self._configs and len(self._scope_last_seen) >= self.max_scopes:
                 oldest_key = min(
@@ -703,7 +711,7 @@ class HierarchicalRateLimiter:
             except RateLimitExceeded as e:
                 # Rollback all capacity successfully acquired prior to the
                 # failure so partial acquisitions do not leak quota.
-                for limiter_type, key in acquired_keys:
+                for limiter_type, key in reversed(acquired_keys):
                     if limiter_type == "request" and key in self._request_limiters:
                         self._request_limiters[key].refund()
                     elif limiter_type == "token" and key in self._limiters:
@@ -1456,11 +1464,11 @@ class BudgetManager:
             # Project to end of period
             if period == BudgetPeriod.HOURLY:
                 hours_remaining = 1 - (
-                    (datetime.now(timezone.utc) - budget.period_start).seconds / 3600
+                    (datetime.now(timezone.utc) - budget.period_start).total_seconds() / 3600
                 )
             elif period == BudgetPeriod.DAILY:
                 hours_remaining = 24 - (
-                    (datetime.now(timezone.utc) - budget.period_start).seconds / 3600
+                    (datetime.now(timezone.utc) - budget.period_start).total_seconds() / 3600
                 )
             elif period == BudgetPeriod.WEEKLY:
                 hours_remaining = 168 - (
@@ -1797,7 +1805,7 @@ class GracefulDegradationManager:
                     "max_queue_size": self.config.max_queue_size,
                 }
 
-            queued_at = time.time()
+            queued_at = time.monotonic()
             queue_entry = {
                 "request": request,
                 "queued_at": queued_at,
@@ -1829,7 +1837,7 @@ class GracefulDegradationManager:
                 cached = self._response_cache[cache_key]
 
                 # Check if cache is still valid
-                if time.time() - cached["cached_at"] < self.config.cache_ttl_seconds:
+                if time.monotonic() - cached["cached_at"] < self.config.cache_ttl_seconds:
                     return {
                         "success": True,
                         "strategy": "cache_fallback",
@@ -2125,7 +2133,7 @@ class GracefulDegradationManager:
                 self._response_cache.move_to_end(cache_key)
             self._response_cache[cache_key] = {
                 "response": response,
-                "cached_at": time.time()
+                "cached_at": time.monotonic()
             }
             while len(self._response_cache) > self.config.max_cache_size:
                 self._response_cache.popitem(last=False)
@@ -2166,7 +2174,7 @@ class GracefulDegradationManager:
             raise ValueError("item_timeout_seconds must be positive or None")
         
         while True:
-            now = time.time()
+            now = time.monotonic()
             with self._lock:
                 # Remove expired entries without changing queue admission policy.
                 # Preserve the bounded-memory invariant by carrying the
@@ -2227,7 +2235,7 @@ class GracefulDegradationManager:
             if effective_timeout is not None:
                 processor_request = {
                     **governed_request,
-                    "deadline_at": time.time() + effective_timeout,
+                    "deadline_at": time.monotonic() + effective_timeout,
                 }
                 executor = self._get_queue_processor_executor()
                 try:
@@ -2293,7 +2301,7 @@ class GracefulDegradationManager:
             elif isinstance(result, dict) and result.get("success") is False:
                 self._refund_reserved_capacity(processor_request)
 
-            queue_time = time.time() - entry["queued_at"]
+            queue_time = time.monotonic() - entry["queued_at"]
             results.append({
                 "request": processor_request,
                 "result": result,

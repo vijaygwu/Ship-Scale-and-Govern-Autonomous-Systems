@@ -385,6 +385,48 @@ def test_identity_service_issues_validates_and_audits_scoped_tokens(
     run_async(scenario())
 
 
+def test_validate_token_rejects_wrong_or_missing_issuer(
+    identity,
+    monkeypatch,
+    run_async,
+):
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("JWT_SECRET", STRONG_TEST_JWT_SECRET)
+
+    async def scenario():
+        service, _store = await _initialized_service_with_agent(identity)
+        token = await service.issue_token("agent_test")
+        payload = identity.jwt.decode(
+            token,
+            STRONG_TEST_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="agent-platform",
+            issuer="agent-identity-service",
+        )
+
+        bad_issuer = dict(payload)
+        bad_issuer["iss"] = "other-issuer"
+        bad_token = identity.jwt.encode(
+            bad_issuer,
+            STRONG_TEST_JWT_SECRET,
+            algorithm="HS256",
+        )
+        with pytest.raises(ValueError, match="Invalid token"):
+            await service.validate_token(bad_token)
+
+        missing_issuer = dict(payload)
+        missing_issuer.pop("iss")
+        missing_token = identity.jwt.encode(
+            missing_issuer,
+            STRONG_TEST_JWT_SECRET,
+            algorithm="HS256",
+        )
+        with pytest.raises(ValueError, match="Invalid token"):
+            await service.validate_token(missing_token)
+
+    run_async(scenario())
+
+
 @pytest.mark.parametrize("environment", ["production", "prod"])
 def test_identity_service_rejects_in_memory_key_vault_in_production(
     identity,
@@ -441,8 +483,11 @@ def test_identity_service_allows_marked_key_provider_in_production(
     class MarkedKeyVault(identity.KeyVault):
         is_production_key_provider = True
 
+    class DurableIdentityStore(identity.IdentityStore):
+        is_durable_production_store = True
+
     async def scenario():
-        store = identity.IdentityStore()
+        store = DurableIdentityStore()
         vault = MarkedKeyVault()
         ca = identity.CertificateAuthority(vault, store)
         service = identity.AgentIdentityService(store, vault, ca)
@@ -450,6 +495,29 @@ def test_identity_service_allows_marked_key_provider_in_production(
         await service.initialize()
 
         assert await vault.get_private_key(service.jwt_signing_key_id) is not None
+
+    run_async(scenario())
+
+
+def test_identity_service_rejects_in_memory_store_in_production(
+    identity,
+    monkeypatch,
+    run_async,
+):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("JWT_SECRET", STRONG_PRODUCTION_JWT_SECRET)
+
+    class MarkedKeyVault(identity.KeyVault):
+        is_production_key_provider = True
+
+    async def scenario():
+        store = identity.IdentityStore()
+        vault = MarkedKeyVault()
+        ca = identity.CertificateAuthority(vault, store)
+        service = identity.AgentIdentityService(store, vault, ca)
+
+        with pytest.raises(RuntimeError, match="durable identity store"):
+            await service.initialize()
 
     run_async(scenario())
 
@@ -718,6 +786,26 @@ def test_validate_delegation_rejections_are_audited(
 
         with pytest.raises(ValueError, match="Invalid delegation"):
             await service.validate_delegation("not-a-jwt")
+
+        wrong_issuer_token = await service.create_delegation(
+            human_claims,
+            "agent_test",
+            [identity.PermissionScope.DATA_READ],
+        )
+        wrong_issuer_payload = identity.jwt.decode(
+            wrong_issuer_token,
+            STRONG_TEST_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="agent-platform",
+        )
+        wrong_issuer_payload["iss"] = "other-issuer"
+        wrong_issuer_token = identity.jwt.encode(
+            wrong_issuer_payload,
+            STRONG_TEST_JWT_SECRET,
+            algorithm="HS256",
+        )
+        with pytest.raises(ValueError, match="Invalid delegation"):
+            await service.validate_delegation(wrong_issuer_token)
 
         denials = await store.query_audit_log(
             event_type=identity.AuditEventType.DELEGATION_REJECTED,

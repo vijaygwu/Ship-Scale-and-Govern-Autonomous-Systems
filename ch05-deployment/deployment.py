@@ -261,8 +261,13 @@ def lambda_handler(event: dict, context: Any) -> dict:
                 "remaining_time_ms": context.get_remaining_time_in_millis()
             })
         except Exception as metrics_err:
-            logger.warning(
-                "Metrics write failed for request %s: %s",
+            # Best-effort: metric write must not fail the request, but should
+            # not be silent either. Log with full traceback so operators see
+            # chronic failures in CloudWatch Logs.
+            # TODO[prod]: also emit a CloudWatch alarm on metric_name=
+            # "lambda_metric_write_failure" so chronic failures page someone.
+            logger.exception(
+                "CloudWatch metric write failed for request %s: %s",
                 context.aws_request_id, metrics_err,
             )
         
@@ -979,8 +984,19 @@ class CanaryConfig:
 class CanaryAnalyzer:
     """Analyzes canary metrics to determine health."""
     
-    def __init__(self, prometheus_url: str):
+    def __init__(
+        self,
+        prometheus_url: str,
+        query_max_attempts: int = 3,
+        query_backoff_seconds: float = 0.2,
+    ):
+        if query_max_attempts < 1:
+            raise ValueError("query_max_attempts must be >= 1")
+        if query_backoff_seconds < 0:
+            raise ValueError("query_backoff_seconds must be non-negative")
         self.prometheus_url = prometheus_url
+        self.query_max_attempts = query_max_attempts
+        self.query_backoff_seconds = query_backoff_seconds
         self._client: httpx.Client | None = None
         self.last_diagnostics: list[str] = []
 
@@ -1010,35 +1026,41 @@ class CanaryAnalyzer:
     
     def query_prometheus(self, query: str) -> float:
         """Execute a Prometheus query and return the result."""
-        try:
-            response = self.client.get(
-                f"{self.prometheus_url}/api/v1/query",
-                params={"query": query}
-            )
-            response.raise_for_status()
-            data = response.json()
+        last_error: Exception | None = None
+        for attempt in range(1, self.query_max_attempts + 1):
+            try:
+                response = self.client.get(
+                    f"{self.prometheus_url}/api/v1/query",
+                    params={"query": query}
+                )
+                response.raise_for_status()
+                data = response.json()
 
-            if data.get("status") != "success":
-                raise ValueError(data.get("error", "Prometheus query failed"))
+                if data.get("status") != "success":
+                    raise ValueError(data.get("error", "Prometheus query failed"))
 
-            results = data.get("data", {}).get("result", [])
-            if not results:
-                return 0.0
+                results = data.get("data", {}).get("result", [])
+                if not results:
+                    return 0.0
 
-            value = float(results[0]["value"][1])
-            if not math.isfinite(value):
-                raise ValueError(f"non-finite Prometheus value: {value}")
-            return value
-        except (
-            httpx.RequestError,
-            httpx.HTTPStatusError,
-            ValueError,
-            KeyError,
-            IndexError,
-            TypeError,
-            AttributeError,
-        ) as e:
-            raise RuntimeError(f"Prometheus query failed: {e}") from e
+                value = float(results[0]["value"][1])
+                if not math.isfinite(value):
+                    raise ValueError(f"non-finite Prometheus value: {value}")
+                return value
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                last_error = e
+                if attempt >= self.query_max_attempts:
+                    break
+                time.sleep(self.query_backoff_seconds * (2 ** (attempt - 1)))
+            except (
+                ValueError,
+                KeyError,
+                IndexError,
+                TypeError,
+                AttributeError,
+            ) as e:
+                raise RuntimeError(f"Prometheus query failed: {e}") from e
+        raise RuntimeError(f"Prometheus query failed: {last_error}") from last_error
     
     def get_success_rate(self, version: str, window: str = "5m") -> float:
         """Calculate request success rate for a version."""
@@ -1188,6 +1210,7 @@ class CanaryController:
 
 # scripts/canary_runner.py
 import asyncio
+import contextlib
 from typing import Callable
 
 
@@ -1225,6 +1248,8 @@ async def main(
         return await run_task
     finally:
         monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
 
 # ============================================================================
 # Block 8 (chapter listing #8)
@@ -1418,6 +1443,16 @@ class LaunchDarklyBackend(FlagBackend):
     
     def set_flag(self, name: str, value: Any) -> None:
         raise NotImplementedError("LaunchDarkly flags are managed via dashboard")
+
+    def close(self) -> None:
+        """Close the underlying SDK client. Idempotent."""
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                logger.exception("Failed to close LDClient cleanly")
+            finally:
+                self.client = None
 
 
 class FeatureFlagManager:
@@ -1705,6 +1740,25 @@ class FeatureFlagManager:
         """Clear the flag cache to pick up changes."""
         self._cache.clear()
 
+    def close(self) -> None:
+        """Close any backends that hold network/thread resources."""
+        for backend in self.backends:
+            close_fn = getattr(backend, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    logger.exception(
+                        "Failed to close flag backend %s",
+                        type(backend).__name__,
+                    )
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 _manager: Optional[FeatureFlagManager] = None
 
@@ -1797,13 +1851,33 @@ class CapabilityGatedAgent:
     
     def _advanced_process(self, request: dict, max_tools: int) -> dict:
         """Multi-step reasoning process."""
-        # Implementation with chain-of-thought, tool use, etc.
-        pass
+        requested_tools = request.get("tools", [])
+        if not isinstance(requested_tools, list):
+            requested_tools = []
+        tools = requested_tools[:max_tools]
+        prompt = request.get("prompt") or request.get("message") or ""
+
+        return {
+            "status": "ok",
+            "mode": "advanced",
+            "model_version": self.capabilities.model_version,
+            "tool_budget": max_tools,
+            "tools_scheduled": tools,
+            "response": f"Advanced reasoning response for: {prompt}",
+        }
     
     def _simple_process(self, request: dict, max_tools: int) -> dict:
         """Direct response without extensive reasoning."""
-        # Simpler implementation
-        pass
+        prompt = request.get("prompt") or request.get("message") or ""
+
+        return {
+            "status": "ok",
+            "mode": "simple",
+            "model_version": self.capabilities.model_version,
+            "tool_budget": max_tools,
+            "tools_scheduled": [],
+            "response": f"Simple response for: {prompt}",
+        }
 
 # ============================================================================
 # Block 10 (chapter listing #10)
@@ -2288,26 +2362,33 @@ Health check API endpoints.
 try:
     from fastapi import APIRouter, Response, status
 except ImportError:  # pragma: no cover - optional API package
+    class _FallbackRoute:
+        def __init__(self, path: str):
+            self.path = path
+
     class Response:
         status_code: int = 200
 
     class APIRouter:
         def __init__(self, *args: Any, **kwargs: Any):
-            pass
+            self.prefix = kwargs.get("prefix", "")
+            self.routes: list[_FallbackRoute] = []
 
         def get(self, *args: Any, **kwargs: Any):
+            path = args[0] if args else ""
+
             def decorator(func):
+                self.routes.append(_FallbackRoute(f"{self.prefix}{path}"))
                 return func
             return decorator
 
     class status:
         HTTP_503_SERVICE_UNAVAILABLE = 503
 
-router = APIRouter(prefix="/health", tags=["health"])
-
 
 def create_health_router(checker: HealthChecker) -> APIRouter:
     """Create health router with the given checker."""
+    router = APIRouter(prefix="/health", tags=["health"])
     
     @router.get("/live")
     async def liveness(response: Response):

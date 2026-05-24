@@ -279,6 +279,10 @@ class TaskResult:
 class TaskSuccessMetrics:
     """Track and analyze task success rates with multiple dimensions."""
 
+    _DEFAULT_TASK_TYPE = "default"
+    _OTHER_TASK_TYPE = "other"
+    _MAX_TRACKED_TASK_TYPES = 128
+
     def __init__(self):
         # Bounded ring buffer keeps recent results for analysis without
         # growing without bound in a long-running monitoring service. For
@@ -286,15 +290,29 @@ class TaskSuccessMetrics:
         # (Prometheus, CloudWatch) and keep only aggregate counters here.
         self._results: deque[TaskResult] = deque(maxlen=10_000)
         self._outcome_counts: dict[TaskOutcome, int] = defaultdict(int)
-        self._outcome_by_task_type: dict[str, dict[TaskOutcome, int]] = defaultdict(
-            lambda: defaultdict(int)
-        )
+        self._outcome_by_task_type: dict[str, dict[TaskOutcome, int]] = {}
+
+    def _normalise_task_type(self, task_type: str) -> str:
+        """Bound caller-provided task labels to a fixed number of buckets."""
+        task_type = task_type or self._DEFAULT_TASK_TYPE
+        if task_type in self._outcome_by_task_type:
+            return task_type
+
+        custom_type_limit = self._MAX_TRACKED_TASK_TYPES - 1
+        if len(self._outcome_by_task_type) < custom_type_limit:
+            return task_type
+        return self._OTHER_TASK_TYPE
 
     def record_result(self, result: TaskResult, task_type: str = "default") -> None:
         """Record a task result for metric calculation."""
         self._results.append(result)
         self._outcome_counts[result.outcome] += 1
-        self._outcome_by_task_type[task_type][result.outcome] += 1
+        task_type = self._normalise_task_type(task_type)
+        type_counts = self._outcome_by_task_type.setdefault(
+            task_type,
+            defaultdict(int),
+        )
+        type_counts[result.outcome] += 1
 
     def success_rate(self, include_partial: bool = True) -> float:
         """Calculate overall success rate.
@@ -319,6 +337,7 @@ class TaskSuccessMetrics:
 
     def success_rate_by_type(self, task_type: str) -> float:
         """Calculate success rate for a specific task type."""
+        task_type = self._normalise_task_type(task_type)
         type_counts = self._outcome_by_task_type.get(task_type, {})
         if not type_counts:
             return 0.0
@@ -875,7 +894,29 @@ from typing import Any, Callable, Optional
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+import atexit
+import threading
 import time
+
+
+# Shared, bounded executor for timeout-guarded collaborator calls.
+# Allocating a fresh ThreadPoolExecutor per call leaked worker threads when
+# a wedged call survived shutdown(wait=False); a small shared pool caps the
+# blast radius and is cleaned up at interpreter exit.
+_EXTERNAL_CALL_MAX_WORKERS = 4
+_EXTERNAL_CALL_MAX_PENDING = 8
+_EXTERNAL_CALL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_EXTERNAL_CALL_MAX_WORKERS,
+    thread_name_prefix="agent-external-call",
+)
+_EXTERNAL_CALL_SLOTS = threading.BoundedSemaphore(
+    _EXTERNAL_CALL_MAX_WORKERS + _EXTERNAL_CALL_MAX_PENDING
+)
+atexit.register(_EXTERNAL_CALL_EXECUTOR.shutdown, wait=False, cancel_futures=True)
+
+
+class ExternalCallSaturationError(TimeoutError):
+    """Raised when the shared sync-call executor cannot accept more work."""
 
 
 def _remaining_seconds(deadline: float) -> float:
@@ -892,28 +933,70 @@ def _call_with_timeout(
     *args: Any,
     timeout_seconds: float,
     deadline: float,
+    span: Any | None = None,
+    orphan_counter: Any | None = None,
+    saturation_counter: Any | None = None,
+    metric_attributes: dict[str, Any] | None = None,
 ) -> Any:
-    """Run one synchronous collaborator call with a bounded wait."""
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(
-        call,
-        *args,
-        timeout=timeout_seconds,
-        deadline=deadline,
-    )
+    """Run one synchronous collaborator call with bounded wait and capacity."""
+    attributes = metric_attributes or {"operation": operation_name}
+    slot_timeout = min(timeout_seconds, _remaining_seconds(deadline))
+    slot_limiter = _EXTERNAL_CALL_SLOTS
+    acquired = slot_limiter.acquire(timeout=slot_timeout)
+    if not acquired:
+        if span is not None:
+            span.set_attribute(f"{operation_name}.saturated", True)
+        _record_counter(
+            saturation_counter,
+            {**attributes, "error.type": "ExternalCallSaturationError"},
+        )
+        raise ExternalCallSaturationError(
+            f"{operation_name} shared executor saturated after "
+            f"{slot_timeout:.2f}s"
+        )
+
     try:
-        return future.result(timeout=timeout_seconds)
+        result_timeout = min(timeout_seconds, _remaining_seconds(deadline))
+        future = _EXTERNAL_CALL_EXECUTOR.submit(
+            call,
+            *args,
+            timeout=result_timeout,
+            deadline=deadline,
+        )
+    except Exception:
+        slot_limiter.release()
+        raise
+
+    future.add_done_callback(lambda _future: slot_limiter.release())
+
+    try:
+        return future.result(timeout=result_timeout)
     except FutureTimeoutError as exc:
-        future.cancel()
+        cancelled = future.cancel()
+        if span is not None:
+            span.set_attribute(
+                f"{operation_name}.cancelled_after_timeout",
+                cancelled,
+            )
+        if not cancelled:
+            if span is not None:
+                span.set_attribute(
+                    f"{operation_name}.orphaned_after_timeout",
+                    True,
+                )
+            _record_counter(
+                orphan_counter,
+                {**attributes, "error.type": "TimeoutError"},
+            )
         raise TimeoutError(
             f"{operation_name} timed out after {timeout_seconds:.2f}s"
         ) from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _record_counter(counter: Any, attributes: dict[str, Any]) -> None:
     """Best-effort metrics recording should not mask the request result."""
+    if counter is None:
+        return
     try:
         counter.add(1, attributes)
     except Exception:
@@ -937,6 +1020,8 @@ def _call_with_retries(
     span: Any,
     retry_counter: Any,
     timeout_counter: Any,
+    orphan_counter: Any,
+    saturation_counter: Any,
 ) -> Any:
     """Call a model or tool with deadline-aware transient retries."""
     for attempt in range(1, max_attempts + 1):
@@ -963,6 +1048,10 @@ def _call_with_retries(
                 *args,
                 timeout_seconds=attempt_timeout,
                 deadline=deadline,
+                span=span,
+                orphan_counter=orphan_counter,
+                saturation_counter=saturation_counter,
+                metric_attributes=attributes,
             )
         except TimeoutError as exc:
             _record_counter(
@@ -1039,6 +1128,16 @@ def trace_agent_request_example(
         description="Model/tool timeouts",
         unit="1",
     )
+    orphan_counter = meter.create_counter(
+        "agent.external_call.orphaned",
+        description="Timed-out sync calls that could not be cancelled",
+        unit="1",
+    )
+    saturation_counter = meter.create_counter(
+        "agent.external_call.saturation",
+        description="Sync calls rejected by shared executor backpressure",
+        unit="1",
+    )
     deadline = time.monotonic() + request_timeout_seconds
 
     with tracer.start_as_current_span(
@@ -1071,6 +1170,8 @@ def trace_agent_request_example(
                         span=model_span,
                         retry_counter=retry_counter,
                         timeout_counter=timeout_counter,
+                        orphan_counter=orphan_counter,
+                        saturation_counter=saturation_counter,
                     )
                     prompt_tokens = model_response.get("prompt_tokens", 0)
                     completion_tokens = model_response.get("completion_tokens", 0)
@@ -1106,6 +1207,8 @@ def trace_agent_request_example(
                         span=tool_span,
                         retry_counter=retry_counter,
                         timeout_counter=timeout_counter,
+                        orphan_counter=orphan_counter,
+                        saturation_counter=saturation_counter,
                     )
                     tool_span.set_attribute(
                         "tool.result_type",
@@ -1408,6 +1511,28 @@ from typing import Any, Optional
 from dataclasses import dataclass
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threaded metrics server with bounded backlog and socket timeouts."""
+    daemon_threads = True
+    request_queue_size = 32
+
+    def __init__(
+        self,
+        server_address,
+        RequestHandlerClass,
+        connection_timeout: float = 5.0,
+        request_queue_size: int = 32,
+    ):
+        self.connection_timeout = connection_timeout
+        self.request_queue_size = request_queue_size
+        super().__init__(server_address, RequestHandlerClass)
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        sock.settimeout(self.connection_timeout)
+        return sock, addr
 
 
 class PrometheusAgentMetrics:
@@ -1769,7 +1894,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
 @dataclass
 class MetricsServerHandle:
     """Owns the background metrics server and its serving thread."""
-    server: ThreadingHTTPServer
+    server: BoundedThreadingHTTPServer
     thread: threading.Thread
     shutdown_timeout: float = 5.0
 
@@ -1798,7 +1923,10 @@ class MetricsServerHandle:
 
 def start_metrics_server(
     metrics: PrometheusAgentMetrics,
-    port: int = 9090
+    port: int = 9090,
+    host: str = "127.0.0.1",
+    request_queue_size: int = 32,
+    connection_timeout: float = 5.0,
 ) -> MetricsServerHandle:
     """Start a Prometheus metrics server in a background thread.
 
@@ -1813,7 +1941,12 @@ def start_metrics_server(
         {'metrics': metrics}
     )
 
-    server = ThreadingHTTPServer(('0.0.0.0', port), handler)
+    server = BoundedThreadingHTTPServer(
+        (host, port),
+        handler,
+        connection_timeout=connection_timeout,
+        request_queue_size=request_queue_size,
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -1829,6 +1962,7 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from collections import deque
 import logging
+import queue
 import sys
 import threading
 import time
@@ -1854,6 +1988,8 @@ class MetricSnapshot:
     model_calls: int
     model_error_rate: float
     estimated_cost_usd: float
+    callback_notifications_dropped: int = 0
+    callback_errors: int = 0
 
 
 class AgentMetrics:
@@ -1869,8 +2005,15 @@ class AgentMetrics:
         agent_id: str,
         window_size: int = 1000,
         prometheus_metrics: Optional[PrometheusAgentMetrics] = None,
-        otel_instrumentation: Optional[OpenTelemetryAgentInstrumentation] = None
+        otel_instrumentation: Optional[OpenTelemetryAgentInstrumentation] = None,
+        max_metric_callbacks: int = 64,
+        callback_queue_size: int = 1024,
     ):
+        if max_metric_callbacks < 0:
+            raise ValueError("max_metric_callbacks must be non-negative")
+        if callback_queue_size <= 0:
+            raise ValueError("callback_queue_size must be positive")
+
         self.agent_id = agent_id
         self.window_size = window_size
         self.prometheus = prometheus_metrics
@@ -1899,20 +2042,95 @@ class AgentMetrics:
         self._last_task_at: Optional[datetime] = None
         self._active_tasks = 0
 
-        # Callbacks for custom metric handling
-        self._metric_callbacks: list[Callable[[str, Any], None]] = []
+        # Callbacks for custom metric handling. Callback execution is bounded
+        # and asynchronous so instrumentation cannot block request completion.
+        self._max_metric_callbacks = max_metric_callbacks
+        self._metric_callbacks: dict[str, Callable[[str, Any], None]] = {}
+        self._next_callback_id = 0
+        self._callback_queue: queue.Queue[tuple[str, Any] | None] = queue.Queue(
+            maxsize=callback_queue_size
+        )
+        self._callback_notifications_dropped = 0
+        self._callback_errors = 0
+        self._callback_worker = threading.Thread(
+            target=self._run_callback_worker,
+            name=f"agent-metrics-callbacks-{agent_id}",
+            daemon=True,
+        )
+        self._callback_worker.start()
 
-    def add_callback(self, callback: Callable[[str, Any], None]) -> None:
+    def add_callback(self, callback: Callable[[str, Any], None]) -> str:
         """Register a callback for metric updates."""
-        self._metric_callbacks.append(callback)
+        with self._lock:
+            if len(self._metric_callbacks) >= self._max_metric_callbacks:
+                raise RuntimeError("metric callback registry is full")
+            callback_id = f"callback-{self._next_callback_id}"
+            self._next_callback_id += 1
+            self._metric_callbacks[callback_id] = callback
+            return callback_id
+
+    def remove_callback(self, callback_id: str) -> bool:
+        """Remove a registered metric callback by id."""
+        with self._lock:
+            return self._metric_callbacks.pop(callback_id, None) is not None
 
     def _notify_callbacks(self, metric_name: str, value: Any) -> None:
-        """Notify all registered callbacks of a metric update."""
-        for callback in list(self._metric_callbacks):
-            try:
-                callback(metric_name, value)
-            except Exception as e:
-                logger.debug(f"Metric callback error suppressed: {e}", exc_info=True)
+        """Queue a metric update for registered callbacks."""
+        with self._lock:
+            has_callbacks = bool(self._metric_callbacks)
+        if not has_callbacks:
+            return
+
+        try:
+            self._callback_queue.put_nowait((metric_name, value))
+        except queue.Full:
+            with self._lock:
+                self._callback_notifications_dropped += 1
+
+    def _run_callback_worker(self) -> None:
+        """Run metric callbacks away from the business request path."""
+        while True:
+            item = self._callback_queue.get()
+            if item is None:
+                self._callback_queue.task_done()
+                return
+
+            metric_name, value = item
+            with self._lock:
+                callbacks = list(self._metric_callbacks.values())
+
+            for callback in callbacks:
+                try:
+                    callback(metric_name, value)
+                except Exception as e:
+                    with self._lock:
+                        self._callback_errors += 1
+                    logger.debug(
+                        "Metric callback error suppressed: %s",
+                        e,
+                        exc_info=True,
+                    )
+            self._callback_queue.task_done()
+
+    def wait_for_callbacks(self, timeout: float | None = None) -> bool:
+        """Wait for queued callbacks to drain; intended for shutdown/tests."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._callback_queue.unfinished_tasks:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+        return True
+
+    def close(self, timeout: float | None = 1.0) -> None:
+        """Stop the callback worker after draining queued notifications."""
+        self.wait_for_callbacks(timeout=timeout)
+        try:
+            self._callback_queue.put_nowait(None)
+        except queue.Full:
+            with self._lock:
+                self._callback_notifications_dropped += 1
+            return
+        self._callback_worker.join(timeout=timeout)
 
     def _call_metric_backend(
         self,
@@ -2214,7 +2432,11 @@ class AgentMetrics:
                 tool_error_rate=tool_error_rate,
                 model_calls=self._model_calls,
                 model_error_rate=model_error_rate,
-                estimated_cost_usd=self._total_cost
+                estimated_cost_usd=self._total_cost,
+                callback_notifications_dropped=(
+                    self._callback_notifications_dropped
+                ),
+                callback_errors=self._callback_errors,
             )
 
 # ============================================================================

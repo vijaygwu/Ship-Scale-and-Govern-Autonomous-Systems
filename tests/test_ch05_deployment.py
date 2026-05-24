@@ -125,6 +125,43 @@ class TargetingBackend:
         pass
 
 
+class FakePrometheusResponse:
+    def __init__(self, value: str = "0.99") -> None:
+        self.value = value
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self):
+        return {
+            "status": "success",
+            "data": {
+                "result": [
+                    {
+                        "value": [123.0, self.value],
+                    }
+                ],
+            },
+        }
+
+
+class FlakyPrometheusClient:
+    def __init__(self, httpx_module) -> None:
+        self.is_closed = False
+        self.calls = 0
+        self.httpx_module = httpx_module
+
+    def get(self, url, params):
+        del url, params
+        self.calls += 1
+        if self.calls == 1:
+            raise self.httpx_module.RequestError("temporary network failure")
+        return FakePrometheusResponse("0.97")
+
+    def close(self) -> None:
+        self.is_closed = True
+
+
 def test_feature_flag_backend_failure_uses_next_backend_and_default(
     deployment,
     monkeypatch,
@@ -168,6 +205,23 @@ def test_feature_flag_manager_passes_targeting_context_to_backend(
         ("advanced_reasoning", "disabled-user", None),
         ("advanced_reasoning", "context-user", context),
     ]
+
+
+def test_canary_analyzer_retries_transient_prometheus_request_error(
+    deployment,
+    monkeypatch,
+) -> None:
+    analyzer = deployment.CanaryAnalyzer(
+        "https://prometheus.example",
+        query_max_attempts=2,
+        query_backoff_seconds=0,
+    )
+    fake_client = FlakyPrometheusClient(deployment.httpx)
+    analyzer._client = fake_client
+    monkeypatch.setattr(deployment.time, "sleep", lambda _seconds: None)
+
+    assert analyzer.query_prometheus("up") == 0.97
+    assert fake_client.calls == 2
 
 
 def test_graceful_shutdown_times_out_hung_callback_and_continues(
@@ -362,6 +416,40 @@ def test_canary_zero_duration_stage_runs_post_shift_analysis(deployment) -> None
     asyncio.run(run_test())
 
 
+def test_canary_main_awaits_cancelled_monitor_cleanup(
+    deployment,
+    monkeypatch,
+) -> None:
+    async def run_test() -> None:
+        cleanup_finished = False
+
+        class FastController:
+            async def run(self) -> bool:
+                return True
+
+        async def monitor(controller, pager_check, budget_check) -> None:
+            nonlocal cleanup_finished
+            del controller, pager_check, budget_check
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleanup_finished = True
+
+        monkeypatch.setattr(deployment, "external_monitor", monitor)
+
+        result = await deployment.main(
+            FastController(),
+            lambda: False,
+            lambda: False,
+        )
+
+        assert result is True
+        assert cleanup_finished is True
+
+    asyncio.run(run_test())
+
+
 def test_liveness_runs_only_critical_checks(deployment) -> None:
     async def run_test() -> None:
         calls = []
@@ -395,6 +483,38 @@ def test_liveness_runs_only_critical_checks(deployment) -> None:
         assert calls == ["critical"]
 
     asyncio.run(run_test())
+
+
+def test_health_router_repeated_app_factories_do_not_accumulate_routes(
+    deployment,
+) -> None:
+    def build_app():
+        checker = deployment.HealthChecker(check_timeout_s=0.01)
+        router = deployment.create_health_router(checker)
+        app = deployment.FastAPI()
+        if hasattr(app, "include_router"):
+            app.include_router(router)
+            return app
+        return router
+
+    def health_paths(app_or_router) -> list[str]:
+        return sorted(
+            route.path
+            for route in getattr(app_or_router, "routes", [])
+            if route.path.startswith("/health/")
+        )
+
+    expected_paths = [
+        "/health/detailed",
+        "/health/live",
+        "/health/ready",
+    ]
+
+    first_app = build_app()
+    second_app = build_app()
+
+    assert health_paths(first_app) == expected_paths
+    assert health_paths(second_app) == expected_paths
 
 
 def test_httpx_imports_use_optional_dependency_guard() -> None:

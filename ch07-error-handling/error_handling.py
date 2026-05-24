@@ -288,7 +288,11 @@ logger = logging.getLogger(__name__)
 # functions (generate_response, get_product_recommendation). Replace with
 # your actual client instance (e.g., an anthropic.AsyncAnthropic() or
 # openai.AsyncOpenAI() handle) in your application before calling them.
-llm_client = None
+from _optional import _RequiredDependency
+llm_client = _RequiredDependency(
+    "llm_client",
+    "Provide an Anthropic/OpenAI client before running these examples."
+)
 
 T = TypeVar('T')
 
@@ -876,6 +880,7 @@ class CircuitBreaker(Generic[T]):
         self._state = CircuitState.CLOSED
         self._state_lock = threading.RLock()
         self._last_failure_time: Optional[datetime] = None
+        self._last_failure_monotonic: Optional[float] = None
         self._half_open_calls = 0
         self._half_open_successes = 0
         self._half_open_generation = 0
@@ -902,10 +907,10 @@ class CircuitBreaker(Generic[T]):
     
     def _should_attempt_reset(self) -> bool:
         """Check if enough time has passed to attempt reset."""
-        if self._last_failure_time is None:
+        if self._last_failure_monotonic is None:
             return True
-        elapsed = datetime.now(timezone.utc) - self._last_failure_time
-        return elapsed >= self.config.timeout
+        elapsed = _time.monotonic() - self._last_failure_monotonic
+        return elapsed >= self.config.timeout.total_seconds()
     
     def _transition_to(self, new_state: CircuitState) -> None:
         """Transition to a new state with callback notification."""
@@ -958,6 +963,7 @@ class CircuitBreaker(Generic[T]):
                 and self._should_open()
             ):
                 self._last_failure_time = now
+                self._last_failure_monotonic = _time.monotonic()
                 self._transition_to(CircuitState.OPEN)
     
     def _record_failure(
@@ -971,6 +977,7 @@ class CircuitBreaker(Generic[T]):
             self._total_failures += 1
             now = datetime.now(timezone.utc)
             self._last_failure_time = now
+            self._last_failure_monotonic = _time.monotonic()
             self._call_history.append(CallResult(
                 timestamp=now,
                 success=False,
@@ -1119,18 +1126,18 @@ class CircuitBreaker(Generic[T]):
             if fallback:
                 return await fallback()
             
-            time_until_retry = (
-                self.config.timeout -
-                (datetime.now(timezone.utc) - self._last_failure_time)
-                if self._last_failure_time else self.config.timeout
+            elapsed = (
+                _time.monotonic() - self._last_failure_monotonic
+                if self._last_failure_monotonic is not None else 0.0
             )
+            time_until_retry = self.config.timeout - timedelta(seconds=elapsed)
             raise CircuitBreakerError(self.name, time_until_retry)
         
-        start_time = datetime.now(timezone.utc)
+        start_time = _time.monotonic()
         try:
             result = await operation()
             self._record_success(
-                datetime.now(timezone.utc) - start_time,
+                timedelta(seconds=_time.monotonic() - start_time),
                 half_open_generation
             )
             return result
@@ -1141,7 +1148,7 @@ class CircuitBreaker(Generic[T]):
         except Exception as e:
             self._record_failure(
                 e,
-                datetime.now(timezone.utc) - start_time,
+                timedelta(seconds=_time.monotonic() - start_time),
                 half_open_generation
             )
             raise
@@ -1167,25 +1174,25 @@ class CircuitBreaker(Generic[T]):
             if fallback:
                 return fallback()
             
-            time_until_retry = (
-                self.config.timeout -
-                (datetime.now(timezone.utc) - self._last_failure_time)
-                if self._last_failure_time else self.config.timeout
+            elapsed = (
+                _time.monotonic() - self._last_failure_monotonic
+                if self._last_failure_monotonic is not None else 0.0
             )
+            time_until_retry = self.config.timeout - timedelta(seconds=elapsed)
             raise CircuitBreakerError(self.name, time_until_retry)
         
-        start_time = datetime.now(timezone.utc)
+        start_time = _time.monotonic()
         try:
             result = operation()
             self._record_success(
-                datetime.now(timezone.utc) - start_time,
+                timedelta(seconds=_time.monotonic() - start_time),
                 half_open_generation
             )
             return result
         except Exception as e:
             self._record_failure(
                 e,
-                datetime.now(timezone.utc) - start_time,
+                timedelta(seconds=_time.monotonic() - start_time),
                 half_open_generation
             )
             raise
@@ -2719,6 +2726,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timedelta, timezone
 import threading
 import statistics
+import time
 
 
 @dataclass
@@ -2758,6 +2766,7 @@ class ErrorAggregator:
         max_affected_operations: int = 25,
         max_errors_per_window: int = 10_000,
         max_errors_per_bucket: int = 1_000,
+        cleanup_interval: float = 5.0,
     ):
         self.window_size = window_size
         self.pattern_threshold = pattern_threshold
@@ -2767,22 +2776,29 @@ class ErrorAggregator:
         self.max_affected_operations = max(1, max_affected_operations)
         self.max_errors_per_window = max(1, max_errors_per_window)
         self.max_errors_per_bucket = max(1, max_errors_per_bucket)
-        
+        self.cleanup_interval = cleanup_interval
+
         self._errors = deque(maxlen=self.max_errors_per_window)
         self._patterns: Dict[str, ErrorPattern] = {}
         self._lock = threading.Lock()
-        
+        # Throttle the O(N) pattern/correlation rebuild so record() stays cheap
+        # on hot paths. Cleanup still runs at every read-side query.
+        self._last_cleanup_at: float = 0.0
+
         # Correlation tracking
         self._component_correlations: Dict[Tuple[str, str], int] = defaultdict(int)
         self._temporal_buckets = defaultdict(
             lambda: deque(maxlen=self.max_errors_per_bucket)
         )
-    
+
     def record(self, error: AgentError) -> None:
         """Record an error for aggregation."""
         with self._lock:
             self._errors.append(error)
-            self._cleanup_windowed_state()
+            now = time.monotonic()
+            if now - self._last_cleanup_at >= self.cleanup_interval:
+                self._cleanup_windowed_state()
+                self._last_cleanup_at = now
     
     def _cleanup_windowed_state(self) -> None:
         """Keep all aggregate state scoped to the analysis window."""

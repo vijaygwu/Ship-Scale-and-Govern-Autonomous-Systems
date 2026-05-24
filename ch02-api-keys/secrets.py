@@ -150,6 +150,10 @@ class SecretMetadata:
     expires_at: Optional[datetime]
     rotation_due: Optional[datetime]
     tags: dict[str, str] = field(default_factory=dict)
+    # ``is_binary`` is True when the backend returned non-UTF-8 bytes (e.g.,
+    # a DER certificate or raw key material). In that case ``secret_value``
+    # is a base64-encoded string that the caller must decode before use.
+    is_binary: bool = False
 
 
 @dataclass
@@ -192,7 +196,7 @@ class AuditLogger(ABC):
     """Abstract base class for audit logging."""
     
     @abstractmethod
-    def log(self, event: AuditEvent) -> None:
+    def log(self, event: AuditEvent) -> Any:
         """Log an audit event."""
         pass
 
@@ -311,6 +315,16 @@ class SecretAccessDeniedError(Exception):
 
 class SecretRotationError(Exception):
     """Raised when secret rotation fails."""
+    pass
+
+
+class SecretRetryExhaustedError(Exception):
+    """Raised when a retry budget is exhausted without success.
+
+    Distinct from the underlying transport error so callers can tell
+    "we gave up after N attempts" apart from "this is a fatal error
+    that should not be retried" (e.g.\\ a Forbidden response).
+    """
     pass
 
 # ============================================================================
@@ -444,7 +458,13 @@ class HashiCorpVaultProvider(SecretBackendProvider):
                     e,
                 )
                 time.sleep(delay)
-        
+        # Loop fell through without returning or raising. The retry budget
+        # is exhausted; surface that explicitly so callers do not silently
+        # receive ``None`` from an apparently successful call.
+        raise SecretRetryExhaustedError(
+            f"Retry budget exhausted after {self._max_retries} attempts"
+        )
+
     def get_secret(self, secret_id: str, version: Optional[str] = None) -> tuple[str, SecretMetadata]:
         """Retrieve a secret from Vault."""
         client = self._get_client()
@@ -628,29 +648,35 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
             response = client.get_secret_value(**kwargs)
             
             # Secrets Manager stores either string or binary
+            is_binary = False
             if 'SecretString' in response:
                 secret_value = response['SecretString']
             else:
                 import base64
                 # Binary secrets may not be valid UTF-8 (DER certificates,
-                # raw key material). ``errors='replace'`` surfaces a logged
-                # value instead of bubbling UnicodeDecodeError to the caller;
-                # the metadata records the original byte length so callers
-                # can detect a non-text payload.
-                secret_value = base64.b64decode(
-                    response['SecretBinary']
-                ).decode("utf-8", errors="replace")
-            
+                # raw key material). Decoding with ``errors='replace'``
+                # silently corrupts byte payloads with U+FFFD; instead, try
+                # strict UTF-8 first and fall back to base64 so callers get
+                # a deterministic round-trippable string. ``is_binary`` on
+                # the metadata signals which path produced the value.
+                raw_bytes = base64.b64decode(response['SecretBinary'])
+                try:
+                    secret_value = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    secret_value = base64.b64encode(raw_bytes).decode("ascii")
+                    is_binary = True
+
             # Get additional metadata
             describe_response = client.describe_secret(SecretId=secret_id)
-            
+
             metadata = SecretMetadata(
                 secret_id=secret_id,
                 version=response['VersionId'],
                 created_at=response['CreatedDate'],
                 expires_at=None,
                 rotation_due=describe_response.get('NextRotationDate'),
-                tags={t['Key']: t['Value'] for t in describe_response.get('Tags', [])}
+                tags={t['Key']: t['Value'] for t in describe_response.get('Tags', [])},
+                is_binary=is_binary,
             )
             
             return secret_value, metadata
@@ -772,7 +798,8 @@ class SecretManager:
         allowed_secret_patterns: Optional[list[str]] = None,
         default_cache_ttl: int = 300,
         audit_logger: Optional[AuditLogger] = None,
-        rotation_check_interval: Optional[int] = 3600
+        rotation_check_interval: Optional[int] = 3600,
+        require_audit_success: bool = False
     ):
         """
         Initialize the SecretManager.
@@ -783,20 +810,24 @@ class SecretManager:
             backend: Which secret backend to use.
             backend_config: Backend-specific configuration.
             allowed_secret_patterns: Glob patterns for secrets this agent can access.
+                Defaults to deny-all; pass explicit patterns for every agent.
             default_cache_ttl: Default cache TTL in seconds.
             audit_logger: Custom audit logger implementation.
             rotation_check_interval: How often to check for rotation needs (seconds).
                 Set to None to disable the background monitor. The monitor starts
                 lazily when the first rotation callback is registered.
+            require_audit_success: If true, successful reads fail closed when the
+                audit logger reports that the event could not be accepted.
         """
         if rotation_check_interval is not None and rotation_check_interval <= 0:
             raise ValueError("rotation_check_interval must be positive or None")
 
         self._agent_id = agent_id
         self._agent_role = agent_role
-        self._allowed_patterns = allowed_secret_patterns or ["*"]
+        self._allowed_patterns = list(allowed_secret_patterns or [])
         self._default_cache_ttl = default_cache_ttl
         self._audit_logger = audit_logger or StructuredAuditLogger()
+        self._require_audit_success = require_audit_success
         self._rotation_check_interval = rotation_check_interval
         provider_config = dict(backend_config)
         if backend == SecretBackend.ENVIRONMENT:
@@ -908,7 +939,7 @@ class SecretManager:
         version: Optional[str] = None,
         context: Optional[dict] = None,
         error: Optional[str] = None
-    ) -> None:
+    ) -> Any:
         """Record an audit event."""
         event = AuditEvent(
             timestamp=datetime.now(timezone.utc),
@@ -922,7 +953,27 @@ class SecretManager:
             context=context or {},
             error_message=error
         )
-        self._audit_logger.log(event)
+        return self._audit_logger.log(event)
+
+    def _audit_delivery_accepted(self, result: Any) -> bool:
+        """Return true when the audit logger accepted the event for delivery."""
+        if result is None:
+            return True
+        if getattr(result, "error", None):
+            return False
+        if getattr(result, "queued", False):
+            return True
+        return bool(getattr(result, "delivered", False))
+
+    def _require_successful_audit(self, result: Any) -> None:
+        """Fail closed if policy requires an accepted audit event."""
+        if (
+            self._require_audit_success
+            and not self._audit_delivery_accepted(result)
+        ):
+            raise SecretAccessDeniedError(
+                "Secret audit delivery failed; refusing to return secret"
+            )
         
     def get_secret(
         self,
@@ -974,7 +1025,7 @@ class SecretManager:
                 if cache_key in self._cache:
                     cached = self._cache[cache_key]
                     if not cached.is_expired:
-                        self._audit(
+                        audit_result = self._audit(
                             "secret_access",
                             secret_id,
                             "read",
@@ -982,6 +1033,7 @@ class SecretManager:
                             version=cached.metadata.version,
                             context={**(context or {}), "cache_hit": True}
                         )
+                        self._require_successful_audit(audit_result)
                         return cached.value
         
         # Fetch from backend
@@ -1002,7 +1054,7 @@ class SecretManager:
                 with self._cache_lock:
                     self._cache[cache_key] = cached_secret
             
-            self._audit(
+            audit_result = self._audit(
                 "secret_access",
                 secret_id,
                 "read",
@@ -1010,6 +1062,7 @@ class SecretManager:
                 version=metadata.version,
                 context={**(context or {}), "cache_hit": False}
             )
+            self._require_successful_audit(audit_result)
             
             return value
             
@@ -1753,6 +1806,9 @@ class SIEMAuditMetrics:
     circuit_open_total: int
 
 
+MAX_BACKOFF_SECONDS = 30.0
+
+
 class SIEMSender(Protocol):
     """Callable transport used by SIEM delivery; inject one in tests."""
     def __call__(
@@ -1848,7 +1904,8 @@ def send_to_siem(
             last_error = str(exc)
 
         if attempt < attempts:
-            time.sleep(backoff_seconds * attempt)
+            delay = min(MAX_BACKOFF_SECONDS, backoff_seconds * (2 ** attempt))
+            time.sleep(random.uniform(0, delay))
 
     return SIEMDeliveryResult(
         delivered=False,
@@ -2048,6 +2105,30 @@ class SIEMAuditLogger(AuditLogger):
         """Return failed-buffer drop count."""
         with self._failed_events_lock:
             return self._dropped_failed_events_total
+
+    def _buffer_undrained_queue(self, error: str) -> int:
+        """Move queued events into the failed-event buffer during close."""
+        buffered_count = 0
+        while True:
+            try:
+                event = self._delivery_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            result = SIEMDeliveryResult(
+                delivered=False,
+                attempts=0,
+                error=error,
+                buffered=True,
+                queue_depth=self._delivery_queue.qsize(),
+                dropped_failed_events_total=self._dropped_failed_total(),
+                circuit_open=self._circuit_open(),
+            )
+            self._buffer_failed_event(event, result)
+            self._delivery_queue.task_done()
+            buffered_count += 1
+
+        return buffered_count
 
     def _worker_loop(self) -> None:
         """Deliver queued audit events outside the secret access path."""
@@ -2312,18 +2393,64 @@ class SIEMAuditLogger(AuditLogger):
                 self._delivery_queue.all_tasks_done.wait(remaining)
         return True
 
-    def close(self, timeout: float = 5.0) -> None:
-        """Stop the background worker after draining or buffering queued work."""
-        self._shutdown_event.set()
-        if (
-            self._worker_thread.is_alive()
-            and self._worker_thread is not threading.current_thread()
-        ):
-            self._worker_thread.join(timeout=timeout)
+    def close(self, timeout: float = 5.0) -> bool:
+        """
+        Flush queued audit events and stop the worker.
 
-    def shutdown(self) -> None:
+        Returns ``False`` if the queue could not drain or the worker could not
+        stop before the timeout. Any events still waiting in the delivery queue
+        after a flush timeout are moved into the failed-event buffer so callers
+        can retry them with ``drain_failed_events()`` instead of losing them on
+        process exit.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be >= 0")
+
+        if self._worker_thread is threading.current_thread():
+            self._shutdown_event.set()
+            return False
+
+        drained = self.flush(timeout=timeout)
+        buffered_count = 0
+        if not drained:
+            self._shutdown_event.set()
+            buffered_count = self._buffer_undrained_queue(
+                "SIEM audit logger closed before delivery queue drained"
+            )
+            logger.error(
+                "SIEM audit close timed out; queued events buffered",
+                extra={
+                    "client_id": self._client_id,
+                    "buffered_queued_events": buffered_count,
+                    "queue_depth": self._delivery_queue.qsize(),
+                    "dropped_failed_events_total": (
+                        self._dropped_failed_total()
+                    ),
+                },
+            )
+        else:
+            self._shutdown_event.set()
+
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=timeout if drained else 0)
+
+        stopped = not self._worker_thread.is_alive()
+        if not stopped:
+            logger.error(
+                "SIEM audit worker did not stop before close timeout",
+                extra={
+                    "client_id": self._client_id,
+                    "queue_drained": drained,
+                    "buffered_queued_events": buffered_count,
+                    "queue_depth": self._delivery_queue.qsize(),
+                },
+            )
+
+        return drained and stopped
+
+    def shutdown(self) -> bool:
         """Backward-compatible alias for close()."""
-        self.close()
+        return self.close()
 
     def __enter__(self) -> "SIEMAuditLogger":
         """Use this logger as a context manager."""

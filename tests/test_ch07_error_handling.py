@@ -4,10 +4,12 @@ from __future__ import annotations
 import importlib
 import asyncio
 import concurrent.futures
+import inspect
 import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -474,3 +476,10 @@ def test_decorrelated_jitter_resets_previous_delay_for_new_sequence(
     assert jitter.calculate_delay(attempt=1, base_delay=2.0) == 18.0
     assert jitter.calculate_delay(attempt=0, base_delay=2.0) == 6.0
     assert calls == [(2.0, 6.0), (2.0, 18.0), (2.0, 6.0)]
+
+
+def test_circuit_breaker_elapsed_paths_use_monotonic_clock(eh_mod):
+    source = inspect.getsource(eh_mod.CircuitBreaker)
+    assert "_last_failure_monotonic" in source
+    assert "start_time = _time.monotonic()" in source
+    assert "datetime.now(timezone.utc) - start_time" not in source

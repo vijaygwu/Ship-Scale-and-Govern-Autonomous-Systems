@@ -95,6 +95,15 @@ def _optional_test_module(module_name: str):
     except ImportError:
         return _MissingModule(module_name)
 
+
+def _optional_test_class(module_name: str, class_name: str):
+    """Return an optional test class, or None so pytest can skip its tests."""
+    try:
+        module = __import__(module_name, fromlist=[class_name])
+    except ImportError:
+        return None
+    return getattr(module, class_name)
+
 Agent = _RequiredDependency(  # TODO[1]: see checklist
     "Agent",
     "Replace with your real Agent class when adapting this example.",
@@ -744,6 +753,7 @@ Unit tests for agent decision-making logic.
 import ast
 import operator
 import pytest
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -836,17 +846,35 @@ class Agent:
         cancellation_token: Any | None = None,
     ) -> SimpleAgentResult:
         """Run the example agent against the scripted MockLLM responses."""
-        del timeout  # MockLLM is in-process; real agents should honor this.
+        deadline = time.monotonic() + timeout if timeout is not None else None
+
+        def check_deadline() -> None:
+            if cancellation_token is not None and cancellation_token.cancel_requested:
+                raise TimeoutError("agent run cancelled")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("agent run timed out")
+
+        def time_remaining() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
         messages = self._messages_for(message)
         tool_calls: list[MockToolCall] = []
         has_error = False
         error: Exception | None = None
 
         for _ in range(self.config.max_iterations + 1):
-            if cancellation_token is not None and cancellation_token.cancel_requested:
-                raise TimeoutError("agent run cancelled")
+            check_deadline()
 
-            response = self.llm.complete(messages, tools=self.tools.to_llm_tools())
+            remaining = time_remaining()
+            kwargs = {"timeout": remaining} if remaining is not None else {}
+            response = self.llm.complete(
+                messages,
+                tools=self.tools.to_llm_tools(),
+                **kwargs,
+            )
+            check_deadline()
 
             if not response.tool_calls:
                 final_response = response.content or ""
@@ -865,6 +893,7 @@ class Agent:
             tool_calls.extend(response.tool_calls)
             messages.append(response.to_message())
             for tool_call in response.tool_calls:
+                check_deadline()
                 try:
                     tool_result = self.tools.execute(
                         tool_call.name,
@@ -880,6 +909,7 @@ class Agent:
                     "tool_call_id": tool_call.id,
                     "content": content,
                 })
+                check_deadline()
 
         return SimpleAgentResult(
             final_response="Stopped after reaching the iteration limit.",
@@ -1123,17 +1153,24 @@ import pytest
 import httpx
 try:
     import respx
+    _HAS_RESPX = True
 except ImportError:  # pragma: no cover - optional integration-test dependency
     respx = _MissingRespx()
+    _HAS_RESPX = False
 from pathlib import Path
-WebSearchTool = _optional_test_module("src.tools.web_search").WebSearchTool
-FileOperationsTool = _optional_test_module(
-    "src.tools.file_operations"
-).FileOperationsTool
-DatabaseTool = _optional_test_module("src.tools.database").DatabaseTool
+WebSearchTool = _optional_test_class("src.tools.web_search", "WebSearchTool")
+FileOperationsTool = _optional_test_class(
+    "src.tools.file_operations",
+    "FileOperationsTool",
+)
+DatabaseTool = _optional_test_class("src.tools.database", "DatabaseTool")
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    WebSearchTool is None or not _HAS_RESPX,
+    reason="requires src.tools.web_search and respx",
+)
 class TestWebSearchTool:
     """Integration tests for web search functionality."""
     
@@ -1186,6 +1223,10 @@ class TestWebSearchTool:
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    FileOperationsTool is None,
+    reason="requires src.tools.file_operations",
+)
 class TestFileOperationsTool:
     """Integration tests for file operations."""
     
@@ -1245,6 +1286,10 @@ class TestFileOperationsTool:
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    DatabaseTool is None,
+    reason="requires src.tools.database",
+)
 class TestDatabaseTool:
     """Integration tests for database operations."""
     
@@ -1329,17 +1374,23 @@ Tests using VCR.py to record/replay HTTP interactions.
 import pytest
 try:
     import vcr
+    _HAS_VCR = True
 except ImportError:  # pragma: no cover - optional integration-test dependency
     vcr = _MissingVCR()
+    _HAS_VCR = False
 from pathlib import Path
-WeatherTool = _optional_test_module("src.tools.weather").WeatherTool
-StockPriceTool = _optional_test_module("src.tools.stock_price").StockPriceTool
+WeatherTool = _optional_test_class("src.tools.weather", "WeatherTool")
+StockPriceTool = _optional_test_class("src.tools.stock_price", "StockPriceTool")
 
 
 CASSETTE_DIR = Path(__file__).parent / "cassettes"
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    WeatherTool is None or not _HAS_VCR,
+    reason="requires src.tools.weather and vcr",
+)
 class TestWeatherToolWithRecording:
     """Weather tool tests with recorded HTTP responses."""
     
@@ -1364,6 +1415,10 @@ class TestWeatherToolWithRecording:
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    StockPriceTool is None or not _HAS_VCR,
+    reason="requires src.tools.stock_price and vcr",
+)
 class TestStockPriceToolWithRecording:
     """Stock price tool tests with recorded responses."""
     
@@ -1661,30 +1716,82 @@ class AgentTestHarness:
             if is_async_run:
                 result = run_method(message, **kwargs)
             else:
-                result_queue: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
+                from concurrent.futures import ThreadPoolExecutor
+                from concurrent.futures import TimeoutError as FutureTimeoutError
 
-                def invoke_sync_run() -> None:
-                    try:
-                        result_queue.put((True, run_method(message, **kwargs)))
-                    except BaseException as exc:
-                        result_queue.put((False, exc))
+                max_workers = 2
+                max_abandoned = 2
 
-                worker = threading.Thread(
-                    target=invoke_sync_run,
-                    name="agent-test-harness-run",
-                    daemon=True,
-                )
-                worker.start()
-                worker.join(timeout=token.time_remaining)
-                if worker.is_alive():
-                    token.cancel()
-                    raise ScenarioTimeoutError(
-                        f"agent.run exceeded {timeout_seconds:.2f}s harness timeout"
+                if not hasattr(self, "_sync_run_executor"):
+                    self._sync_run_executor = ThreadPoolExecutor(
+                        max_workers=max_workers,
+                        thread_name_prefix="agent-test-harness-run",
                     )
-                succeeded, payload = result_queue.get_nowait()
-                if not succeeded:
-                    raise payload
-                result = payload
+                    self._sync_run_slots = threading.BoundedSemaphore(
+                        value=max_workers
+                    )
+                    self._sync_run_lock = threading.Lock()
+                    self._abandoned_sync_runs = 0
+                    self._sync_executor_closed = False
+
+                with self._sync_run_lock:
+                    if self._sync_executor_closed:
+                        raise RuntimeError(
+                            "Synchronous agent.run worker pool is closed "
+                            "after too many abandoned runs."
+                        )
+
+                if not self._sync_run_slots.acquire(blocking=False):
+                    raise RuntimeError(
+                        "Synchronous agent.run worker pool is saturated; "
+                        "refusing to schedule another scenario."
+                    )
+
+                state = {"abandoned": False}
+
+                def release_slot(_future: Any) -> None:
+                    self._sync_run_slots.release()
+                    with self._sync_run_lock:
+                        if state["abandoned"]:
+                            state["abandoned"] = False
+                            self._abandoned_sync_runs -= 1
+
+                try:
+                    future = self._sync_run_executor.submit(
+                        run_method,
+                        message,
+                        **kwargs,
+                    )
+                except RuntimeError:
+                    self._sync_run_slots.release()
+                    raise
+
+                future.add_done_callback(release_slot)
+
+                try:
+                    result = future.result(timeout=token.time_remaining)
+                except FutureTimeoutError as exc:
+                    token.cancel()
+                    close_executor = False
+                    with self._sync_run_lock:
+                        if not future.done():
+                            state["abandoned"] = True
+                            self._abandoned_sync_runs += 1
+                            close_executor = (
+                                self._abandoned_sync_runs >= max_abandoned
+                            )
+                            if close_executor:
+                                self._sync_executor_closed = True
+                    future.cancel()
+                    if close_executor:
+                        self._sync_run_executor.shutdown(
+                            wait=False,
+                            cancel_futures=True,
+                        )
+                    raise ScenarioTimeoutError(
+                        f"agent.run exceeded {timeout_seconds:.2f}s "
+                        "harness timeout"
+                    ) from exc
 
             if inspect.isawaitable(result):
                 try:
@@ -1869,6 +1976,20 @@ SCENARIOS_DIR = Path(__file__).parent / "scenarios"
 def harness() -> AgentTestHarness:
     """Create a test harness for the customer support agent."""
     return AgentTestHarness(agent_factory=create_customer_support_agent)
+
+
+@pytest.fixture
+def agent() -> Agent:
+    """Create the production agent for behavioral and edge-case examples."""
+    module = pytest.importorskip("src.agents.production")
+    return module.create_production_agent()
+
+
+@pytest.fixture
+def secure_agent() -> Agent:
+    """Create the secured agent for safety examples."""
+    module = pytest.importorskip("src.agents.secure_agent")
+    return module.create_secure_agent()
 
 
 @pytest.mark.behavioral

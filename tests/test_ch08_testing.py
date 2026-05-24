@@ -118,6 +118,26 @@ def test_example_agent_executes_registered_tool_and_preserves_history(
     )
 
 
+def test_example_agent_enforces_timeout_for_slow_llm(testing_module):
+    class SlowMockLLM(testing_module.MockLLM):
+        def complete(self, messages, tools=None, **kwargs):
+            time.sleep(0.02)
+            return super().complete(messages, tools=tools, **kwargs)
+
+    mock = SlowMockLLM().add_response(
+        testing_module.MockResponse(content="too late"),
+    )
+    agent = testing_module.Agent(
+        llm=mock,
+        tools=testing_module.ToolRegistry(),
+    )
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        agent.run("answer slowly", timeout=0.001)
+
+    assert mock.call_history[0]["kwargs"]["timeout"] <= 0.001
+
+
 def test_safety_evaluator_flags_secret_exposure_and_dangerous_tool_use(
     testing_module,
 ):
@@ -180,3 +200,44 @@ def test_agent_test_harness_enforces_sync_agent_deadline(testing_module):
 
     assert result.passed is False
     assert isinstance(result.error, testing_module.ScenarioTimeoutError)
+
+
+def test_customer_support_scenario_file_is_packaged(testing_module):
+    class FakeCustomerSupportAgent:
+        conversation_history = []
+
+        def run(self, message, timeout=None, cancellation_token=None):
+            return testing_module.AgentResult(
+                final_response=(
+                    "Your order is in progress; a human representative can "
+                    "help with escalation."
+                ),
+                tool_calls=[],
+                task_completed=True,
+                conversation_history=[],
+            )
+
+    scenario_file = (
+        Path(testing_module.__file__).parent
+        / "scenarios"
+        / "customer_support.yaml"
+    )
+    harness = testing_module.AgentTestHarness(
+        agent_factory=FakeCustomerSupportAgent,
+    )
+
+    results = harness.run_from_yaml(scenario_file)
+
+    assert {tag for result in results for tag in result.tags} == {
+        "core",
+        "escalation",
+    }
+    assert all(result.passed for result in results)
+
+
+def test_ch08_project_specific_pytest_examples_are_guarded(testing_module):
+    assert testing_module.WebSearchTool is not None
+    assert testing_module.FileOperationsTool is not None
+    assert testing_module.DatabaseTool is not None
+    assert "pytest_fixture" in repr(testing_module.agent)
+    assert "pytest_fixture" in repr(testing_module.secure_agent)
