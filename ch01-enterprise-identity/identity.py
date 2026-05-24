@@ -266,12 +266,15 @@ Security considerations:
 - Every operation is audited
 - Permissions follow least-privilege
 
-Code Navigation (line numbers are approximate):
-- Permission Model (PermissionScope, IdentityStatus, AuditEventType) ... ~45
-- Data Models (AgentIdentity, Credential, DelegationRecord, AuditEvent) ... ~120
-- Storage Layer (IdentityStore, KeyVault) ... ~280
-- Certificate Authority (CertificateAuthority) ... ~470
-- Main Service (AgentIdentityService) ... ~700
+Code Navigation (search by symbol; line numbers drift as the file
+evolves, so we anchor to class names instead):
+- Permission Model: see PermissionScope, IdentityStatus,
+  AuditEventType below.
+- Data Models: see AgentIdentity, Credential, DelegationRecord,
+  AuditEvent below.
+- Storage Layer: see IdentityStore and KeyVault below.
+- Certificate Authority: see CertificateAuthority below.
+- Main Service: see AgentIdentityService below.
 """
 
 import asyncio
@@ -1534,6 +1537,17 @@ class AgentIdentityService:
         self.delegation_ttl_hours = delegation_ttl_hours
         self.last_used_update_interval = last_used_update_interval
         self._jwt_secret: Optional[str] = None
+        # Audit reliability: bounded retry plus in-memory DLQ so a transient
+        # store failure cannot abort the identity operation that triggered it.
+        self._audit_max_retries: int = 3
+        self._audit_dlq: deque[tuple[AuditEvent, Exception]] = deque(
+            maxlen=1000
+        )
+
+    @property
+    def audit_dlq_size(self) -> int:
+        """Number of audit events currently parked in the DLQ."""
+        return len(self._audit_dlq)
     
     async def initialize(self) -> None:
         """Initialize the identity service."""
@@ -2676,8 +2690,25 @@ class AgentIdentityService:
             user_agent=user_agent,
             correlation_id=correlation_id
         )
-        await self.store.log_audit_event(event)
-    
+        # Bounded retry plus DLQ. Audit failure must not abort the operation
+        # that produced it; we surface the loss to operators via a critical
+        # log and an in-memory dead-letter queue they can drain.
+        for attempt in range(self._audit_max_retries):
+            try:
+                await self.store.log_audit_event(event)
+                return
+            except Exception as exc:
+                if attempt == self._audit_max_retries - 1:
+                    self._audit_dlq.append((event, exc))
+                    logger.critical(
+                        "Audit event failed after %d retries; pushed to "
+                        "DLQ. Operator action required.",
+                        self._audit_max_retries,
+                        exc_info=exc,
+                    )
+                else:
+                    await asyncio.sleep(0.01 * (2 ** attempt))
+
     async def get_audit_log(
         self,
         agent_id: Optional[str] = None,
@@ -3141,6 +3172,11 @@ class ComplianceAuditStore:
     storage or an immutable log service, replicate it, and configure retention
     to match your control obligations.
     """
+    # NOTE: class-level threading.Lock only serializes within a single
+    # process. Cross-process serialization (e.g., gunicorn forked workers)
+    # relies on _acquire_file_lock(), which uses fcntl.flock on the
+    # shared on-disk audit file. Do not rely on _process_append_lock for
+    # cross-process correctness.
     _process_append_lock = threading.Lock()
     
     def __init__(

@@ -915,6 +915,33 @@ _EXTERNAL_CALL_SLOTS = threading.BoundedSemaphore(
 atexit.register(_EXTERNAL_CALL_EXECUTOR.shutdown, wait=False, cancel_futures=True)
 
 
+def get_timeout_executor() -> ThreadPoolExecutor:
+    """Return the module-level executor used for timeout-guarded calls."""
+    return _EXTERNAL_CALL_EXECUTOR
+
+
+def set_timeout_executor(executor: ThreadPoolExecutor) -> None:
+    """Replace the module-level executor (intended for tests)."""
+    global _EXTERNAL_CALL_EXECUTOR
+    _EXTERNAL_CALL_EXECUTOR = executor
+
+
+def get_external_call_executor() -> ThreadPoolExecutor:
+    """Return the shared executor for external (collaborator) calls.
+
+    This is the same underlying pool as ``get_timeout_executor``; the
+    two names exist because callers reason about the pool at different
+    levels (timeout-guarded vs. external-call quota).
+    """
+    return _EXTERNAL_CALL_EXECUTOR
+
+
+def set_external_call_executor(executor: ThreadPoolExecutor) -> None:
+    """Replace the shared external-call executor (intended for tests)."""
+    global _EXTERNAL_CALL_EXECUTOR
+    _EXTERNAL_CALL_EXECUTOR = executor
+
+
 class ExternalCallSaturationError(TimeoutError):
     """Raised when the shared sync-call executor cannot accept more work."""
 
@@ -957,7 +984,7 @@ def _call_with_timeout(
 
     try:
         result_timeout = min(timeout_seconds, _remaining_seconds(deadline))
-        future = _EXTERNAL_CALL_EXECUTOR.submit(
+        future = get_timeout_executor().submit(
             call,
             *args,
             timeout=result_timeout,
@@ -1662,6 +1689,11 @@ class PrometheusAgentMetrics:
             registry=self.registry
         )
 
+        # Suppress repeated warnings about the same unrecognized agent_id.
+        # A legacy ID shape would otherwise flood logs on every request.
+        self._warned_agent_ids: set[str] = set()
+        self._warned_agent_ids_max: int = 10000
+
     def record_task_start(self, task_type: str, agent_id: str) -> None:
         """Record that a task has started."""
         agent_pool = self._agent_pool(agent_id)
@@ -1814,8 +1846,7 @@ class PrometheusAgentMetrics:
         """Generate Prometheus metrics output."""
         return generate_latest(self.registry)
 
-    @staticmethod
-    def _agent_pool(agent_id: str) -> str:
+    def _agent_pool(self, agent_id: str) -> str:
         """Map arbitrary agent IDs to a bounded deployment pool."""
         value = (agent_id or "").lower()
         if "canary" in value:
@@ -1828,10 +1859,17 @@ class PrometheusAgentMetrics:
             return "nonprod"
         # Falling through to "primary" silently collapses cardinality; warn so
         # operators can audit unexpected agent_id shapes that route to default.
-        logging.getLogger(__name__).warning(
-            "agent_id=%r did not match a known pool token; bucketing as 'primary'",
-            agent_id,
-        )
+        # We warn at most once per ID (bounded set) so a fleet with legacy IDs
+        # does not flood logs on every request.
+        key = agent_id or ""
+        if key not in self._warned_agent_ids:
+            if len(self._warned_agent_ids) < self._warned_agent_ids_max:
+                self._warned_agent_ids.add(key)
+            logging.getLogger(__name__).warning(
+                "Unrecognized agent_id shape %r; falling through to primary "
+                "pool. Subsequent occurrences will be suppressed.",
+                agent_id,
+            )
         return "primary"
 
     @staticmethod
@@ -2127,10 +2165,23 @@ class AgentMetrics:
         try:
             self._callback_queue.put_nowait(None)
         except queue.Full:
+            # Queue is at capacity; drop the sentinel and increment the
+            # existing dropped-notifications counter so operators see the
+            # slow-shutdown case. We still attempt to join so the caller
+            # can observe whether the worker exits on its own.
             with self._lock:
                 self._callback_notifications_dropped += 1
-            return
+            logger.warning(
+                "AgentMetrics.close: callback queue full; sentinel "
+                "dropped, worker may exit on next tick or be force-joined."
+            )
         self._callback_worker.join(timeout=timeout)
+        if self._callback_worker.is_alive():
+            logger.warning(
+                "AgentMetrics.close: callback worker did not exit within "
+                "%ss; abandoning.",
+                timeout,
+            )
 
     def _call_metric_backend(
         self,
@@ -2702,6 +2753,16 @@ class BehaviorDriftDetector:
         self.max_metrics = max_metrics
         self._recent: "OrderedDict[str, deque[float]]" = OrderedDict()
         self._historical: "OrderedDict[str, deque[float]]" = OrderedDict()
+
+    def warmup_complete(self, metric_name: str) -> bool:
+        """True once the metric's historical buffer holds more than
+        ``2 * window_size`` samples. Drift comparisons before this point
+        should be treated as low-confidence: the older slice has not yet
+        accumulated enough samples to be a stable baseline."""
+        historical = self._historical.get(metric_name)
+        if historical is None:
+            return False
+        return len(historical) >= 2 * self.window_size
 
     def record(self, metric_name: str, value: float) -> Optional[str]:
         """Record a value and check for drift.

@@ -2602,6 +2602,12 @@ class GracefulShutdown:
         # Wait for active requests to complete
         shutdown_deadline = datetime.now(timezone.utc) + timedelta(seconds=self.shutdown_timeout)
         
+        # Post-drain wait for any stragglers. The drain phase above already
+        # exits early on _drain_idle_event, so reaching this loop means
+        # requests are still in flight after drain_timeout. We poll at 100 ms
+        # rather than 1 s so shutdown can finish promptly once the last
+        # request completes; the 100 ms cap on extra wall-clock latency is a
+        # better trade-off than wiring another Event through this branch.
         while self._active_requests and datetime.now(timezone.utc) < shutdown_deadline:
             _log_with_fields(
                 "info",
@@ -2609,7 +2615,7 @@ class GracefulShutdown:
                 active_requests=self.active_request_count(),
                 remaining_seconds=(shutdown_deadline - datetime.now(timezone.utc)).seconds
             )
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
         
         if self._active_requests:
             _log_with_fields(

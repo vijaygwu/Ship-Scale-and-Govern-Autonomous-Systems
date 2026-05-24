@@ -1489,8 +1489,12 @@ import asyncio
 import inspect
 import queue
 import threading
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Callable, ClassVar, TYPE_CHECKING
 from pathlib import Path
 import yaml
 
@@ -1527,11 +1531,16 @@ class TestScenario:
 @dataclass
 class ExpectedOutcome:
     """Expected outcome for a test scenario."""
-    
+
     type: str  # "contains", "tool_called", "task_completed", "regex", "custom"
     value: Any
     message: str | None = None
-    
+
+    # Wall-clock cap on custom evaluators. A misbehaving evaluator could
+    # otherwise wedge the harness; we run the call in a worker thread and
+    # return False on timeout. ClassVar keeps this off the dataclass init.
+    custom_eval_timeout: ClassVar[float] = 30.0
+
     def check(self, result: AgentResult) -> bool:
         """Check if the result matches this expectation."""
         if self.type == "contains":
@@ -1544,7 +1553,29 @@ class ExpectedOutcome:
             import re
             return bool(re.search(self.value, result.final_response))
         elif self.type == "custom":
-            return self.value(result)
+            if not callable(self.value):
+                logger.error(
+                    "custom outcome requires a callable, got %s",
+                    type(self.value),
+                )
+                return False
+            # Run the user-supplied evaluator behind a wall-clock bound so a
+            # wedged callable cannot stall the whole harness.
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self.value, result)
+                    return bool(
+                        future.result(timeout=self.custom_eval_timeout)
+                    )
+            except FutureTimeoutError:
+                logger.error(
+                    "custom evaluator exceeded %.3fs",
+                    self.custom_eval_timeout,
+                )
+                return False
+            except Exception as exc:
+                logger.error("custom evaluator raised: %r", exc)
+                return False
         return False
 
 
@@ -1652,6 +1683,10 @@ class AgentTestHarness:
         self.agent_factory = agent_factory
         self.metrics_collector = metrics_collector or MetricsCollector()
         self._results: deque[TestResult] = deque(maxlen=max_results)
+        # Guards lazy init of _sync_run_executor and friends. Without this
+        # lock, two concurrent first-uses can both pass the hasattr check and
+        # create two executors, leaking the loser.
+        self._sync_run_init_lock = threading.Lock()
 
     def _deadline_kwargs(
         self,
@@ -1722,17 +1757,22 @@ class AgentTestHarness:
                 max_workers = 2
                 max_abandoned = 2
 
+                # Double-checked locking: avoid acquiring the init lock on
+                # every call once the executor exists, while still preventing
+                # two concurrent first-uses from creating duplicate pools.
                 if not hasattr(self, "_sync_run_executor"):
-                    self._sync_run_executor = ThreadPoolExecutor(
-                        max_workers=max_workers,
-                        thread_name_prefix="agent-test-harness-run",
-                    )
-                    self._sync_run_slots = threading.BoundedSemaphore(
-                        value=max_workers
-                    )
-                    self._sync_run_lock = threading.Lock()
-                    self._abandoned_sync_runs = 0
-                    self._sync_executor_closed = False
+                    with self._sync_run_init_lock:
+                        if not hasattr(self, "_sync_run_executor"):
+                            self._sync_run_executor = ThreadPoolExecutor(
+                                max_workers=max_workers,
+                                thread_name_prefix="agent-test-harness-run",
+                            )
+                            self._sync_run_slots = threading.BoundedSemaphore(
+                                value=max_workers
+                            )
+                            self._sync_run_lock = threading.Lock()
+                            self._abandoned_sync_runs = 0
+                            self._sync_executor_closed = False
 
                 with self._sync_run_lock:
                     if self._sync_executor_closed:
@@ -1794,9 +1834,33 @@ class AgentTestHarness:
                     ) from exc
 
             if inspect.isawaitable(result):
+                # asyncio.run creates a new event loop and fails if one is
+                # already running in this thread (e.g., the harness is being
+                # driven from inside a Jupyter cell or an existing event
+                # loop). Detect that case and schedule onto the running
+                # loop instead.
                 try:
-                    return asyncio.run(
-                        asyncio.wait_for(result, timeout=token.time_remaining)
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    running_loop = None
+
+                try:
+                    if running_loop is None:
+                        return asyncio.run(
+                            asyncio.wait_for(
+                                result, timeout=token.time_remaining
+                            )
+                        )
+                    # A loop is already running in this thread; submit the
+                    # coroutine to it and block this thread on the result.
+                    awaited_future = asyncio.run_coroutine_threadsafe(
+                        asyncio.wait_for(
+                            result, timeout=token.time_remaining
+                        ),
+                        running_loop,
+                    )
+                    return awaited_future.result(
+                        timeout=token.time_remaining
                     )
                 except asyncio.TimeoutError as exc:
                     token.cancel()

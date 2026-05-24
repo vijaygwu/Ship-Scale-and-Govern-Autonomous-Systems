@@ -98,7 +98,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Callable, Optional, Protocol, TypeVar
 from uuid import UUID, uuid4
 
 
@@ -219,9 +219,16 @@ class PIIDetector(Protocol):
 class PIITokenizer:
     """
     Tokenizes PII for privacy-preserving logging.
-    
+
     Replaces detected PII with tokens that can be resolved through
     a separate, access-controlled mapping service.
+
+    Note on cache eviction: when the bounded LRU cache evicts under
+    pressure, re-tokenization of the same PII yields a new token. For
+    audit consistency across long time-windows, either persist the
+    mapping to durable storage (the access-controlled service) or use
+    a deterministic hash-based token instead of the random uuid4 token
+    used here.
     """
     
     def __init__(self, detector: PIIDetector | None = None):
@@ -587,11 +594,24 @@ class AuditLogger:
             "close": 0,
         }
         self._dropped_event_count = 0
+        # Optional Prometheus-compatible hook for retry-exhausted failures.
+        # Operators wire this to a real counter (see chapter 6's
+        # PrometheusAgentMetrics) so an outage shows up on a dashboard, not
+        # just in the log stream.
+        self._failure_counter_hook: Optional[Callable[[dict], None]] = None
         if not sinks:
             logging.warning(
                 "AuditLogger initialized without sinks; audit events will be "
                 "dropped and counted. Use only for explicit no-op/test usage."
             )
+
+    def set_failure_counter_hook(
+        self, hook: Callable[[dict], None]
+    ) -> None:
+        """Register a callback invoked on each retry-exhausted failure with
+        a metric-shaped dict ``{'sink_name', 'failure_count', 'last_error'}``.
+        Intended for wiring to chapter 6's ``PrometheusAgentMetrics``."""
+        self._failure_counter_hook = hook
     
     @contextmanager
     def session(
@@ -930,6 +950,22 @@ class AuditLogger:
             op_name, self._max_retries, op_name,
             self._failure_counts[op_name], last_error,
         )
+        # Fire the Prometheus hook if set. We wrap in try/except so a
+        # misbehaving exporter cannot crash the audit pipeline, which would
+        # turn a transient sink failure into a complete loss of observability.
+        if self._failure_counter_hook is not None:
+            try:
+                self._failure_counter_hook({
+                    "sink_name": op_name,
+                    "failure_count": self._failure_counts[op_name],
+                    "last_error": repr(last_error),
+                })
+            except Exception as hook_exc:
+                logging.error(
+                    "Audit failure-counter hook raised %r; metric not "
+                    "recorded.",
+                    hook_exc,
+                )
 
     def _record_dropped_event(self, event: AuditEvent) -> None:
         """Count and warn when explicit no-sink mode drops an audit event."""

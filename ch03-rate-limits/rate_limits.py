@@ -3167,7 +3167,14 @@ class AlertManager:
 
 
 def slack_notification_channel(webhook_url: str) -> Callable[[Alert], None]:
-    """Create a Slack notification channel."""
+    """Create a Slack notification channel.
+
+    Webhook delivery is best-effort and synchronous in this reference
+    implementation: a single failure is logged and dropped. For
+    high-volume production deployments, route webhooks through the
+    SIEMAuditLogger pattern (Chapter 2) with a bounded queue, circuit
+    breaker, and DLQ so transient outages do not silently lose alerts.
+    """
     import urllib.request
     import urllib.error
     import json
@@ -3215,7 +3222,14 @@ def pagerduty_notification_channel(
     routing_key: str,
     only_critical: bool = True
 ) -> Callable[[Alert], None]:
-    """Create a PagerDuty notification channel."""
+    """Create a PagerDuty notification channel.
+
+    Webhook delivery is best-effort and synchronous in this reference
+    implementation: a single failure is logged and dropped. For
+    high-volume production deployments, route webhooks through the
+    SIEMAuditLogger pattern (Chapter 2) with a bounded queue, circuit
+    breaker, and DLQ so transient outages do not silently lose alerts.
+    """
     import urllib.request
     import urllib.error
     import json

@@ -275,10 +275,14 @@ import contextvars
 import random
 import time
 import threading
-from concurrent.futures import Executor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    Executor,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Set, TypeVar, Generic, Awaitable
+from typing import Callable, ClassVar, Optional, Set, TypeVar, Generic, Awaitable
 from functools import wraps
 import logging
 
@@ -434,7 +438,34 @@ class RetryPolicy:
     retry_budget: Optional["RetryBudget"] = None
     attempt_timeout: Optional[float] = None
     sync_timeout_executor: Optional[Executor] = None
-    
+
+    # Shared lazy default executor used when ``attempt_timeout`` is set
+    # but no ``sync_timeout_executor`` is supplied. ClassVar keeps the
+    # dataclass from treating these as fields.
+    _default_executor: ClassVar[Optional[ThreadPoolExecutor]] = None
+    _default_executor_warned: ClassVar[bool] = False
+
+    def _get_default_executor(self) -> ThreadPoolExecutor:
+        """Return a small process-wide default executor, lazy-built.
+
+        We warn once so the operator notices that a production deployment is
+        running on an implicit pool whose size we did not size for them.
+        """
+        cls = type(self)
+        if cls._default_executor is None:
+            cls._default_executor = ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="retry-policy-default",
+            )
+        if not cls._default_executor_warned:
+            logger.warning(
+                "RetryPolicy.execute_sync called with attempt_timeout set "
+                "but no sync_timeout_executor; lazy-allocated a default "
+                "pool. Pass an explicit executor for production deployments."
+            )
+            cls._default_executor_warned = True
+        return cls._default_executor
+
     def should_retry(self, error: AgentError, attempt: int) -> bool:
         """
         Determine if an error should trigger a retry.
@@ -599,13 +630,8 @@ class RetryPolicy:
         if self.attempt_timeout is None:
             return operation()
 
-        if self.sync_timeout_executor is None:
-            raise ValueError(
-                "sync attempt_timeout requires sync_timeout_executor; "
-                "Python cannot interrupt arbitrary blocking synchronous code"
-            )
-
-        future = self.sync_timeout_executor.submit(operation)
+        executor = self.sync_timeout_executor or self._get_default_executor()
+        future = executor.submit(operation)
         try:
             return future.result(timeout=self.attempt_timeout)
         except FutureTimeoutError as e:
@@ -1241,21 +1267,30 @@ class CircuitBreaker(Generic[T]):
 class CircuitBreakerRegistry:
     """
     Centralized registry for managing multiple circuit breakers.
-    
+
     Provides aggregated metrics and health status for monitoring dashboards.
+
+    The registry caps the number of tracked breakers at ``max_breakers`` and
+    evicts the least-recently-used entry when the cap is reached. This keeps
+    long-running processes that mint breakers per request key (e.g., per
+    tenant or per upstream endpoint) from leaking memory unbounded. The
+    first eviction logs a warning so operators notice the cardinality cap.
     """
-    
+
     _instance: Optional['CircuitBreakerRegistry'] = None
     _lock = threading.Lock()
-    
-    def __new__(cls):
+
+    def __new__(cls, max_breakers: int = 1024):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
-                    cls._instance._breakers: Dict[str, CircuitBreaker] = {}
+                    from collections import OrderedDict
+                    cls._instance._breakers: "OrderedDict[str, CircuitBreaker]" = OrderedDict()
+                    cls._instance._max_breakers = max_breakers
+                    cls._instance._eviction_warned = False
         return cls._instance
-    
+
     def register(
         self,
         name: str,
@@ -1263,13 +1298,36 @@ class CircuitBreakerRegistry:
     ) -> CircuitBreaker:
         """Register a new circuit breaker or return existing one."""
         with self._lock:
-            if name not in self._breakers:
-                self._breakers[name] = CircuitBreaker(name, config)
+            if name in self._breakers:
+                # Touch existing entry to refresh LRU order.
+                self._breakers.move_to_end(name)
+                return self._breakers[name]
+
+            if len(self._breakers) >= self._max_breakers:
+                evicted_name, _ = self._breakers.popitem(last=False)
+                if not self._eviction_warned:
+                    logger.warning(
+                        "CircuitBreakerRegistry hit max_breakers=%d; evicting "
+                        "least-recently-used breaker %r. Further evictions "
+                        "will be silent. Consider raising max_breakers or "
+                        "reducing breaker-name cardinality.",
+                        self._max_breakers,
+                        evicted_name,
+                    )
+                    self._eviction_warned = True
+
+            self._breakers[name] = CircuitBreaker(name, config)
             return self._breakers[name]
-    
+
     def get(self, name: str) -> Optional[CircuitBreaker]:
         """Get a circuit breaker by name."""
-        return self._breakers.get(name)
+        breaker = self._breakers.get(name)
+        if breaker is not None:
+            # Reads also count as use for LRU purposes.
+            with self._lock:
+                if name in self._breakers:
+                    self._breakers.move_to_end(name)
+        return breaker
     
     def get_all_metrics(self) -> Dict[str, Dict[str, Any]]:
         """Get metrics for all registered circuit breakers."""
