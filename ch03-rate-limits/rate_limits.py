@@ -38,8 +38,14 @@ class RequestRateLimiter:
     """
     max_requests: int
     window_seconds: float
-    _timestamps: deque = field(default_factory=deque)  # bounded by try_acquire below
+    _timestamps: deque = field(init=False)  # initialized in __post_init__ with maxlen
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        # Bound the deque so direct manipulation can't grow unbounded; the
+        # sliding-window logic in try_acquire already keeps len <= max_requests,
+        # so 2x max_requests is a safe upper bound for transient additions.
+        self._timestamps = deque(maxlen=self.max_requests * 2)
     
     def _clean_old_timestamps(self, now: float) -> None:
         """Remove timestamps outside the current window."""
@@ -62,6 +68,21 @@ class RequestRateLimiter:
                 self._timestamps.append(now)
                 return True
             return False
+
+    def refund(self) -> bool:
+        """
+        Return one request slot after a failed multi-scope acquisition.
+
+        This is intended for rollback paths that just called try_acquire().
+        Expired timestamps are cleaned first; if the slot already aged out,
+        there is nothing left to refund.
+        """
+        with self._lock:
+            self._clean_old_timestamps(time.time())
+            if not self._timestamps:
+                return False
+            self._timestamps.pop()
+            return True
     
     def wait_for_capacity(self, timeout: Optional[float] = None) -> bool:
         """
@@ -79,9 +100,11 @@ class RequestRateLimiter:
             if self.try_acquire():
                 return True
             
+            remaining_timeout = None
             if timeout is not None:
                 elapsed = time.time() - start_time
-                if elapsed >= timeout:
+                remaining_timeout = timeout - elapsed
+                if remaining_timeout <= 0:
                     return False
             
             # Calculate sleep time until oldest request expires
@@ -94,6 +117,9 @@ class RequestRateLimiter:
                 else:
                     sleep_time = 0.01
             
+            if remaining_timeout is not None:
+                sleep_time = min(sleep_time, remaining_timeout)
+
             time.sleep(sleep_time)
     
     def get_remaining_capacity(self) -> int:
@@ -172,7 +198,7 @@ class TokenBucket:
             return False
     
     def get_available_tokens(self) -> int:
-        """Return currently available tokens."""
+        """Return available tokens; negative means overage debt is outstanding."""
         with self._lock:
             self._refill(time.time())
             return int(self._tokens)
@@ -189,11 +215,12 @@ class TokenBucket:
     def adjust(self, delta: int) -> None:
         """
         Adjust the bucket's available tokens by `delta` (positive or negative),
-        clamped to [0, capacity]. Takes the bucket's own lock so callers do
-        not have to reach across the bucket boundary.
+        clamped only at capacity. Negative balances are preserved as debt, so
+        an underestimated request must be repaid by future refills before more
+        tokens can be consumed.
         """
         with self._lock:
-            self._tokens = max(0.0, min(float(self.capacity), self._tokens + delta))
+            self._tokens = min(float(self.capacity), self._tokens + delta)
 
 
 @dataclass
@@ -236,6 +263,13 @@ class TokenRateLimiter:
             capacity=int(self.max_total_tokens_per_minute * self.burst_multiplier),
             refill_rate=self.max_total_tokens_per_minute / 60.0
         )
+
+    @staticmethod
+    def _validate_token_counts(**token_counts: int) -> None:
+        """Reject invalid token counts before touching bucket state."""
+        for name, value in token_counts.items():
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
     
     def check_capacity(
         self,
@@ -252,6 +286,10 @@ class TokenRateLimiter:
         Returns:
             Tuple of (has_capacity, reason_if_limited)
         """
+        self._validate_token_counts(
+            estimated_input_tokens=estimated_input_tokens,
+            estimated_output_tokens=estimated_output_tokens,
+        )
         total = estimated_input_tokens + estimated_output_tokens
         
         if self._input_bucket.get_available_tokens() < estimated_input_tokens:
@@ -275,6 +313,10 @@ class TokenRateLimiter:
         token counts. After the call completes, use record_actual_usage
         to adjust for any difference between estimated and actual usage.
         """
+        self._validate_token_counts(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
         with self._lock:
             has_capacity, reason = self.check_capacity(input_tokens, output_tokens)
             if not has_capacity:
@@ -321,13 +363,19 @@ class TokenRateLimiter:
         limiting when actual token counts vary significantly from
         estimates.
         """
+        self._validate_token_counts(
+            estimated_input=estimated_input,
+            estimated_output=estimated_output,
+            actual_input=actual_input,
+            actual_output=actual_output,
+        )
         with self._lock:
             input_diff = actual_input - estimated_input
             output_diff = actual_output - estimated_output
 
-            # Reconcile against each bucket through its own lock; underestimates
-            # subtract more tokens (delta<0), overestimates refund them. Each
-            # bucket clamps to [0, capacity].
+            # Reconcile against each bucket through its own lock. Underestimates
+            # subtract more tokens (delta<0) and may drive a bucket negative;
+            # that debt is repaid by future refills before new work is admitted.
             self._input_bucket.adjust(-input_diff)
             self._output_bucket.adjust(-output_diff)
             self._total_bucket.adjust(-(input_diff + output_diff))
@@ -366,6 +414,10 @@ class TokenRateLimiter:
         to roll back partial acquisitions when a downstream limit fails. Each
         bucket clamps to its own capacity through its own lock.
         """
+        self._validate_token_counts(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
         with self._lock:
             self._input_bucket.refund(input_tokens)
             self._output_bucket.refund(output_tokens)
@@ -376,7 +428,7 @@ class TokenRateLimiter:
 # ============================================================================
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple, Any, Set
 from enum import Enum
 import time
 import threading
@@ -412,22 +464,121 @@ class HierarchicalRateLimiter:
     Implements hierarchical rate limiting across multiple scopes.
     
     Requests must pass rate checks at all applicable levels of the
-    hierarchy. This ensures that even if a user has available quota,
-    they cannot exceed organization or global limits.
+    hierarchy. This reduces cross-level exhaustion only when parent and
+    child quotas are configured consistently, acquisition is atomic, and
+    callers cannot bypass the limiter.
     """
     
     global_config: RateLimitConfig
+    max_scopes: int = 10_000
+    scope_ttl_seconds: float = 3600.0
     _limiters: Dict[str, TokenRateLimiter] = field(default_factory=dict)
     _request_limiters: Dict[str, RequestRateLimiter] = field(default_factory=dict)
     _configs: Dict[str, RateLimitConfig] = field(default_factory=dict)
+    _parent_scopes: Dict[str, str] = field(default_factory=dict)
+    _scope_last_seen: Dict[str, float] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     
     def __post_init__(self):
+        if self.max_scopes <= 0:
+            raise ValueError("max_scopes must be positive")
+        if self.scope_ttl_seconds <= 0:
+            raise ValueError("scope_ttl_seconds must be positive")
         # Initialize global limiters
         self._initialize_limiters("global", self.global_config)
+
+    def _delete_scope(self, key: str) -> None:
+        """Drop all per-scope limiter state for a non-global key."""
+        if key == "global":
+            return
+        self._limiters.pop(key, None)
+        self._request_limiters.pop(key, None)
+        self._configs.pop(key, None)
+        self._parent_scopes.pop(key, None)
+        self._scope_last_seen.pop(key, None)
+
+    def _evict_inactive_scopes(self, now: Optional[float] = None) -> None:
+        """Evict expired or least-recently-seen dynamic scopes."""
+        now = time.time() if now is None else now
+        cutoff = now - self.scope_ttl_seconds
+
+        for key, last_seen in list(self._scope_last_seen.items()):
+            if last_seen < cutoff:
+                self._delete_scope(key)
+
+        while len(self._scope_last_seen) > self.max_scopes:
+            oldest_key = min(
+                self._scope_last_seen,
+                key=lambda scope_key: self._scope_last_seen[scope_key],
+            )
+            self._delete_scope(oldest_key)
+
+    def _touch_scope(self, key: str, now: Optional[float] = None) -> None:
+        """Record recent use for configured non-global scopes."""
+        if key != "global" and key in self._configs:
+            self._scope_last_seen[key] = time.time() if now is None else now
+
+    @staticmethod
+    def _scope_key(scope: LimitScope, identifier: str) -> str:
+        """Build the internal key used for configured non-global scopes."""
+        scope_name = scope.value if isinstance(scope, LimitScope) else str(scope)
+        return f"{scope_name}:{identifier}"
+
+    def _add_scope_with_ancestors(
+        self,
+        key: str,
+        keys: List[str],
+        seen: Set[str],
+        visiting: Set[str]
+    ) -> None:
+        """Append a scope after its configured parents, avoiding duplicates."""
+        if key in visiting:
+            return
+
+        visiting.add(key)
+        parent_key = self._parent_scopes.get(key)
+        if parent_key and parent_key not in seen:
+            self._add_scope_with_ancestors(parent_key, keys, seen, visiting)
+        visiting.remove(key)
+
+        if key not in seen:
+            keys.append(key)
+            seen.add(key)
+
+    def _keys_for_scopes(
+        self,
+        scopes: List[Tuple[LimitScope, str]]
+    ) -> List[str]:
+        """Return global plus each scope's full configured parent chain."""
+        keys = ["global"]
+        seen = {"global"}
+
+        for scope, identifier in scopes:
+            self._add_scope_with_ancestors(
+                self._scope_key(scope, identifier),
+                keys,
+                seen,
+                set(),
+            )
+
+        return keys
     
     def _initialize_limiters(self, key: str, config: RateLimitConfig) -> None:
         """Create rate limiters for a given configuration."""
+        self._limiters.pop(key, None)
+        self._request_limiters.pop(key, None)
+
+        if key != "global":
+            now = time.time()
+            self._evict_inactive_scopes(now)
+            if key not in self._configs and len(self._scope_last_seen) >= self.max_scopes:
+                oldest_key = min(
+                    self._scope_last_seen,
+                    key=lambda scope_key: self._scope_last_seen[scope_key],
+                )
+                self._delete_scope(oldest_key)
+            self._scope_last_seen[key] = now
+
         if config.max_tokens_per_minute:
             self._limiters[key] = TokenRateLimiter(
                 max_input_tokens_per_minute=config.max_tokens_per_minute // 2,
@@ -462,16 +613,16 @@ class HierarchicalRateLimiter:
             parent_scope: Optional parent scope for inheritance
             parent_identifier: Optional parent identifier
         """
-        key = f"{scope.value}:{identifier}"
+        key = self._scope_key(scope, identifier)
         
         with self._lock:
+            self._evict_inactive_scopes()
             self._initialize_limiters(key, config)
             
             # Store parent relationship for hierarchy traversal
             if parent_scope and parent_identifier:
-                parent_key = f"{parent_scope.value}:{parent_identifier}"
-                # In a full implementation, store this relationship
-                # for quota inheritance and rollup reporting
+                parent_key = self._scope_key(parent_scope, parent_identifier)
+                self._parent_scopes[key] = parent_key
     
     def check_all_limits(
         self,
@@ -491,13 +642,11 @@ class HierarchicalRateLimiter:
         Returns:
             Tuple of (allowed, scope_that_blocked, reason)
         """
-        # Always check global limits
-        keys_to_check = ["global"] + [
-            f"{scope.value}:{identifier}" for scope, identifier in scopes
-        ]
-        
         with self._lock:
+            self._evict_inactive_scopes()
+            keys_to_check = self._keys_for_scopes(scopes)
             for key in keys_to_check:
+                self._touch_scope(key)
                 # Check request limit
                 if key in self._request_limiters:
                     if self._request_limiters[key].get_remaining_capacity() < 1:
@@ -526,15 +675,14 @@ class HierarchicalRateLimiter:
         This is an atomic operation - either all scopes approve
         the request or none do (with rollback).
         """
-        keys_to_check = ["global"] + [
-            f"{scope.value}:{identifier}" for scope, identifier in scopes
-        ]
-        
         acquired_keys: List[Tuple[str, str]] = []
 
         with self._lock:
+            self._evict_inactive_scopes()
+            keys_to_check = self._keys_for_scopes(scopes)
             try:
                 for key in keys_to_check:
+                    self._touch_scope(key)
                     # Try to acquire request capacity
                     if key in self._request_limiters:
                         if not self._request_limiters[key].try_acquire():
@@ -556,15 +704,58 @@ class HierarchicalRateLimiter:
                 # Rollback all capacity successfully acquired prior to the
                 # failure so partial acquisitions do not leak quota.
                 for limiter_type, key in acquired_keys:
-                    if limiter_type == "token" and key in self._limiters:
+                    if limiter_type == "request" and key in self._request_limiters:
+                        self._request_limiters[key].refund()
+                    elif limiter_type == "token" and key in self._limiters:
                         self._limiters[key].refund(input_tokens, output_tokens)
-                    # Request limiters expose no rollback; failing fast on
-                    # the request limit is acceptable because request slots
-                    # refill on a fixed cadence.
                 logger.warning(
                     f"Rate limit exceeded at {e.scope}: {e.reason}"
                 )
                 return False, e.scope, e.reason
+
+    def refund_acquisition(
+        self,
+        scopes: List[Tuple[LimitScope, str]],
+        input_tokens: int,
+        output_tokens: int
+    ) -> None:
+        """Return request and token capacity for work that never ran."""
+        with self._lock:
+            self._evict_inactive_scopes()
+            keys_to_update = self._keys_for_scopes(scopes)
+            for key in keys_to_update:
+                self._touch_scope(key)
+                request_limiter = self._request_limiters.get(key)
+                if request_limiter is not None:
+                    request_limiter.refund()
+
+                token_limiter = self._limiters.get(key)
+                if token_limiter is not None:
+                    token_limiter.refund(input_tokens, output_tokens)
+
+    def record_actual_usage(
+        self,
+        scopes: List[Tuple[LimitScope, str]],
+        estimated_input_tokens: int,
+        estimated_output_tokens: int,
+        actual_input_tokens: int,
+        actual_output_tokens: int
+    ) -> None:
+        """Reconcile estimated token acquisitions with actual usage."""
+        with self._lock:
+            self._evict_inactive_scopes()
+            keys_to_update = self._keys_for_scopes(scopes)
+            for key in keys_to_update:
+                self._touch_scope(key)
+                limiter = self._limiters.get(key)
+                if limiter is None:
+                    continue
+                limiter.record_actual_usage(
+                    estimated_input_tokens,
+                    estimated_output_tokens,
+                    actual_input_tokens,
+                    actual_output_tokens,
+                )
     
     @contextmanager
     def rate_limited_call(
@@ -616,7 +807,7 @@ class RateLimitResult:
 # ============================================================================
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Tuple
 from enum import Enum
 from datetime import datetime, timedelta, timezone
 import threading
@@ -649,23 +840,30 @@ class ModelPricing:
         cached_tokens: int = 0
     ) -> float:
         """Calculate the cost for a given token usage."""
-        input_cost = (input_tokens / 1000) * self.input_cost_per_1k_tokens
+        if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
+            raise ValueError("Token counts must be non-negative")
+
+        billable_cached_tokens = min(cached_tokens, input_tokens)
+        uncached_input_tokens = input_tokens - billable_cached_tokens
+        cached_rate = (
+            self.cached_input_cost_per_1k_tokens
+            if self.cached_input_cost_per_1k_tokens is not None
+            else self.input_cost_per_1k_tokens
+        )
+
+        input_cost = (
+            uncached_input_tokens / 1000
+        ) * self.input_cost_per_1k_tokens
+        cached_cost = (billable_cached_tokens / 1000) * cached_rate
         output_cost = (output_tokens / 1000) * self.output_cost_per_1k_tokens
-        
-        cached_cost = 0.0
-        if cached_tokens and self.cached_input_cost_per_1k_tokens:
-            cached_cost = (
-                (cached_tokens / 1000) * self.cached_input_cost_per_1k_tokens
-            )
         
         return input_cost + output_cost + cached_cost
 
 
-# Standard pricing - ILLUSTRATIVE ONLY
-# These values represent approximate pricing tiers at time of writing.
-# IMPORTANT: Always verify current pricing from provider documentation
-# before production deployment, as rates change frequently (typically
-# decreasing 20-40% annually for equivalent capability tiers).
+# Example pricing - ILLUSTRATIVE ONLY
+# Treat these numbers as local configuration placeholders for tests and
+# examples. Load production rates from your provider contract, region, and
+# model configuration instead of relying on this static table.
 STANDARD_PRICING = {
     "claude-3-opus": ModelPricing(
         model_id="claude-3-opus",
@@ -706,12 +904,16 @@ class Budget:
     period: BudgetPeriod
     allocated_amount: float
     spent_amount: float = 0.0
+    reserved_amount: float = 0.0
     period_start: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     alerts_sent: Dict[str, bool] = field(default_factory=dict)
     
     @property
     def remaining(self) -> float:
-        return max(0.0, self.allocated_amount - self.spent_amount)
+        return max(
+            0.0,
+            self.allocated_amount - self.spent_amount - self.reserved_amount,
+        )
     
     @property
     def utilization_percent(self) -> float:
@@ -736,10 +938,22 @@ class Budget:
         """Reset budget if period has expired. Returns True if reset."""
         if self.is_period_expired():
             self.spent_amount = 0.0
+            self.reserved_amount = 0.0
             self.period_start = datetime.now(timezone.utc)
             self.alerts_sent = {}
             return True
         return False
+
+
+@dataclass
+class BudgetReservation:
+    """Estimated spend held before an API call completes."""
+    reservation_id: str
+    scopes: List[Tuple[str, str]]
+    budget_entries: List[Tuple[str, str, BudgetPeriod]]
+    estimated_cost: float
+    expires_at: datetime
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -755,8 +969,11 @@ class BudgetManager:
         default_factory=lambda: STANDARD_PRICING.copy()
     )
     alert_callback: Optional[Callable[[str, Dict], None]] = None
+    reservation_ttl_seconds: float = 300.0
+    max_active_reservations: int = 10_000
     
     _budgets: Dict[str, Budget] = field(default_factory=dict)
+    _reservations: Dict[str, BudgetReservation] = field(default_factory=dict)
     # Bounded so a high-traffic gateway cannot OOM on history growth; the
     # alerting / projection paths only need recent samples.
     _spending_history: deque = field(default_factory=lambda: deque(maxlen=10_000))
@@ -775,6 +992,44 @@ class BudgetManager:
     ) -> str:
         """Generate a unique key for a budget."""
         return f"{scope_type}:{scope_id}:{period.value}"
+
+    def _release_reservation_locked(
+        self,
+        reservation: BudgetReservation
+    ) -> None:
+        """Release a reservation hold. Caller must hold _lock."""
+        for scope_type, scope_id, period in reservation.budget_entries:
+            key = self._budget_key(scope_type, scope_id, period)
+            budget = self._budgets.get(key)
+            if budget is None:
+                continue
+            budget.reset_if_expired()
+            budget.reserved_amount = max(
+                0.0,
+                budget.reserved_amount - reservation.estimated_cost,
+            )
+
+    def _cleanup_expired_reservations_locked(
+        self,
+        now: datetime
+    ) -> int:
+        """Release expired reservation leases. Caller must hold _lock."""
+        expired_ids = [
+            reservation_id
+            for reservation_id, reservation in self._reservations.items()
+            if reservation.expires_at <= now
+        ]
+        for reservation_id in expired_ids:
+            reservation = self._reservations.pop(reservation_id)
+            self._release_reservation_locked(reservation)
+        return len(expired_ids)
+
+    def cleanup_expired_reservations(self) -> int:
+        """Release expired reservation leases and return the cleanup count."""
+        with self._lock:
+            return self._cleanup_expired_reservations_locked(
+                datetime.now(timezone.utc)
+            )
     
     def allocate_budget(
         self,
@@ -783,6 +1038,7 @@ class BudgetManager:
         period: BudgetPeriod,
         amount: float
     ) -> Budget:
+        # 1. Allocation: create or update the tenant's budget envelope.
         """
         Allocate a budget for a specific scope and period.
         
@@ -792,6 +1048,8 @@ class BudgetManager:
         key = self._budget_key(scope_type, scope_id, period)
         
         with self._lock:
+            self._cleanup_expired_reservations_locked(datetime.now(timezone.utc))
+
             if key in self._budgets:
                 self._budgets[key].allocated_amount = amount
                 self._budgets[key].reset_if_expired()
@@ -812,6 +1070,7 @@ class BudgetManager:
         period: BudgetPeriod,
         estimated_cost: float
     ) -> Tuple[bool, float, str]:
+        # 2. Enforcement: check estimated spend before work starts.
         """
         Check if a cost is within budget.
         
@@ -821,6 +1080,8 @@ class BudgetManager:
         key = self._budget_key(scope_type, scope_id, period)
         
         with self._lock:
+            self._cleanup_expired_reservations_locked(datetime.now(timezone.utc))
+
             if key not in self._budgets:
                 # No budget configured means no limit
                 return True, float('inf'), "No budget configured"
@@ -838,6 +1099,200 @@ class BudgetManager:
                 )
             
             return True, remaining_after, "Within budget"
+
+    def reserve_spend(
+        self,
+        scopes: List[Tuple[str, str]],
+        periods: List[BudgetPeriod],
+        estimated_cost: float
+    ) -> Tuple[bool, Optional[BudgetReservation], str]:
+        """
+        Atomically check and hold estimated spend for a pending request.
+
+        The reservation prevents concurrent requests from all passing the same
+        pre-check and later overspending a hard budget. Budgets that are not
+        configured are skipped, preserving the existing "no budget means no
+        limit" behavior.
+        """
+        import uuid
+
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            self._cleanup_expired_reservations_locked(now)
+
+            budget_entries: List[Tuple[str, str, BudgetPeriod]] = []
+
+            for scope_type, scope_id in scopes:
+                for period in periods:
+                    key = self._budget_key(scope_type, scope_id, period)
+                    budget = self._budgets.get(key)
+                    if budget is None:
+                        continue
+
+                    budget.reset_if_expired()
+                    remaining_after = budget.remaining - estimated_cost
+                    if remaining_after < 0:
+                        return (
+                            False,
+                            None,
+                            f"Would exceed {period.value} budget by "
+                            f"${-remaining_after:.4f}",
+                        )
+                    budget_entries.append((scope_type, scope_id, period))
+
+            if not budget_entries:
+                return True, None, "No budget configured"
+
+            if self.max_active_reservations <= 0:
+                return False, None, "Budget reservations are disabled"
+            if len(self._reservations) >= self.max_active_reservations:
+                return (
+                    False,
+                    None,
+                    "Too many active budget reservations; retry after leases expire",
+                )
+
+            for scope_type, scope_id, period in budget_entries:
+                key = self._budget_key(scope_type, scope_id, period)
+                self._budgets[key].reserved_amount += estimated_cost
+
+            reservation = BudgetReservation(
+                reservation_id=str(uuid.uuid4()),
+                scopes=list(scopes),
+                budget_entries=budget_entries,
+                estimated_cost=estimated_cost,
+                expires_at=now + timedelta(seconds=self.reservation_ttl_seconds),
+            )
+            self._reservations[reservation.reservation_id] = reservation
+            return True, reservation, "Reserved"
+
+    def refund_reservation(self, reservation_id: str) -> bool:
+        """Release estimated spend for a request that did not complete."""
+        with self._lock:
+            self._cleanup_expired_reservations_locked(datetime.now(timezone.utc))
+            reservation = self._reservations.pop(reservation_id, None)
+            if reservation is None:
+                return False
+
+            self._release_reservation_locked(reservation)
+            return True
+
+    def commit_reservation(
+        self,
+        reservation_id: str,
+        actual_cost: float,
+        scope_type: str,
+        scope_id: str,
+        model_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int = 0,
+        metadata: Optional[Dict] = None
+    ) -> bool:
+        """
+        Convert a pending budget reservation into committed spend.
+
+        The estimated hold is released and the actual cost is recorded under
+        the same lock, so concurrent request admission observes the transition
+        atomically.
+        """
+        metadata = metadata or {}
+
+        with self._lock:
+            self._cleanup_expired_reservations_locked(datetime.now(timezone.utc))
+            reservation = self._reservations.pop(reservation_id, None)
+            if reservation is None:
+                return False
+
+            for entry in reservation.budget_entries:
+                budget_scope_type, budget_scope_id, period = entry
+                key = self._budget_key(budget_scope_type, budget_scope_id, period)
+                budget = self._budgets.get(key)
+                if budget is None:
+                    continue
+
+                budget.reset_if_expired()
+                budget.reserved_amount = max(
+                    0.0,
+                    budget.reserved_amount - reservation.estimated_cost,
+                )
+                budget.spent_amount += actual_cost
+                self._check_alerts(budget)
+
+            self._append_spending_history(
+                reservation.scopes,
+                scope_type,
+                scope_id,
+                model_id,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                actual_cost,
+                metadata,
+            )
+
+            return True
+
+    def _spend_scope_chain(
+        self,
+        scope_type: str,
+        scope_id: str,
+        metadata: Dict
+    ) -> List[Tuple[str, str]]:
+        """Return the child-to-parent budget scopes charged for one event."""
+        scopes: List[Tuple[str, str]] = []
+
+        def add(scope: str, identifier: object) -> None:
+            if identifier is None:
+                return
+            candidate = (scope, str(identifier))
+            if candidate not in scopes:
+                scopes.append(candidate)
+
+        add(scope_type, scope_id)
+
+        org_id = metadata.get("org_id") or metadata.get("organization_id")
+        user_id = metadata.get("user_id")
+
+        if scope_type == "agent":
+            add("user", user_id)
+            add("organization", org_id)
+        elif scope_type == "user":
+            add("organization", org_id)
+
+        global_scope_id = metadata.get("global_scope_id", "system")
+        add("global", global_scope_id)
+
+        return scopes
+
+    def _append_spending_history(
+        self,
+        spend_scopes: List[Tuple[str, str]],
+        source_scope_type: str,
+        source_scope_id: str,
+        model_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int,
+        cost: float,
+        metadata: Dict
+    ) -> None:
+        """Append per-scope spend samples. Caller must hold _lock."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        for budget_scope_type, budget_scope_id in spend_scopes:
+            self._spending_history.append({
+                "timestamp": timestamp,
+                "scope_type": budget_scope_type,
+                "scope_id": budget_scope_id,
+                "source_scope_type": source_scope_type,
+                "source_scope_id": source_scope_id,
+                "model_id": model_id,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": cached_tokens,
+                "cost": cost,
+                "metadata": metadata
+            })
     
     def record_spend(
         self,
@@ -849,14 +1304,17 @@ class BudgetManager:
         cached_tokens: int = 0,
         metadata: Optional[Dict] = None
     ) -> float:
+        # 3. Spend recording: post actual model usage after execution.
         """
         Record spending against budgets.
         
         Records against all configured budget periods for the scope
-        and checks alert thresholds.
+        and its parent scopes, then checks alert thresholds.
         
         Returns the calculated cost.
         """
+        metadata = metadata or {}
+
         # Calculate cost
         pricing = self.pricing.get(model_id)
         if not pricing:
@@ -865,31 +1323,37 @@ class BudgetManager:
             cost = ((input_tokens + output_tokens) / 1000) * 0.01
         else:
             cost = pricing.calculate_cost(input_tokens, output_tokens, cached_tokens)
-        
+
+        spend_scopes = self._spend_scope_chain(scope_type, scope_id, metadata)
+
         with self._lock:
-            # Record against all budget periods for this scope
-            for period in BudgetPeriod:
-                key = self._budget_key(scope_type, scope_id, period)
-                if key in self._budgets:
-                    budget = self._budgets[key]
-                    budget.reset_if_expired()
-                    budget.spent_amount += cost
-                    
-                    # Check alert thresholds
-                    self._check_alerts(budget)
-            
-            # Store in spending history
-            self._spending_history.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "scope_type": scope_type,
-                "scope_id": scope_id,
-                "model_id": model_id,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cached_tokens": cached_tokens,
-                "cost": cost,
-                "metadata": metadata or {}
-            })
+            self._cleanup_expired_reservations_locked(datetime.now(timezone.utc))
+
+            # Record against all budget periods for every enforced scope.
+            for budget_scope_type, budget_scope_id in spend_scopes:
+                for period in BudgetPeriod:
+                    key = self._budget_key(
+                        budget_scope_type, budget_scope_id, period
+                    )
+                    if key in self._budgets:
+                        budget = self._budgets[key]
+                        budget.reset_if_expired()
+                        budget.spent_amount += cost
+
+                        # Check alert thresholds
+                        self._check_alerts(budget)
+
+            self._append_spending_history(
+                spend_scopes,
+                scope_type,
+                scope_id,
+                model_id,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                cost,
+                metadata,
+            )
         
         return cost
     
@@ -923,10 +1387,13 @@ class BudgetManager:
         scope_type: str,
         scope_id: str
     ) -> Dict[str, Dict]:
+        # 4. Reporting: expose current allocation, spend, and remaining balance.
         """Get status of all budgets for a scope."""
         status = {}
         
         with self._lock:
+            self._cleanup_expired_reservations_locked(datetime.now(timezone.utc))
+
             for period in BudgetPeriod:
                 key = self._budget_key(scope_type, scope_id, period)
                 if key in self._budgets:
@@ -936,6 +1403,7 @@ class BudgetManager:
                     status[period.value] = {
                         "allocated": budget.allocated_amount,
                         "spent": budget.spent_amount,
+                        "reserved": budget.reserved_amount,
                         "remaining": budget.remaining,
                         "utilization_percent": budget.utilization_percent,
                         "period_start": budget.period_start.isoformat()
@@ -950,6 +1418,7 @@ class BudgetManager:
         period: BudgetPeriod,
         hours_to_project: int = 24
     ) -> Dict:
+        # 5. Projection: estimate end-of-period spend from recent samples.
         """
         Project future spending based on recent patterns.
         
@@ -1020,17 +1489,19 @@ class BudgetManager:
 # ============================================================================
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Callable, Any
+from typing import Optional, Dict, List, Callable, Any, Tuple
 from enum import Enum
 from collections import deque, OrderedDict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import time
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
-# Bounds for in-memory degradation state. The queue is a deque to drop the
-# oldest pending request once full; the cache is an OrderedDict so we can
-# evict the least-recently-inserted entry when capacity is hit.
+# Bounds for in-memory degradation state. Queue overflow is rejected explicitly
+# so the caller can fall through to another degradation strategy; cached
+# responses still use bounded FIFO eviction.
 MAX_QUEUE_SIZE = 10_000
 MAX_CACHE_SIZE = 1024
 
@@ -1084,6 +1555,22 @@ class DegradationConfig:
     
     # Maximum queue wait time in seconds
     max_queue_wait: float = 300.0
+
+    # Maximum queued requests before queueing fails explicitly
+    max_queue_size: int = MAX_QUEUE_SIZE
+
+    # Maximum cached responses retained for fallback before FIFO eviction
+    max_cache_size: int = MAX_CACHE_SIZE
+
+    # Per-item processor timeout for queued work. Set to None only when the
+    # processor has its own deadline enforcement.
+    queue_item_timeout_seconds: Optional[float] = 30.0
+
+    # Bounded worker count for queued processors that need timeout supervision.
+    # Timed-out synchronous processors cannot be killed safely, so each running
+    # processor keeps one slot until it returns or cooperatively observes
+    # deadline_at.
+    queue_processor_workers: int = 4
     
     # Cache TTL for fallback responses
     cache_ttl_seconds: float = 3600.0
@@ -1108,16 +1595,37 @@ class GracefulDegradationManager:
     rate_limiter: Optional[HierarchicalRateLimiter] = None
     budget_manager: Optional[BudgetManager] = None
     
-    # Bounded so a hot path can't grow these indefinitely; deque drops the
-    # oldest queued request once full and the OrderedDict gives O(1) FIFO
-    # eviction in cache_response().
-    _request_queue: deque = field(
-        default_factory=lambda: deque(maxlen=MAX_QUEUE_SIZE)
-    )
+    # Bounded manually in _try_queue() so overflow is visible rather than
+    # silently evicting the oldest queued request.
+    _request_queue: deque = field(default_factory=deque)
     _response_cache: "OrderedDict[str, Dict]" = field(
         default_factory=OrderedDict
     )
     _degradation_stats: Dict[str, int] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+    _queue_processor_executor: Optional[ThreadPoolExecutor] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _queue_processor_slots: threading.BoundedSemaphore = field(
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.config.max_queue_size < 1:
+            raise ValueError("max_queue_size must be at least 1")
+        if (
+            self.config.queue_item_timeout_seconds is not None
+            and self.config.queue_item_timeout_seconds <= 0
+        ):
+            raise ValueError("queue_item_timeout_seconds must be positive or None")
+        if self.config.queue_processor_workers < 1:
+            raise ValueError("queue_processor_workers must be at least 1")
+        self._queue_processor_slots = threading.BoundedSemaphore(
+            self.config.queue_processor_workers
+        )
     
     def handle_rate_limit(
         self,
@@ -1191,9 +1699,15 @@ class GracefulDegradationManager:
         # Try each subsequent model
         for i in range(current_index + 1, len(self.config.model_downgrade_path)):
             downgraded_model = self.config.model_downgrade_path[i]
-            
-            # Check if we have budget/rate capacity for the cheaper model
-            if self._check_capacity_for_model(request, downgraded_model):
+
+            modified_request = {**request, "model": downgraded_model}
+            reserved, governance_metadata, _ = self._reserve_capacity_for_request(
+                modified_request, downgraded_model
+            )
+            if reserved:
+                modified_request["governance"] = self._merge_governance_metadata(
+                    modified_request, governance_metadata or {}
+                )
                 logger.info(
                     f"Downgrading from {current_model} to {downgraded_model}"
                 )
@@ -1202,7 +1716,8 @@ class GracefulDegradationManager:
                     "strategy": "downgrade_model",
                     "original_model": current_model,
                     "downgraded_model": downgraded_model,
-                    "modified_request": {**request, "model": downgraded_model},
+                    "modified_request": modified_request,
+                    "governance": modified_request["governance"],
                     "user_message": (
                         f"Using {downgraded_model} due to rate limits"
                         if self.config.notify_user else None
@@ -1222,6 +1737,12 @@ class GracefulDegradationManager:
             self.config.max_output_tokens_degraded
         )
         modified_request["max_tokens"] = reduced_max_tokens
+        estimated_input, estimated_output = self._estimated_tokens_for_request(
+            modified_request
+        )
+        estimated_output = min(estimated_output, reduced_max_tokens)
+        modified_request["estimated_input_tokens"] = estimated_input
+        modified_request["estimated_output_tokens"] = estimated_output
         
         # Add instruction to be concise
         original_system = request.get("system", "")
@@ -1230,6 +1751,20 @@ class GracefulDegradationManager:
             "\n\nIMPORTANT: Due to resource constraints, provide a concise "
             "response. Focus on the most critical information only."
         )
+
+        model = modified_request.get("model", "claude-3-opus")
+        reserved, governance_metadata, reason = self._reserve_capacity_for_request(
+            modified_request, model
+        )
+        if not reserved:
+            return {
+                "success": False,
+                "strategy": "reduce_quality",
+                "reason": reason
+            }
+        modified_request["governance"] = self._merge_governance_metadata(
+            modified_request, governance_metadata or {}
+        )
         
         return {
             "success": True,
@@ -1237,6 +1772,7 @@ class GracefulDegradationManager:
             "original_max_tokens": original_max_tokens,
             "reduced_max_tokens": reduced_max_tokens,
             "modified_request": modified_request,
+            "governance": modified_request["governance"],
             "user_message": (
                 "Response may be shorter due to current load"
                 if self.config.notify_user else None
@@ -1245,46 +1781,65 @@ class GracefulDegradationManager:
     
     def _try_queue(self, request: Dict) -> Dict:
         """Queue the request for later processing."""
-        queue_entry = {
-            "request": request,
-            "queued_at": time.time(),
-            "expires_at": time.time() + self.config.max_queue_wait
-        }
-        
-        self._request_queue.append(queue_entry)
-        
-        estimated_wait = self._estimate_queue_wait()
-        
-        return {
-            "success": True,
-            "strategy": "queue",
-            "queue_position": len(self._request_queue),
-            "estimated_wait_seconds": estimated_wait,
-            "user_message": (
-                f"Request queued. Estimated wait: {int(estimated_wait)}s"
-                if self.config.notify_user else None
-            )
-        }
+        with self._lock:
+            if len(self._request_queue) >= self.config.max_queue_size:
+                queue_size = len(self._request_queue)
+                logger.warning(
+                    "Degradation queue full; rejecting queue strategy "
+                    "without evicting pending requests"
+                )
+                self._record_degradation("queue_full")
+                return {
+                    "success": False,
+                    "strategy": "queue",
+                    "reason": "queue_full",
+                    "queue_size": queue_size,
+                    "max_queue_size": self.config.max_queue_size,
+                }
+
+            queued_at = time.time()
+            queue_entry = {
+                "request": request,
+                "queued_at": queued_at,
+                "expires_at": queued_at + self.config.max_queue_wait
+            }
+
+            self._request_queue.append(queue_entry)
+
+            queue_position = len(self._request_queue)
+            estimated_wait = self._estimate_queue_wait()
+
+            return {
+                "success": True,
+                "strategy": "queue",
+                "queue_position": queue_position,
+                "estimated_wait_seconds": estimated_wait,
+                "user_message": (
+                    f"Request queued. Estimated wait: {int(estimated_wait)}s"
+                    if self.config.notify_user else None
+                )
+            }
     
     def _try_cache_fallback(self, request: Dict) -> Dict:
         """Return cached result if available."""
         cache_key = self._compute_cache_key(request)
-        
-        if cache_key in self._response_cache:
-            cached = self._response_cache[cache_key]
-            
-            # Check if cache is still valid
-            if time.time() - cached["cached_at"] < self.config.cache_ttl_seconds:
-                return {
-                    "success": True,
-                    "strategy": "cache_fallback",
-                    "cached_response": cached["response"],
-                    "cached_at": cached["cached_at"],
-                    "user_message": (
-                        "Returning cached response due to rate limits"
-                        if self.config.notify_user else None
-                    )
-                }
+
+        with self._lock:
+            if cache_key in self._response_cache:
+                cached = self._response_cache[cache_key]
+
+                # Check if cache is still valid
+                if time.time() - cached["cached_at"] < self.config.cache_ttl_seconds:
+                    return {
+                        "success": True,
+                        "strategy": "cache_fallback",
+                        "cached_response": cached["response"],
+                        "cached_at": cached["cached_at"],
+                        "user_message": (
+                            "Returning cached response due to rate limits"
+                            if self.config.notify_user else None
+                        )
+                    }
         
         return {"success": False, "strategy": "cache_fallback"}
     
@@ -1293,30 +1848,208 @@ class GracefulDegradationManager:
         # This would integrate with streaming APIs to return
         # whatever was generated before hitting limits
         return {"success": False, "strategy": "partial"}
+
+    def _estimated_tokens_for_request(self, request: Dict) -> Tuple[int, int]:
+        """Return non-negative estimated input and output tokens."""
+        estimated_input = max(
+            0,
+            int(request.get("estimated_input_tokens", 1000))
+        )
+        estimated_output = max(
+            0,
+            int(request.get("estimated_output_tokens", 500))
+        )
+        return estimated_input, estimated_output
+
+    def _estimated_cost_for_model(
+        self,
+        model: str,
+        estimated_input: int,
+        estimated_output: int
+    ) -> float:
+        """Estimate request cost for budget reservation."""
+        pricing = (
+            self.budget_manager.pricing.get(model)
+            if self.budget_manager is not None
+            else None
+        )
+        if pricing:
+            return pricing.calculate_cost(estimated_input, estimated_output, 0)
+        return ((estimated_input + estimated_output) / 1000) * 0.01
+
+    def _merge_governance_metadata(
+        self,
+        request: Dict,
+        governance_metadata: Dict
+    ) -> Dict:
+        """Attach admission metadata without discarding caller metadata."""
+        existing = request.get("governance", {})
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        merged.update(governance_metadata)
+        return merged
+
+    def _reserve_capacity_for_request(
+        self,
+        request: Dict,
+        model: str
+    ) -> Tuple[bool, Optional[Dict], str]:
+        """
+        Reserve budget and acquire rate-limit capacity for a degraded request.
+
+        Budget reservation happens before rate-limit acquisition so a rate
+        failure can release the reservation and leave no partial admission.
+        """
+        estimated_input, estimated_output = self._estimated_tokens_for_request(
+            request
+        )
+        budget_scopes = self._budget_scopes_for_request(request)
+        estimated_cost = self._estimated_cost_for_model(
+            model, estimated_input, estimated_output
+        )
+        budget_reservation = None
+
+        if self.budget_manager:
+            budget_reserved, budget_reservation, msg = (
+                self.budget_manager.reserve_spend(
+                    budget_scopes,
+                    [BudgetPeriod.DAILY, BudgetPeriod.MONTHLY],
+                    estimated_cost,
+                )
+            )
+            if not budget_reserved:
+                return False, None, msg
+
+        scopes = request.get("scopes", [])
+        if self.rate_limiter and scopes:
+            success, blocked_scope, reason = self.rate_limiter.acquire(
+                scopes, estimated_input, estimated_output
+            )
+            if not success:
+                if budget_reservation is not None:
+                    self.budget_manager.refund_reservation(
+                        budget_reservation.reservation_id
+                    )
+                if blocked_scope and reason:
+                    return False, None, f"{blocked_scope}: {reason}"
+                return False, None, reason or "Rate limit exceeded"
+
+        governance_metadata = {
+            "governance_id": str(uuid.uuid4()),
+            "rate_limit_acquisition": (
+                {
+                    "scopes": scopes,
+                    "estimated_input_tokens": estimated_input,
+                    "estimated_output_tokens": estimated_output,
+                }
+                if self.rate_limiter and scopes
+                else None
+            ),
+            "budget_reservation_id": (
+                budget_reservation.reservation_id
+                if budget_reservation is not None
+                else None
+            ),
+            "budget_scopes": budget_scopes,
+            "estimated_cost": estimated_cost,
+        }
+        return True, governance_metadata, "Reserved"
+
+    def _refund_reserved_capacity(self, request: Dict) -> None:
+        """Release admission holds when queued work fails before completion."""
+        governance_metadata = request.get("governance", {})
+        if not isinstance(governance_metadata, dict):
+            return
+
+        reservation_id = governance_metadata.get("budget_reservation_id")
+        if reservation_id and self.budget_manager:
+            self.budget_manager.refund_reservation(reservation_id)
+
+        rate_limit_acquisition = governance_metadata.get("rate_limit_acquisition")
+        if rate_limit_acquisition and self.rate_limiter:
+            self.rate_limiter.refund_acquisition(
+                rate_limit_acquisition["scopes"],
+                rate_limit_acquisition["estimated_input_tokens"],
+                rate_limit_acquisition["estimated_output_tokens"],
+            )
     
     def _check_capacity_for_model(self, request: Dict, model: str) -> bool:
         """Check if there's capacity for a specific model."""
-        if not self.rate_limiter:
-            return True
-        
         # Estimate tokens for the downgraded model
         # (cheaper models might use more tokens for same task)
         estimated_input = request.get("estimated_input_tokens", 1000)
         estimated_output = request.get("estimated_output_tokens", 500)
         
         scopes = request.get("scopes", [])
-        allowed, _, _ = self.rate_limiter.check_all_limits(
-            scopes, estimated_input, estimated_output
-        )
-        
-        return allowed
+        if self.rate_limiter and scopes:
+            allowed, _, _ = self.rate_limiter.check_all_limits(
+                scopes, estimated_input, estimated_output
+            )
+            if not allowed:
+                return False
+
+        if self.budget_manager:
+            pricing = self.budget_manager.pricing.get(model)
+            if pricing:
+                estimated_cost = pricing.calculate_cost(
+                    estimated_input, estimated_output, 0
+                )
+            else:
+                estimated_cost = (
+                    (estimated_input + estimated_output) / 1000
+                ) * 0.01
+
+            for scope_type, scope_id in self._budget_scopes_for_request(request):
+                for period in [BudgetPeriod.DAILY, BudgetPeriod.MONTHLY]:
+                    within_budget, _, _ = self.budget_manager.check_budget(
+                        scope_type, scope_id, period, estimated_cost
+                    )
+                    if not within_budget:
+                        return False
+
+        return True
+
+    def _budget_scopes_for_request(self, request: Dict) -> List[Tuple[str, str]]:
+        """Derive budget scopes to enforce for a degraded request."""
+        configured_scopes = request.get("budget_scopes")
+        if configured_scopes:
+            return [
+                (
+                    scope_type.value
+                    if isinstance(scope_type, LimitScope)
+                    else str(scope_type),
+                    str(scope_id)
+                )
+                for scope_type, scope_id in configured_scopes
+            ]
+
+        budget_scopes: List[Tuple[str, str]] = []
+
+        def add(scope_type: str, scope_id: object) -> None:
+            if scope_id is None:
+                return
+            candidate = (scope_type, str(scope_id))
+            if candidate not in budget_scopes:
+                budget_scopes.append(candidate)
+
+        add("global", request.get("global_scope_id", "system"))
+
+        for scope, scope_id in request.get("scopes", []):
+            scope_type = scope.value if isinstance(scope, LimitScope) else str(scope)
+            if scope_type in {"organization", "user", "agent"}:
+                add(scope_type, scope_id)
+
+        add("organization", request.get("org_id"))
+        add("user", request.get("user_id"))
+        add("agent", request.get("agent_id"))
+
+        return budget_scopes
     
     def _calculate_retry_after(self, blocked_scope: str) -> float:
         """
         Calculate recommended retry delay using decorrelated jitter.
 
-        The decorrelated jitter approach~\cite{aws-backoff}, building on exponential
-        backoff principles~\cite{metcalfe-backoff}, reduces correlation between retry
+        The decorrelated jitter approach~\\cite{aws-backoff}, building on exponential
+        backoff principles~\\cite{metcalfe-backoff}, reduces correlation between retry
         attempts from multiple clients, preventing thundering herd problems.
 
         Formula: sleep = min(cap, random(base, sleep * 3))
@@ -1332,16 +2065,17 @@ class GracefulDegradationManager:
         # _last_delay is an instance attribute (initialized lazily via getattr)
         # so concurrent GracefulDegradationManager instances cannot stomp on a
         # shared module-level value.
-        previous_delay = getattr(self, '_last_delay', base_delay)
-
-        delay = min(cap, random.uniform(base_delay, previous_delay * 3))
-        self._last_delay = delay
+        with self._lock:
+            previous_delay = getattr(self, '_last_delay', base_delay)
+            delay = min(cap, random.uniform(base_delay, previous_delay * 3))
+            self._last_delay = delay
         return delay
     
     def _estimate_queue_wait(self) -> float:
         """Estimate queue wait time based on processing rate."""
         # Simple estimate: 5 seconds per queued item
-        return len(self._request_queue) * 5.0
+        with self._lock:
+            return len(self._request_queue) * 5.0
     
     def _compute_cache_key(self, request: Dict) -> str:
         """Generate a cache key for a request."""
@@ -1359,70 +2093,214 @@ class GracefulDegradationManager:
     
     def _record_degradation(self, strategy: str) -> None:
         """Record degradation event for monitoring."""
-        self._degradation_stats[strategy] = (
-            self._degradation_stats.get(strategy, 0) + 1
-        )
+        with self._lock:
+            self._degradation_stats[strategy] = (
+                self._degradation_stats.get(strategy, 0) + 1
+            )
+
+    def _get_queue_processor_executor(self) -> ThreadPoolExecutor:
+        """Return the shared bounded executor used for timed queue items."""
+        with self._lock:
+            if self._queue_processor_executor is None:
+                self._queue_processor_executor = ThreadPoolExecutor(
+                    max_workers=self.config.queue_processor_workers,
+                    thread_name_prefix="degradation-queue",
+                )
+            return self._queue_processor_executor
+
+    def shutdown_queue_processor(self, wait: bool = True) -> None:
+        """Shut down the shared queue processor executor."""
+        with self._lock:
+            executor = self._queue_processor_executor
+            self._queue_processor_executor = None
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=True)
     
     def cache_response(self, request: Dict, response: Dict) -> None:
         """Cache a response for potential future fallback."""
         cache_key = self._compute_cache_key(request)
-        # Refresh recency on hit, then enforce MAX_CACHE_SIZE via FIFO eviction.
-        if cache_key in self._response_cache:
-            self._response_cache.move_to_end(cache_key)
-        self._response_cache[cache_key] = {
-            "response": response,
-            "cached_at": time.time()
-        }
-        while len(self._response_cache) > MAX_CACHE_SIZE:
-            self._response_cache.popitem(last=False)
+        with self._lock:
+            # Refresh recency on hit, then enforce MAX_CACHE_SIZE via FIFO eviction.
+            if cache_key in self._response_cache:
+                self._response_cache.move_to_end(cache_key)
+            self._response_cache[cache_key] = {
+                "response": response,
+                "cached_at": time.time()
+            }
+            while len(self._response_cache) > self.config.max_cache_size:
+                self._response_cache.popitem(last=False)
     
     def get_degradation_stats(self) -> Dict[str, int]:
         """Return statistics on degradation events."""
-        return self._degradation_stats.copy()
+        with self._lock:
+            return self._degradation_stats.copy()
     
     def process_queue(
         self,
-        processor: Callable[[Dict], Dict]
+        processor: Callable[[Dict], Dict],
+        item_timeout_seconds: Optional[float] = None
     ) -> List[Dict]:
         """
         Process queued requests when capacity is available.
         
         Args:
-            processor: Function to process a request and return response
+            processor: Function to process a request and return response.
+                Successful processors should record completion using the
+                request's governance metadata; exceptions or
+                {"success": False} results release the reservation.
+            item_timeout_seconds: Optional override for the configured
+                per-item timeout. Pass None to use the configuration; set the
+                configuration to None only if the processor enforces its own
+                deadline using the request's ``deadline_at`` field.
             
         Returns:
             List of processed results
         """
         results = []
-        now = time.time()
-        
-        # Remove expired entries while preserving the deque bound.
-        self._request_queue = deque(
-            (entry for entry in self._request_queue
-             if entry["expires_at"] > now),
-            maxlen=MAX_QUEUE_SIZE
+        effective_timeout = (
+            self.config.queue_item_timeout_seconds
+            if item_timeout_seconds is None
+            else item_timeout_seconds
         )
+        if effective_timeout is not None and effective_timeout <= 0:
+            raise ValueError("item_timeout_seconds must be positive or None")
         
-        # Process what we can
-        while self._request_queue:
-            entry = self._request_queue[0]
-            
-            # Check if we have capacity now
-            request = entry["request"]
-            if self._check_capacity_for_model(
-                request, request.get("model", "claude-3-opus")
-            ):
-                self._request_queue.popleft()
-                result = processor(request)
-                results.append({
-                    "request": request,
-                    "result": result,
-                    "queue_time": now - entry["queued_at"]
-                })
-            else:
-                # No capacity, stop processing
+        while True:
+            now = time.time()
+            with self._lock:
+                # Remove expired entries without changing queue admission policy.
+                # Preserve the bounded-memory invariant by carrying the
+                # original maxlen through the rebuild.
+                self._request_queue = deque(
+                    (entry for entry in self._request_queue
+                     if entry["expires_at"] > now),
+                    maxlen=self._request_queue.maxlen,
+                )
+
+                if not self._request_queue:
+                    break
+
+                entry = self._request_queue[0]
+                request = entry["request"]
+
+            processor_slot_acquired = False
+            if effective_timeout is not None:
+                processor_slot_acquired = self._queue_processor_slots.acquire(
+                    blocking=False
+                )
+                if not processor_slot_acquired:
+                    self._record_degradation("queue_processor_saturated")
+                    break
+
+            try:
+                reserved, governance_metadata, _ = (
+                    self._reserve_capacity_for_request(
+                        request, request.get("model", "claude-3-opus")
+                    )
+                )
+            except Exception:
+                if processor_slot_acquired:
+                    self._queue_processor_slots.release()
+                raise
+            if not reserved:
+                # No capacity, stop processing and keep the request queued.
+                if processor_slot_acquired:
+                    self._queue_processor_slots.release()
                 break
-        
+
+            governed_request = {
+                **request,
+                "governance": self._merge_governance_metadata(
+                    request, governance_metadata or {}
+                ),
+            }
+
+            with self._lock:
+                if not self._request_queue or self._request_queue[0] is not entry:
+                    self._refund_reserved_capacity(governed_request)
+                    if processor_slot_acquired:
+                        self._queue_processor_slots.release()
+                    continue
+                self._request_queue.popleft()
+
+            processor_request = governed_request
+            if effective_timeout is not None:
+                processor_request = {
+                    **governed_request,
+                    "deadline_at": time.time() + effective_timeout,
+                }
+                executor = self._get_queue_processor_executor()
+                try:
+                    future = executor.submit(processor, processor_request)
+                except Exception:
+                    self._queue_processor_slots.release()
+                    self._refund_reserved_capacity(processor_request)
+                    raise
+
+                timed_out = False
+                refund_after_timeout = False
+                try:
+                    result = future.result(timeout=effective_timeout)
+                except FutureTimeoutError:
+                    timed_out = True
+                    if not future.cancel():
+                        # Worker still holds the slot past the deadline; surface
+                        # the wedge to SREs as a distinct counter so they can
+                        # distinguish "clean timeout" from "stuck worker".
+                        self._record_degradation("queue_timeout_uncancelable")
+                        def release_after_completion(_future):
+                            try:
+                                completed_result = _future.result()
+                            except Exception:
+                                self._refund_reserved_capacity(processor_request)
+                            else:
+                                if (
+                                    isinstance(completed_result, dict)
+                                    and completed_result.get("success") is False
+                                ):
+                                    self._refund_reserved_capacity(processor_request)
+                            finally:
+                                self._queue_processor_slots.release()
+
+                        future.add_done_callback(release_after_completion)
+                    else:
+                        self._queue_processor_slots.release()
+                        refund_after_timeout = True
+                    result = {
+                        "success": False,
+                        "error": "queue_item_timeout",
+                        "timeout_seconds": effective_timeout,
+                        "capacity_refunded": refund_after_timeout,
+                    }
+                except Exception:
+                    self._queue_processor_slots.release()
+                    self._refund_reserved_capacity(processor_request)
+                    raise
+                else:
+                    self._queue_processor_slots.release()
+            else:
+                timed_out = False
+                try:
+                    result = processor(processor_request)
+                except Exception:
+                    self._refund_reserved_capacity(processor_request)
+                    raise
+
+            if timed_out:
+                if refund_after_timeout:
+                    self._refund_reserved_capacity(processor_request)
+                self._record_degradation("queue_timeout")
+            elif isinstance(result, dict) and result.get("success") is False:
+                self._refund_reserved_capacity(processor_request)
+
+            queue_time = time.time() - entry["queued_at"]
+            results.append({
+                "request": processor_request,
+                "result": result,
+                "queue_time": queue_time,
+                "timed_out": timed_out,
+            })
+
         return results
 
 # ============================================================================
@@ -1470,10 +2348,11 @@ class CostAggregation:
 @dataclass
 class CostTracker:
     """
-    Real-time cost tracking and aggregation system.
+    Freshness-bounded cost tracking and aggregation system.
     
-    Provides streaming cost updates, aggregation at multiple time
-    granularities, and integration with monitoring systems.
+    Provides synchronous in-process callbacks for new cost events,
+    aggregation at multiple time granularities, and integration hooks
+    for monitoring systems.
     """
     
     pricing: Dict[str, ModelPricing] = field(
@@ -1484,9 +2363,13 @@ class CostTracker:
     # long-running trackers. Oldest events are dropped FIFO once the
     # cap is reached.
     max_cost_events: int = 100_000
+    max_aggregation_scopes: int = 10_000
+    aggregation_scope_ttl_hours: int = 168
+    aggregation_hour_retention_hours: Optional[int] = None
 
     _events: "deque[CostEvent]" = field(init=False)
     _aggregations: Dict[str, CostAggregation] = field(default_factory=dict)
+    _aggregation_last_seen: Dict[str, datetime] = field(default_factory=dict)
     _subscribers: List[Callable[[CostEvent], None]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -1559,6 +2442,7 @@ class CostTracker:
         scope_key = f"{event.scope_type}:{event.scope_id}"
         if scope_key not in self._aggregations:
             self._aggregations[scope_key] = CostAggregation()
+        self._aggregation_last_seen[scope_key] = event.timestamp
         
         agg = self._aggregations[scope_key]
         agg.total_cost += event.cost
@@ -1577,19 +2461,73 @@ class CostTracker:
         agg.by_hour[hour_key] = (
             agg.by_hour.get(hour_key, 0) + event.cost
         )
+        self._prune_aggregation_hours(agg, event.timestamp)
+        self._evict_aggregation_scopes(event.timestamp)
+
+    def _aggregation_hour_retention(self) -> int:
+        if self.aggregation_hour_retention_hours is not None:
+            return self.aggregation_hour_retention_hours
+        return self.retention_hours
+
+    def _prune_aggregation_hours(
+        self,
+        agg: CostAggregation,
+        now: datetime
+    ) -> None:
+        """Drop per-hour buckets outside the configured retention window."""
+        retention = max(0, self._aggregation_hour_retention())
+        cutoff_hour = (now - timedelta(hours=retention)).strftime("%Y-%m-%d-%H")
+        for hour_key in sorted(list(agg.by_hour.keys())):
+            if hour_key < cutoff_hour:
+                del agg.by_hour[hour_key]
+
+    def _evict_aggregation_scopes(self, now: datetime) -> None:
+        """Evict inactive scopes first, then oldest active scopes."""
+        ttl = max(0, self.aggregation_scope_ttl_hours)
+        cutoff = now - timedelta(hours=ttl)
+        expired_keys = [
+            key for key, last_seen in self._aggregation_last_seen.items()
+            if last_seen < cutoff
+        ]
+        for key in sorted(expired_keys):
+            self._aggregations.pop(key, None)
+            self._aggregation_last_seen.pop(key, None)
+
+        if self.max_aggregation_scopes <= 0:
+            for key in sorted(list(self._aggregations.keys())):
+                self._aggregations.pop(key, None)
+                self._aggregation_last_seen.pop(key, None)
+            return
+
+        overflow = len(self._aggregations) - self.max_aggregation_scopes
+        if overflow <= 0:
+            return
+
+        floor = datetime.min.replace(tzinfo=timezone.utc)
+        eviction_order = sorted(
+            self._aggregations.keys(),
+            key=lambda key: (self._aggregation_last_seen.get(key, floor), key)
+        )
+        for key in eviction_order[:overflow]:
+            self._aggregations.pop(key, None)
+            self._aggregation_last_seen.pop(key, None)
     
     def _cleanup_old_events(self) -> None:
         """Remove events older than retention period."""
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=self.retention_hours)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=self.retention_hours)
         # Rebuild as a deque with the same maxlen so the bounded-memory
-        # guarantee from __post_init__ survives cleanup.
+        # invariant from __post_init__ survives cleanup.
         self._events = deque(
             (e for e in self._events if e.timestamp >= cutoff),
             maxlen=self.max_cost_events,
         )
+        for agg in self._aggregations.values():
+            self._prune_aggregation_hours(agg, now)
+        self._evict_aggregation_scopes(now)
     
     def subscribe(self, callback: Callable[[CostEvent], None]) -> None:
-        """Subscribe to real-time cost events."""
+        """Subscribe to newly recorded cost events."""
         self._subscribers.append(callback)
     
     def unsubscribe(self, callback: Callable[[CostEvent], None]) -> None:
@@ -1848,14 +2786,26 @@ class AlertManager:
     notification_channels: List[Callable[[Alert], None]] = field(
         default_factory=list
     )
+    max_notification_channels: int = 20
+    max_metric_keys: int = 10_000
+    metric_ttl_hours: int = 24
+    max_metric_samples_per_key: int = 1000
+    max_cooldown_keys: int = 10_000
+    alert_cooldown_ttl_hours: int = 24
     
     _rules: Dict[str, AlertRule] = field(default_factory=dict)
     _alerts: List[Alert] = field(default_factory=list)
     _last_alert_times: Dict[str, datetime] = field(default_factory=dict)
     _metric_history: Dict[str, deque] = field(default_factory=dict)
+    _metric_last_seen: Dict[str, datetime] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     
     def __post_init__(self):
+        if self.max_notification_channels < 0:
+            raise ValueError("max_notification_channels must be non-negative")
+        self.notification_channels = self.notification_channels[
+            :self.max_notification_channels
+        ]
         # Register default rules
         self._register_default_rules()
     
@@ -1938,6 +2888,8 @@ class AlertManager:
         channel: Callable[[Alert], None]
     ) -> None:
         """Add a notification channel."""
+        if len(self.notification_channels) >= self.max_notification_channels:
+            raise ValueError("notification channel limit reached")
         self.notification_channels.append(channel)
     
     def record_metric(
@@ -1949,15 +2901,77 @@ class AlertManager:
     ) -> None:
         """Record a metric value for anomaly detection."""
         key = f"{metric_name}:{scope_type}:{scope_id}"
+        now = datetime.now(timezone.utc)
         
         with self._lock:
+            self._prune_metric_history(now)
+            if self.max_metric_keys <= 0:
+                return
+
             if key not in self._metric_history:
-                self._metric_history[key] = deque(maxlen=1000)
+                self._metric_history[key] = deque(
+                    maxlen=max(1, self.max_metric_samples_per_key)
+                )
+            self._metric_last_seen[key] = now
             
             self._metric_history[key].append({
-                "timestamp": datetime.now(timezone.utc),
+                "timestamp": now,
                 "value": value
             })
+            self._evict_metric_keys()
+
+    def _prune_metric_history(self, now: datetime) -> None:
+        """Drop inactive metric keys and old samples."""
+        ttl = max(0, self.metric_ttl_hours)
+        cutoff = now - timedelta(hours=ttl)
+        for key in sorted(list(self._metric_history.keys())):
+            history = self._metric_history[key]
+            while history and history[0]["timestamp"] < cutoff:
+                history.popleft()
+            if not history or self._metric_last_seen.get(key, cutoff) < cutoff:
+                self._metric_history.pop(key, None)
+                self._metric_last_seen.pop(key, None)
+
+    def _evict_metric_keys(self) -> None:
+        """Keep only the most recently used metric keys."""
+        overflow = len(self._metric_history) - self.max_metric_keys
+        if overflow <= 0:
+            return
+
+        floor = datetime.min.replace(tzinfo=timezone.utc)
+        eviction_order = sorted(
+            self._metric_history.keys(),
+            key=lambda key: (self._metric_last_seen.get(key, floor), key)
+        )
+        for key in eviction_order[:overflow]:
+            self._metric_history.pop(key, None)
+            self._metric_last_seen.pop(key, None)
+
+    def _prune_cooldown_keys(self, now: datetime) -> None:
+        """Drop stale cooldown entries and cap high-cardinality keys."""
+        ttl = max(0, self.alert_cooldown_ttl_hours)
+        cutoff = now - timedelta(hours=ttl)
+        expired_keys = [
+            key for key, last_seen in self._last_alert_times.items()
+            if last_seen < cutoff
+        ]
+        for key in sorted(expired_keys):
+            self._last_alert_times.pop(key, None)
+
+        if self.max_cooldown_keys <= 0:
+            self._last_alert_times.clear()
+            return
+
+        overflow = len(self._last_alert_times) - self.max_cooldown_keys
+        if overflow <= 0:
+            return
+
+        eviction_order = sorted(
+            self._last_alert_times.keys(),
+            key=lambda key: (self._last_alert_times[key], key)
+        )
+        for key in eviction_order[:overflow]:
+            self._last_alert_times.pop(key, None)
     
     def check_for_anomalies(
         self,
@@ -1992,6 +3006,9 @@ class AlertManager:
         )
         
         with self._lock:
+            now = datetime.now(timezone.utc)
+            self._prune_cooldown_keys(now)
+
             for rule_id, rule in self._rules.items():
                 if not rule.enabled:
                     continue
@@ -2000,8 +3017,7 @@ class AlertManager:
                 cooldown_key = f"{rule_id}:{scope_type}:{scope_id}"
                 if cooldown_key in self._last_alert_times:
                     time_since_last = (
-                        datetime.now(timezone.utc) -
-                        self._last_alert_times[cooldown_key]
+                        now - self._last_alert_times[cooldown_key]
                     )
                     if time_since_last < timedelta(minutes=rule.cooldown_minutes):
                         continue
@@ -2013,7 +3029,8 @@ class AlertManager:
                         triggered_alerts.append(alert)
                         
                         # Update cooldown
-                        self._last_alert_times[cooldown_key] = datetime.now(timezone.utc)
+                        self._last_alert_times[cooldown_key] = now
+                        self._prune_cooldown_keys(now)
                         
                         # Store alert, bounding the in-memory ring.
                         self._alerts.append(alert)
@@ -2042,6 +3059,7 @@ class AlertManager:
             if key not in self._metric_history:
                 return 1.0
             
+            self._metric_last_seen[key] = datetime.now(timezone.utc)
             history = list(self._metric_history[key])
         
         if len(history) < 10:
@@ -2232,10 +3250,14 @@ def pagerduty_notification_channel(
 # Block 8 (chapter listing #8)
 # ============================================================================
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
+from collections import deque
+from contextlib import contextmanager
 import logging
 import os
+import threading
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -2255,6 +3277,21 @@ class AgentCostGovernor:
     cost_tracker: CostTracker
     alert_manager: AlertManager
     degradation_manager: GracefulDegradationManager
+    _finalized_governance_ids: set = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _finalized_governance_order: deque = field(
+        default_factory=lambda: deque(maxlen=10_000),
+        init=False,
+        repr=False,
+    )
+    _governance_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
     
     @classmethod
     def create_default(
@@ -2305,15 +3342,37 @@ class AgentCostGovernor:
         
         # Wire up cost tracking to budget manager
         def on_cost_event(event: CostEvent):
-            budget_manager.record_spend(
-                event.scope_type,
-                event.scope_id,
-                event.model_id,
-                event.input_tokens,
-                event.output_tokens,
-                event.cached_tokens,
-                event.metadata
-            )
+            reservation_id = event.metadata.get("budget_reservation_id")
+            committed = False
+            if reservation_id:
+                committed = budget_manager.commit_reservation(
+                    reservation_id,
+                    event.cost,
+                    event.scope_type,
+                    event.scope_id,
+                    event.model_id,
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.cached_tokens,
+                    event.metadata
+                )
+                if not committed:
+                    logger.warning(
+                        "Budget reservation %s was not active; "
+                        "recording spend directly",
+                        reservation_id,
+                    )
+
+            if not reservation_id or not committed:
+                budget_manager.record_spend(
+                    event.scope_type,
+                    event.scope_id,
+                    event.model_id,
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.cached_tokens,
+                    event.metadata
+                )
             
             # Check for anomalies
             alert_manager.check_for_anomalies(
@@ -2401,6 +3460,23 @@ class AgentCostGovernor:
         if agent_id:
             scopes.append((LimitScope.AGENT, agent_id))
         
+        budget_scopes = [
+            ("global", "system"),
+            ("organization", org_id),
+            ("user", user_id)
+        ]
+        if agent_id:
+            budget_scopes.append(("agent", agent_id))
+
+        governed_request = {
+            **request,
+            "scopes": scopes,
+            "budget_scopes": budget_scopes,
+            "org_id": org_id,
+            "user_id": user_id,
+            "agent_id": agent_id,
+        }
+
         # Estimate costs
         estimated_input = request.get("estimated_input_tokens", 1000)
         estimated_output = request.get("estimated_output_tokens", 500)
@@ -2414,17 +3490,6 @@ class AgentCostGovernor:
         else:
             estimated_cost = ((estimated_input + estimated_output) / 1000) * 0.01
         
-        # Check budget
-        for scope_type, scope_id in [("organization", org_id), ("user", user_id)]:
-            for period in [BudgetPeriod.DAILY, BudgetPeriod.MONTHLY]:
-                within_budget, remaining, msg = self.budget_manager.check_budget(
-                    scope_type, scope_id, period, estimated_cost
-                )
-                if not within_budget:
-                    return self.degradation_manager.handle_rate_limit(
-                        request, f"{scope_type}:{scope_id}", msg
-                    )
-        
         # Check rate limits
         allowed, blocked_scope, reason = self.rate_limiter.check_all_limits(
             scopes, estimated_input, estimated_output
@@ -2432,25 +3497,194 @@ class AgentCostGovernor:
         
         if not allowed:
             return self.degradation_manager.handle_rate_limit(
-                request, blocked_scope, reason
+                governed_request, blocked_scope, reason
             )
         
+        budget_reserved, budget_reservation, msg = self.budget_manager.reserve_spend(
+            budget_scopes,
+            [BudgetPeriod.DAILY, BudgetPeriod.MONTHLY],
+            estimated_cost,
+        )
+        if not budget_reserved:
+            return self.degradation_manager.handle_rate_limit(
+                governed_request, "budget", msg
+            )
+
         # Acquire capacity
         success, blocked_scope, reason = self.rate_limiter.acquire(
             scopes, estimated_input, estimated_output
         )
         
         if not success:
+            if budget_reservation is not None:
+                self.budget_manager.refund_reservation(
+                    budget_reservation.reservation_id
+                )
             return self.degradation_manager.handle_rate_limit(
-                request, blocked_scope, reason
+                governed_request, blocked_scope, reason
             )
         
+        governance_metadata = {
+            "governance_id": str(uuid.uuid4()),
+            "rate_limit_acquisition": {
+                "scopes": scopes,
+                "estimated_input_tokens": estimated_input,
+                "estimated_output_tokens": estimated_output,
+            },
+            "budget_reservation_id": (
+                budget_reservation.reservation_id
+                if budget_reservation is not None
+                else None
+            ),
+            "budget_scopes": budget_scopes,
+            "estimated_cost": estimated_cost,
+        }
+        governed_request["governance"] = governance_metadata
+
         # Request approved
         return {
             "approved": True,
-            "request": request,
-            "scopes": scopes
+            "request": governed_request,
+            "scopes": scopes,
+            "budget_scopes": budget_scopes,
+            "governance": governance_metadata
         }
+
+    def _extract_governance_metadata(self, metadata: Optional[Dict]) -> Dict:
+        """Accept governance metadata, a result, or a governed request."""
+        if not isinstance(metadata, dict):
+            return {}
+
+        governance_metadata = metadata.get("governance")
+        if isinstance(governance_metadata, dict):
+            return governance_metadata
+
+        for request_key in ("request", "modified_request"):
+            request = metadata.get(request_key)
+            if not isinstance(request, dict):
+                continue
+            request_governance = request.get("governance")
+            if isinstance(request_governance, dict):
+                return request_governance
+
+        return metadata
+
+    def _has_unfinished_admission(self, result: Dict) -> bool:
+        """Return True for admitted work that still needs finalization."""
+        if not isinstance(result, dict):
+            return False
+
+        if result.get("approved") is True:
+            return True
+
+        if result.get("success") is not True:
+            return False
+
+        governance_metadata = self._extract_governance_metadata(result)
+        return any(
+            governance_metadata.get(key)
+            for key in (
+                "governance_id",
+                "budget_reservation_id",
+                "rate_limit_acquisition",
+            )
+        )
+
+    def _governance_finalization_key(
+        self,
+        governance_metadata: Dict
+    ) -> Optional[str]:
+        governance_id = governance_metadata.get("governance_id")
+        if governance_id:
+            return str(governance_id)
+
+        reservation_id = governance_metadata.get("budget_reservation_id")
+        if reservation_id:
+            return f"budget:{reservation_id}"
+
+        return None
+
+    def _mark_governance_finalized(self, governance_metadata: Dict) -> bool:
+        """
+        Return True once for each admitted request.
+
+        Success and failure both finalize the admission. The bounded memory of
+        finalized ids prevents a later failure handler from refunding capacity
+        that was already consumed by a successful completion.
+        """
+        finalization_key = self._governance_finalization_key(
+            governance_metadata
+        )
+        if finalization_key is None:
+            return True
+
+        with self._governance_lock:
+            if finalization_key in self._finalized_governance_ids:
+                return False
+
+            maxlen = self._finalized_governance_order.maxlen
+            if maxlen is not None and len(self._finalized_governance_order) >= maxlen:
+                expired_key = self._finalized_governance_order.popleft()
+                self._finalized_governance_ids.discard(expired_key)
+
+            self._finalized_governance_order.append(finalization_key)
+            self._finalized_governance_ids.add(finalization_key)
+            return True
+
+    def record_failure(self, metadata: Optional[Dict] = None) -> bool:
+        """
+        Release admission holds for an approved request that did not complete.
+
+        Pass the ``governance`` metadata returned by process_request, the
+        process_request result itself, or the governed request. The method is
+        idempotent for admissions produced by this governor: after
+        record_completion succeeds, this returns False and does not refund rate
+        capacity.
+        """
+        governance_metadata = self._extract_governance_metadata(metadata)
+        if not governance_metadata:
+            return False
+
+        if not self._mark_governance_finalized(governance_metadata):
+            return False
+
+        released = False
+        reservation_id = governance_metadata.get("budget_reservation_id")
+        if reservation_id:
+            released = self.budget_manager.refund_reservation(reservation_id)
+
+        rate_limit_acquisition = governance_metadata.get("rate_limit_acquisition")
+        if rate_limit_acquisition:
+            self.rate_limiter.refund_acquisition(
+                rate_limit_acquisition["scopes"],
+                rate_limit_acquisition["estimated_input_tokens"],
+                rate_limit_acquisition["estimated_output_tokens"],
+            )
+            released = True
+
+        return released
+
+    @contextmanager
+    def governed_call(
+        self,
+        request: Dict,
+        org_id: str,
+        user_id: str,
+        agent_id: Optional[str] = None
+    ):
+        """
+        Context manager for governed work with automatic failure release.
+
+        Call record_completion inside the ``with`` block after successful
+        downstream work. If the block exits before completion is recorded, any
+        held budget and rate-limit capacity is released.
+        """
+        result = self.process_request(request, org_id, user_id, agent_id)
+        try:
+            yield result
+        finally:
+            if self._has_unfinished_admission(result):
+                self.record_failure(result)
     
     def record_completion(
         self,
@@ -2467,11 +3701,31 @@ class AgentCostGovernor:
         Record a completed API call.
         
         Should be called after each successful API call to track
-        actual usage.
+        actual usage. Pass the ``governance`` metadata returned by
+        process_request so token and budget reservations can be reconciled.
         
         Returns the calculated cost.
         """
-        # Record at user level (will roll up to org)
+        completion_metadata = dict(metadata or {})
+        governance_metadata = self._extract_governance_metadata(
+            completion_metadata
+        )
+        rate_limit_acquisition = governance_metadata.get("rate_limit_acquisition")
+        if rate_limit_acquisition:
+            self.rate_limiter.record_actual_usage(
+                rate_limit_acquisition["scopes"],
+                rate_limit_acquisition["estimated_input_tokens"],
+                rate_limit_acquisition["estimated_output_tokens"],
+                input_tokens,
+                output_tokens,
+            )
+
+        reservation_id = governance_metadata.get("budget_reservation_id")
+        if reservation_id:
+            completion_metadata["budget_reservation_id"] = reservation_id
+
+        # Record at user level; BudgetManager rolls up org/global spend
+        # from the metadata when the cost event subscriber records it.
         event = self.cost_tracker.record(
             scope_type="user",
             scope_id=user_id,
@@ -2482,9 +3736,11 @@ class AgentCostGovernor:
             metadata={
                 "org_id": org_id,
                 "agent_id": agent_id,
-                **(metadata or {})
+                **completion_metadata
             }
         )
+
+        self._mark_governance_finalized(governance_metadata)
         
         return event.cost
     
@@ -2504,9 +3760,17 @@ def example_usage():
     # an environment variable rather than embedding a literal URL: webhook
     # URLs are secrets, and a single literal token can overflow the PDF
     # code-block right margin (no break opportunity inside one token).
+    # Use .get() with an empty default so an unset env var does not raise
+    # KeyError before the user has a chance to configure alerting.
+    slack_webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if not slack_webhook:
+        raise RuntimeError(
+            "Set SLACK_WEBHOOK_URL to enable Slack alerts before running this "
+            "example."
+        )
     governor = AgentCostGovernor.create_default(
         global_daily_budget=500.0,
-        slack_webhook=os.environ["SLACK_WEBHOOK_URL"]
+        slack_webhook=slack_webhook,
     )
     
     # Configure an organization
@@ -2552,7 +3816,8 @@ def example_usage():
             model="claude-3-sonnet",
             input_tokens=487,
             output_tokens=1423,
-            agent_id="data-analyst"
+            agent_id="data-analyst",
+            metadata=result["governance"]
         )
     else:
         # Handle degraded or rejected request
@@ -2573,18 +3838,19 @@ def example_usage():
 # ============================================================================
 
 _block_9_listing = r"""
-# Cost projection assuming ~1000 tokens/paper at $0.015/1K input + $0.075/1K output
-# Validation: 500 papers * 1000 tokens * ($0.015 + $0.075)/1000 = $45 (input) + $225 (output)
-# Actual costs vary based on paper length and response verbosity
+# Hypothetical budget exercise:
+# assume $0.30/paper after retrieval, prompting, summarization,
+# and bookkeeping. Replace this with your measured unit cost.
+# Validation: 500 papers * $0.30/paper = $150
 
 Hour 1:  500 papers analyzed          $150
 Hour 2:  2,500 papers (5x growth)     $750
 Hour 3:  12,500 papers                $3,750
 Hour 4:  62,500 papers                $18,750
 Hour 5:  312,500 papers               $93,750
-         (API provider cuts access)
+         (manual cutoff)
 
-Total potential damage: $47,000+ before intervention
+Total hypothetical exposure: $117,000+ before cutoff
 """
 
 # ============================================================================
@@ -2593,14 +3859,14 @@ Total potential damage: $47,000+ before intervention
 # ============================================================================
 
 _block_10_listing = r"""
-15 minutes: 125 papers analyzed       $37.50
-            Daily budget hit (user: $50)
+15 minutes: 166 papers analyzed       $49.80
+            Next paper rejected (user daily budget: $50)
             
 System response:
 1. Blocked further processing
-2. Alerted user: "Daily analysis budget reached"
-3. Offered option to continue with Haiku model
+2. Alerted user: "Daily analysis budget would be exceeded"
+3. Offered option to continue with a less expensive model
 4. Cached partial results for immediate delivery
 
-Actual cost: $37.50
+Modeled cost: $49.80
 """

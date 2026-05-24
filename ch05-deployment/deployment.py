@@ -30,11 +30,72 @@ import json
 import logging
 import os
 from typing import Any
-import boto3
-from anthropic import Anthropic
+
+# Optional provider SDKs (boto3, anthropic). Guard so this Lambda-style
+# listing can be imported in a vanilla environment without the cloud
+# dependencies installed; real deployments will install them via
+# requirements.txt.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _optional import optional_import, _RequiredDependency  # noqa: E402
+
+boto3 = optional_import("boto3", stub_exception_names=("ClientError",))
+_botocore_config = optional_import("botocore.config")
+try:
+    Config = _botocore_config.Config  # type: ignore[attr-defined]
+except AttributeError:  # botocore not installed; provide a clear failure
+    Config = _RequiredDependency(
+        "botocore.config.Config",
+        "Install boto3 to enable AWS SDK client configuration.",
+    )
+try:
+    from anthropic import Anthropic  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    Anthropic = _RequiredDependency(
+        "anthropic.Anthropic",
+        "Install the `anthropic` package to use the real LLM client.",
+    )
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _format_log_fields(fields: dict[str, Any]) -> str:
+    """Render structured fields for stdlib loggers without losing context."""
+    return " ".join(f"{key}={value!r}" for key, value in fields.items())
+
+
+def _log_with_fields(level: str, message: str, **fields: Any) -> None:
+    """Log structured fields with structlog-style or stdlib loggers."""
+    log_fn = getattr(logger, level)
+    if not fields:
+        log_fn(message)
+        return
+    try:
+        log_fn(message, **fields)
+    except TypeError:
+        log_fn(
+            "%s | %s",
+            message,
+            _format_log_fields(fields),
+            extra={"structured_fields": fields},
+        )
+
+DEFAULT_ROUTE_TIMEOUT_SECONDS = float(
+    os.environ.get("ROUTE_TIMEOUT_SECONDS", "8")
+)
+LAMBDA_COMPLETION_BUFFER_MS = int(
+    os.environ.get("LAMBDA_COMPLETION_BUFFER_MS", "1000")
+)
+MIN_ROUTE_TIMEOUT_SECONDS = 1.0
+METRICS_CONNECT_TIMEOUT_SECONDS = float(
+    os.environ.get("METRICS_CONNECT_TIMEOUT_SECONDS", "0.5")
+)
+METRICS_READ_TIMEOUT_SECONDS = float(
+    os.environ.get("METRICS_READ_TIMEOUT_SECONDS", "0.5")
+)
+METRICS_MAX_ATTEMPTS = int(os.environ.get("METRICS_MAX_ATTEMPTS", "2"))
 
 
 # Lazy-initialized resources. We deliberately avoid touching
@@ -44,6 +105,33 @@ logger.setLevel(logging.INFO)
 # clean RuntimeError on the first call so CloudWatch shows the cause.
 _anthropic_client: Anthropic | None = None
 _metrics_table = None
+
+
+def _route_timeout_seconds(context: Any) -> float:
+    """Bound provider calls so Lambda keeps time to format a response."""
+    remaining_ms_fn = getattr(context, "get_remaining_time_in_millis", None)
+    if not callable(remaining_ms_fn):
+        return DEFAULT_ROUTE_TIMEOUT_SECONDS
+
+    remaining_ms = remaining_ms_fn()
+    available_seconds = (
+        remaining_ms - LAMBDA_COMPLETION_BUFFER_MS
+    ) / 1000
+    if available_seconds < MIN_ROUTE_TIMEOUT_SECONDS:
+        raise TimeoutError("Insufficient Lambda time remaining for routing")
+    return min(DEFAULT_ROUTE_TIMEOUT_SECONDS, available_seconds)
+
+
+def _metrics_config() -> Config:
+    """Return a bounded retry/timeout policy for best-effort metrics writes."""
+    return Config(
+        connect_timeout=METRICS_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=METRICS_READ_TIMEOUT_SECONDS,
+        retries={
+            "max_attempts": METRICS_MAX_ATTEMPTS,
+            "mode": "standard",
+        },
+    )
 
 
 def _get_anthropic_client() -> Anthropic:
@@ -68,7 +156,10 @@ def _get_metrics_table():
         table_name = os.environ.get("METRICS_TABLE")
         if not table_name:
             raise RuntimeError("METRICS_TABLE env var is not set.")
-        _metrics_table = boto3.resource("dynamodb").Table(table_name)
+        _metrics_table = boto3.resource(
+            "dynamodb",
+            config=_metrics_config(),
+        ).Table(table_name)
     return _metrics_table
 
 
@@ -90,7 +181,12 @@ class InquiryRouter:
     def __init__(self, client: Anthropic):
         self.client = client
     
-    def route(self, inquiry: str, customer_tier: str) -> dict[str, Any]:
+    def route(
+        self,
+        inquiry: str,
+        customer_tier: str,
+        timeout_seconds: float = DEFAULT_ROUTE_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         """Classify inquiry and determine routing with priority adjustment."""
         response = self.client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -98,10 +194,11 @@ class InquiryRouter:
             messages=[
                 {"role": "user", "content": f"Customer tier: {customer_tier}\n\nInquiry: {inquiry}"}
             ],
-            system=self.ROUTING_PROMPT
+            system=self.ROUTING_PROMPT,
+            timeout=timeout_seconds,
         )
         
-        # LLM output is not guaranteed to be valid JSON. Parse defensively
+        # LLM output may not be valid JSON. Parse defensively
         # and fall back to a safe default rather than 500-ing the request.
         try:
             parsed = json.loads(response.content[0].text)
@@ -145,7 +242,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
         customer_tier = event.get("customer_tier", "standard")
         
         router = InquiryRouter(_get_anthropic_client())
-        result = router.route(inquiry, customer_tier)
+        result = router.route(
+            inquiry,
+            customer_tier,
+            timeout_seconds=_route_timeout_seconds(context),
+        )
 
         # Record metrics for monitoring. Best-effort: a slow or unavailable
         # DynamoDB endpoint must not extend Lambda duration or fail the
@@ -178,6 +279,12 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "statusCode": 400,
             "body": json.dumps({"error": f"Missing required field: {e}"})
         }
+    except TimeoutError:
+        logger.warning("Routing skipped because Lambda time budget is exhausted")
+        return {
+            "statusCode": 504,
+            "body": json.dumps({"error": "Routing timed out"})
+        }
     except Exception as e:
         # Outer safety net at the Lambda boundary: any unhandled exception
         # is logged with full traceback and reported to the caller as a
@@ -196,9 +303,15 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
 _block_2_listing = r"""
 # Multi-stage build to minimize final image size
+#
+# Refresh PYTHON_BASE_IMAGE in a dependency-update patch whenever the
+# python:3.11-slim digest changes; do not use the mutable tag by itself.
+# Replace <refresh-with-current-digest> with the full sha256 value before
+# building.
+ARG PYTHON_BASE_IMAGE=python:3.11-slim@sha256:<refresh-with-current-digest>
 
 # Stage 1: Build dependencies
-FROM python:3.11-slim as builder
+FROM ${PYTHON_BASE_IMAGE} as builder
 
 WORKDIR /build
 
@@ -214,7 +327,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Production image
-FROM python:3.11-slim as production
+FROM ${PYTHON_BASE_IMAGE} as production
 
 # Security: Run as non-root user
 RUN groupadd --gid 1000 agent && \
@@ -335,7 +448,8 @@ resource "aws_autoscaling_group" "agent" {
 
   launch_template {
     id      = aws_launch_template.agent.id
-    version = "$Latest"
+    # Pin an explicit launch-template version for reproducible rollouts.
+    version = var.launch_template_version
   }
 
   instance_refresh {
@@ -368,9 +482,12 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
-import httpx
+httpx = optional_import(
+    "httpx",
+    stub_exception_names=("RequestError", "HTTPStatusError"),
+)
 
 
 @dataclass
@@ -384,11 +501,46 @@ class DeploymentConfig:
     validation_endpoint: str
     validation_timeout: int = 300
     health_check_interval: int = 5
-    # Time to wait after cutover before scaling down the old color.
-    # Tune this per workload; some agents need much longer than 60s to
-    # drain in-flight requests. For best results, poll for zero in-flight
-    # via metrics instead of sleeping.
+    desired_replicas: int = 3
+    # Maximum time to wait for old-color in-flight requests to drain after
+    # cutover. Tune this per workload; some agents need much longer than
+    # 60s to finish active work safely.
     stabilization_seconds: int = 60
+    # Optional endpoint returning {"in_flight": N} or {"inflight_requests": N}.
+    # Include "{version}" to query the old color directly.
+    inflight_requests_endpoint: Optional[str] = None
+    # Optional drain predicate used in place of (or alongside) the in-flight
+    # endpoint. When provided, wait_for_inflight_drain polls this every
+    # health_check_interval seconds and returns True as soon as it returns
+    # True (or stabilization_seconds elapses, whichever comes first). This
+    # lets callers plug in a queue-length check, custom RPC probe, etc.
+    drain_predicate: Optional[Callable[[], bool]] = None
+
+    def __post_init__(self) -> None:
+        # Catch misconfiguration at construction rather than discovering
+        # it mid-cutover. These checks are intentionally narrow: they
+        # enforce only "physically possible" relationships, not policy.
+        if self.validation_timeout <= 0:
+            raise ValueError(
+                f"validation_timeout must be positive, "
+                f"got {self.validation_timeout}"
+            )
+        if self.health_check_interval <= 0:
+            raise ValueError(
+                f"health_check_interval must be positive, "
+                f"got {self.health_check_interval}"
+            )
+        if self.desired_replicas <= 0:
+            raise ValueError(
+                f"desired_replicas must be positive, "
+                f"got {self.desired_replicas}"
+            )
+        if self.stabilization_seconds < self.health_check_interval:
+            raise ValueError(
+                f"stabilization_seconds ({self.stabilization_seconds}) "
+                f"must be >= health_check_interval "
+                f"({self.health_check_interval})"
+            )
 
 
 class BlueGreenDeployer:
@@ -396,7 +548,7 @@ class BlueGreenDeployer:
 
     def __init__(self, config: DeploymentConfig):
         self.config = config
-        self.client = httpx.Client(timeout=30.0)
+        self._client: Optional[httpx.Client] = None
 
     # Make the deployer usable as a context manager so callers can ensure
     # the underlying HTTP connection pool is closed deterministically:
@@ -406,11 +558,25 @@ class BlueGreenDeployer:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.client.close()
+        self.close()
+
+    @property
+    def client(self) -> httpx.Client:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=30.0)
+        return self._client
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
-        self.client.close()
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def get_active_version(self) -> str:
         """Determine which version is currently receiving traffic."""
@@ -509,6 +675,20 @@ class BlueGreenDeployer:
         except httpx.RequestError as e:
             print(f"Validation request failed: {e}")
             return False
+
+    def validation_endpoint_for(self, version: str) -> str:
+        """
+        Return the validation endpoint for a specific color.
+
+        The endpoint must bypass the production Service selector so validation
+        probes hit the inactive color before traffic is switched.
+        """
+        if "{version}" not in self.config.validation_endpoint:
+            raise ValueError(
+                "validation_endpoint must include '{version}' so pre-cutover "
+                "validation targets the inactive color directly"
+            )
+        return self.config.validation_endpoint.format(version=version)
     
     def switch_traffic(self, target_version: str) -> None:
         """Update service selector to route traffic to target version."""
@@ -530,6 +710,71 @@ class BlueGreenDeployer:
                 "traffic switch did not complete"
             ) from e
         print(f"Traffic switched to {target_version}")
+
+    def get_inflight_requests(self, version: str) -> Optional[int]:
+        """Read the old color's in-flight request count from metrics."""
+        if not self.config.inflight_requests_endpoint:
+            return None
+
+        endpoint = self.config.inflight_requests_endpoint
+        if "{version}" in endpoint:
+            endpoint = endpoint.format(version=version)
+
+        try:
+            response = self.client.get(endpoint)
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+        except (httpx.RequestError, ValueError, TypeError) as e:
+            print(f"Inflight metric unavailable for {version}: {e}")
+            return None
+
+        raw_count = payload.get("in_flight", payload.get("inflight_requests"))
+        if raw_count is None:
+            return None
+        try:
+            return max(0, int(raw_count))
+        except (TypeError, ValueError):
+            return None
+
+    def wait_for_inflight_drain(self, version: str) -> bool:
+        """
+        Wait until the old color has no in-flight requests or deadline expires.
+
+        Returning False means the drain deadline expired or the metric was not
+        available; callers can still proceed according to their deployment
+        policy, but the scale-down is no longer an unobserved timer.
+
+        If ``DeploymentConfig.drain_predicate`` is set, it is polled every
+        ``health_check_interval`` seconds and short-circuits the wait when it
+        returns True. This lets operators substitute a queue-depth probe or
+        custom RPC check when the metrics endpoint is unavailable; the loop
+        still falls back to ``time.sleep`` for the final wait interval so
+        nothing changes for callers that did not configure a predicate.
+        """
+        deadline = time.monotonic() + self.config.stabilization_seconds
+        predicate = self.config.drain_predicate
+        while True:
+            if predicate is not None:
+                try:
+                    if predicate():
+                        return True
+                except Exception as e:  # pragma: no cover - defensive
+                    print(f"drain_predicate raised, ignoring: {e}")
+
+            in_flight = self.get_inflight_requests(version)
+            if in_flight == 0:
+                return True
+
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+
+            if in_flight is None:
+                print(f"Waiting for {version} drain; in-flight metric unavailable")
+            else:
+                print(f"Waiting for {version} drain; {in_flight} requests active")
+            time.sleep(min(self.config.health_check_interval, deadline - now))
     
     def deploy(self, new_image: str) -> bool:
         """
@@ -566,7 +811,7 @@ class BlueGreenDeployer:
             ) from e
         
         # Scale up inactive deployment
-        self.scale_deployment(inactive, 3)
+        self.scale_deployment(inactive, self.config.desired_replicas)
         
         # Wait for pods to be ready
         if not self.wait_for_ready(inactive):
@@ -574,8 +819,15 @@ class BlueGreenDeployer:
             self.scale_deployment(inactive, 0)
             return False
         
-        # Validate new deployment
-        if not self.validate_deployment(self.config.validation_endpoint):
+        # Validate new deployment through its color-specific endpoint, before
+        # switching the production Service selector.
+        try:
+            validation_endpoint = self.validation_endpoint_for(inactive)
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            self.scale_deployment(inactive, 0)
+            return False
+        if not self.validate_deployment(validation_endpoint):
             print("ERROR: Validation failed")
             self.scale_deployment(inactive, 0)
             return False
@@ -583,11 +835,13 @@ class BlueGreenDeployer:
         # Switch traffic
         self.switch_traffic(inactive)
         
-        # Scale down old deployment after stabilization period. Configurable
-        # so workloads with longer drain requirements can extend it without
-        # editing the deployer. For best results, replace this sleep with a
-        # poll against an in-flight-requests metric.
-        time.sleep(self.config.stabilization_seconds)
+        # Scale down old deployment only after observed drain or deadline.
+        drained = self.wait_for_inflight_drain(active)
+        if not drained:
+            print(
+                f"WARNING: drain deadline expired for {active}; "
+                "scaling down according to deployment policy"
+            )
         self.scale_deployment(active, 0)
         
         print("Deployment completed successfully")
@@ -599,8 +853,21 @@ class BlueGreenDeployer:
         active = self.get_active_version()
         
         # Scale up previous deployment
-        self.scale_deployment(inactive, 3)
-        self.wait_for_ready(inactive)
+        self.scale_deployment(inactive, self.config.desired_replicas)
+        if not self.wait_for_ready(inactive):
+            message = (
+                f"Rollback aborted: {inactive} did not become ready; "
+                f"traffic remains on {active}"
+            )
+            print(f"ERROR: {message}")
+            try:
+                self.scale_deployment(inactive, 0)
+            except Exception as cleanup_error:
+                print(
+                    f"WARNING: could not scale failed rollback target "
+                    f"{inactive} back down: {cleanup_error}"
+                )
+            raise RuntimeError(message)
         
         # Switch traffic back
         self.switch_traffic(inactive)
@@ -625,14 +892,13 @@ def main():
         blue_deployment="customer-agent-blue",
         green_deployment="customer-agent-green",
         health_endpoint="http://customer-agent.production/health/ready",
-        validation_endpoint="http://customer-agent.production/validate"
+        validation_endpoint="http://customer-agent-{version}.production/validate"
     )
     
-    deployer = BlueGreenDeployer(config)
-    
-    if args.rollback:
-        deployer.rollback()
-    else:
+    with BlueGreenDeployer(config) as deployer:
+        if args.rollback:
+            deployer.rollback()
+            return
         success = deployer.deploy(args.image)
         sys.exit(0 if success else 1)
 
@@ -650,12 +916,16 @@ Canary release controller with automated analysis and promotion.
 """
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
-import httpx
+httpx = optional_import(
+    "httpx",
+    stub_exception_names=("RequestError", "HTTPStatusError"),
+)
 
 
 class CanaryStatus(Enum):
@@ -663,13 +933,14 @@ class CanaryStatus(Enum):
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     FAILED = "failed"
+    ABORTED = "aborted"
 
 
 @dataclass
 class CanaryStage:
     """Defines a canary release stage."""
     weight: int  # Percentage of traffic to canary
-    duration_minutes: int  # Time to wait before analysis
+    duration_minutes: int  # Soak time; zero still gets one analysis
     success_threshold: float  # Required success rate
 
     @property
@@ -689,7 +960,7 @@ class StageResult:
 
     @classmethod
     def aborted(cls, reason: str) -> "StageResult":
-        return cls(status=CanaryStatus.FAILED, reason=reason)
+        return cls(status=CanaryStatus.ABORTED, reason=reason)
 
 
 @dataclass
@@ -699,7 +970,7 @@ class CanaryConfig:
         CanaryStage(weight=5, duration_minutes=10, success_threshold=0.99),
         CanaryStage(weight=25, duration_minutes=15, success_threshold=0.99),
         CanaryStage(weight=50, duration_minutes=20, success_threshold=0.98),
-        CanaryStage(weight=100, duration_minutes=0, success_threshold=0.98),
+        CanaryStage(weight=100, duration_minutes=10, success_threshold=0.98),
     ])
     prometheus_url: str = "http://prometheus:9090"
     rollback_on_failure: bool = True
@@ -710,20 +981,64 @@ class CanaryAnalyzer:
     
     def __init__(self, prometheus_url: str):
         self.prometheus_url = prometheus_url
-        self.client = httpx.Client(timeout=30.0)
+        self._client: httpx.Client | None = None
+        self.last_diagnostics: list[str] = []
+
+    def __enter__(self) -> "CanaryAnalyzer":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    @property
+    def client(self) -> httpx.Client:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=30.0)
+        return self._client
+
+    def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def query_prometheus(self, query: str) -> float:
         """Execute a Prometheus query and return the result."""
-        response = self.client.get(
-            f"{self.prometheus_url}/api/v1/query",
-            params={"query": query}
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        if data["data"]["result"]:
-            return float(data["data"]["result"][0]["value"][1])
-        return 0.0
+        try:
+            response = self.client.get(
+                f"{self.prometheus_url}/api/v1/query",
+                params={"query": query}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("status") != "success":
+                raise ValueError(data.get("error", "Prometheus query failed"))
+
+            results = data.get("data", {}).get("result", [])
+            if not results:
+                return 0.0
+
+            value = float(results[0]["value"][1])
+            if not math.isfinite(value):
+                raise ValueError(f"non-finite Prometheus value: {value}")
+            return value
+        except (
+            httpx.RequestError,
+            httpx.HTTPStatusError,
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+            AttributeError,
+        ) as e:
+            raise RuntimeError(f"Prometheus query failed: {e}") from e
     
     def get_success_rate(self, version: str, window: str = "5m") -> float:
         """Calculate request success rate for a version."""
@@ -759,11 +1074,18 @@ class CanaryAnalyzer:
         
         Compares canary metrics against stable baseline.
         """
-        canary_success = self.get_success_rate("canary")
-        stable_success = self.get_success_rate("stable")
-        
-        canary_latency = self.get_latency_p99("canary")
-        stable_latency = self.get_latency_p99("stable")
+        self.last_diagnostics = []
+        try:
+            canary_success = self.get_success_rate("canary")
+            stable_success = self.get_success_rate("stable")
+
+            canary_latency = self.get_latency_p99("canary")
+            stable_latency = self.get_latency_p99("stable")
+        except RuntimeError as e:
+            diagnostic = f"Canary analysis failed closed: {e}"
+            self.last_diagnostics.append(diagnostic)
+            print(diagnostic)
+            return CanaryStatus.FAILED
         
         # Check absolute success rate
         if canary_success < success_threshold:
@@ -808,10 +1130,19 @@ class CanaryController:
     def _slo_check_passes(self, stage: CanaryStage) -> bool:
         """Re-evaluate canary health against the active stage's threshold."""
         status = self.analyzer.analyze(stage.success_threshold)
-        return status not in (CanaryStatus.FAILED, CanaryStatus.DEGRADED)
+        return status == CanaryStatus.HEALTHY
 
     async def _run_stage(self, stage: CanaryStage) -> StageResult:
         """Run a canary stage; abort early on SLO violation or external signal."""
+        if self._abort_event.is_set():
+            return StageResult.aborted(reason="controller signal")
+
+        if stage.duration_seconds <= 0:
+            if not self._slo_check_passes(stage):
+                self._abort_event.set()
+                return StageResult.aborted(reason="SLO violation")
+            return StageResult.ok()
+
         deadline = time.monotonic() + stage.duration_seconds
         poll_interval = 5.0
         while time.monotonic() < deadline:
@@ -835,14 +1166,14 @@ class CanaryController:
             print(f"Stage {i + 1}: Setting canary weight to {stage.weight}%")
             self.set_traffic_weight(stage.weight)
 
-            if stage.duration_seconds <= 0:
-                continue
-
-            print(f"Waiting {stage.duration_minutes} minutes for analysis...")
+            if stage.duration_seconds > 0:
+                print(f"Waiting {stage.duration_minutes} minutes for analysis...")
+            else:
+                print("Running post-shift canary analysis...")
             result = await self._run_stage(stage)
             print(f"Stage result: {result.status.value} ({result.reason or 'ok'})")
 
-            if result.status == CanaryStatus.FAILED:
+            if result.status != CanaryStatus.HEALTHY:
                 print(f"Canary aborted: {result.reason}")
                 if self.config.rollback_on_failure:
                     self.rollback()
@@ -856,22 +1187,40 @@ class CanaryController:
 # ============================================================================
 
 # scripts/canary_runner.py
-async def external_monitor(controller: CanaryController) -> None:
+import asyncio
+from typing import Callable
+
+
+async def external_monitor(
+    controller: CanaryController,
+    pager_fired_check: Callable[[], bool],
+    error_budget_exhausted_check: Callable[[], bool],
+) -> None:
     """Watch out-of-band signals and abort the canary if needed."""
     while True:
         await asyncio.sleep(5)
-        if pager_fired() or error_budget_exhausted():
+        if pager_fired_check() or error_budget_exhausted_check():
             controller.abort()
             return
 
 
-async def main(controller: CanaryController) -> bool:
+async def main(
+    controller: CanaryController,
+    pager_fired_check: Callable[[], bool],
+    error_budget_exhausted_check: Callable[[], bool],
+) -> bool:
     # The controller's run() will return as soon as either:
     #   (a) all stages complete, or
     #   (b) any stage observes _abort_event being set.
     # The monitor task is cancelled once run() returns.
     run_task = asyncio.create_task(controller.run())
-    monitor_task = asyncio.create_task(external_monitor(controller))
+    monitor_task = asyncio.create_task(
+        external_monitor(
+            controller,
+            pager_fired_check,
+            error_budget_exhausted_check,
+        )
+    )
     try:
         return await run_task
     finally:
@@ -891,13 +1240,26 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 import hashlib
+import inspect
 import json
 import os
+import time
 
-import httpx
-import redis
+httpx = optional_import(
+    "httpx",
+    stub_exception_names=("RequestError", "HTTPStatusError"),
+)
+sync_redis = optional_import("redis")
+ldclient = optional_import(
+    "ldclient",
+    hint="Install the `launchdarkly-server-sdk` package to use LaunchDarkly.",
+)
+_ldclient_config = optional_import(
+    "ldclient.config",
+    hint="Install the `launchdarkly-server-sdk` package to use LaunchDarkly.",
+)
 
 
 class FlagType(Enum):
@@ -917,12 +1279,20 @@ class FeatureFlag:
     description: str = ""
 
 
+FlagEvaluationContext = Mapping[str, Any]
+
+
 class FlagBackend(ABC):
     """Abstract backend for feature flag storage."""
     
     @abstractmethod
-    def get_flag(self, name: str) -> Optional[Any]:
-        """Retrieve flag value from backend."""
+    def get_flag(
+        self,
+        name: str,
+        user_id: Optional[str] = None,
+        context: Optional[FlagEvaluationContext] = None,
+    ) -> Optional[Any]:
+        """Retrieve flag value from backend for an optional user/context."""
         pass
     
     @abstractmethod
@@ -937,7 +1307,12 @@ class EnvironmentBackend(FlagBackend):
     def __init__(self, prefix: str = "FEATURE_"):
         self.prefix = prefix
     
-    def get_flag(self, name: str) -> Optional[str]:
+    def get_flag(
+        self,
+        name: str,
+        user_id: Optional[str] = None,
+        context: Optional[FlagEvaluationContext] = None,
+    ) -> Optional[str]:
         env_name = f"{self.prefix}{name.upper()}"
         return os.environ.get(env_name)
     
@@ -949,14 +1324,32 @@ class EnvironmentBackend(FlagBackend):
 class RedisBackend(FlagBackend):
     """Feature flags from Redis for dynamic updates."""
     
-    def __init__(self, redis_url: str, prefix: str = "feature:"):
-        self.client = redis.from_url(redis_url)
+    def __init__(
+        self,
+        redis_url: str,
+        prefix: str = "feature:",
+        socket_timeout_s: float = 2.0,
+        socket_connect_timeout_s: float = 2.0,
+    ):
+        self.client = sync_redis.from_url(
+            redis_url,
+            socket_timeout=socket_timeout_s,
+            socket_connect_timeout=socket_connect_timeout_s,
+            health_check_interval=30,
+        )
         self.prefix = prefix
     
-    def get_flag(self, name: str) -> Optional[str]:
+    def get_flag(
+        self,
+        name: str,
+        user_id: Optional[str] = None,
+        context: Optional[FlagEvaluationContext] = None,
+    ) -> Optional[str]:
         key = f"{self.prefix}{name}"
         value = self.client.get(key)
-        return value.decode() if value else None
+        if value is None:
+            return None
+        return value.decode() if hasattr(value, "decode") else str(value)
     
     def set_flag(self, name: str, value: Any) -> None:
         key = f"{self.prefix}{name}"
@@ -979,20 +1372,49 @@ class RedisBackend(FlagBackend):
 
 
 class LaunchDarklyBackend(FlagBackend):
-    """Feature flags from LaunchDarkly service."""
-    
+    """Feature flags from LaunchDarkly service.
+
+    Uses a per-instance ``LDClient`` rather than the module-global
+    client returned by ``ldclient.get()``. The global API requires
+    ``ldclient.set_config(...)`` which is process-wide state, so two
+    backends instantiated with different SDK keys (for example, prod
+    and staging in the same test harness) would stomp on each other.
+    """
+
     def __init__(self, sdk_key: str):
-        import ldclient
-        from ldclient.config import Config
-        
-        ldclient.set_config(Config(sdk_key))
-        self.client = ldclient.get()
-    
-    def get_flag(self, name: str, user_key: str = "default") -> Any:
-        from ldclient import Context
-        
-        context = Context.builder(user_key).build()
-        return self.client.variation(name, context, None)
+        # Per-instance client; no mutation of module-global ldclient state.
+        self.client = ldclient.LDClient(
+            config=_ldclient_config.Config(sdk_key)
+        )
+
+    @staticmethod
+    def _build_context(
+        user_id: Optional[str],
+        context: Optional[FlagEvaluationContext],
+    ) -> Any:
+        context_data = dict(context or {})
+        key = (
+            user_id
+            or context_data.pop("user_id", None)
+            or context_data.pop("key", None)
+            or "default"
+        )
+
+        builder = ldclient.Context.builder(str(key))
+        for attribute, value in context_data.items():
+            if attribute in {"key", "user_id"} or value is None:
+                continue
+            builder.set(attribute, value)
+        return builder.build()
+
+    def get_flag(
+        self,
+        name: str,
+        user_id: Optional[str] = None,
+        context: Optional[FlagEvaluationContext] = None,
+    ) -> Any:
+        ld_context = self._build_context(user_id, context)
+        return self.client.variation(name, ld_context, None)
     
     def set_flag(self, name: str, value: Any) -> None:
         raise NotImplementedError("LaunchDarkly flags are managed via dashboard")
@@ -1039,30 +1461,184 @@ class FeatureFlagManager:
         ),
     }
     
-    def __init__(self, backends: list[FlagBackend]):
+    def __init__(
+        self,
+        backends: list[FlagBackend],
+        cache_ttl_seconds: float = 5.0,
+    ):
         """
         Initialize with ordered list of backends.
         First backend with a value wins.
         """
         self.backends = backends
-        # Bounded cache prevents unbounded growth across per-user evaluation;
-        # callers needing strict TTL semantics should swap in cachetools.TTLCache.
-        self._cache: dict[str, Any] = {}
+        self.cache_ttl_seconds = cache_ttl_seconds
+        # Bounded TTL cache prevents unbounded growth while ensuring Redis or
+        # LaunchDarkly kill-switch changes are observed promptly.
+        self._cache: dict[str, tuple[Any, float]] = {}
         self._cache_max_size = 100_000
+
+    def _get_cached(self, cache_key: str) -> tuple[bool, Any]:
+        """Return a cached value only while its TTL is still valid."""
+        cached = self._cache.get(cache_key)
+        if cached is None:
+            return False, None
+
+        value, expires_at = cached
+        if expires_at <= time.monotonic():
+            self._cache.pop(cache_key, None)
+            return False, None
+        return True, value
+
+    def _set_cached(self, cache_key: str, value: Any) -> None:
+        """Store a cache value unless caching has been disabled."""
+        if self.cache_ttl_seconds <= 0:
+            return
+
+        # Evict an arbitrary entry once over the bound (simple FIFO via
+        # iteration order; use a dedicated cache if eviction policy matters).
+        if len(self._cache) >= self._cache_max_size:
+            try:
+                self._cache.pop(next(iter(self._cache)))
+            except StopIteration:
+                pass
+        self._cache[cache_key] = (
+            value,
+            time.monotonic() + self.cache_ttl_seconds,
+        )
+
+    @staticmethod
+    def _backend_identity(backend: FlagBackend) -> str:
+        """Return a stable backend name for failure logs."""
+        return f"{backend.__class__.__module__}.{backend.__class__.__qualname__}"
+
+    @staticmethod
+    def _effective_user_id(
+        user_id: Optional[str],
+        context: Optional[FlagEvaluationContext],
+    ) -> Optional[str]:
+        """Prefer explicit user_id, then common context key names."""
+        if user_id is not None:
+            return user_id
+        if context is None:
+            return None
+        for key in ("user_id", "key"):
+            value = context.get(key)
+            if value is not None:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _cache_key(
+        name: str,
+        user_id: Optional[str],
+        context: Optional[FlagEvaluationContext],
+    ) -> str:
+        """Include targeting context in the cache key when present."""
+        if not context:
+            return f"{name}:{user_id}" if user_id is not None else name
+
+        context_token = json.dumps(
+            dict(context),
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+        context_hash = hashlib.sha256(context_token.encode()).hexdigest()[:16]
+        return f"{name}:{user_id or ''}:{context_hash}"
+
+    @staticmethod
+    def _read_backend_flag(
+        backend: FlagBackend,
+        name: str,
+        user_id: Optional[str],
+        context: Optional[FlagEvaluationContext],
+    ) -> Any:
+        """
+        Call new context-aware backends while preserving legacy get_flag(name).
+        """
+        get_flag = backend.get_flag
+        try:
+            parameters = inspect.signature(get_flag).parameters
+        except (TypeError, ValueError):
+            try:
+                return get_flag(name, user_id=user_id, context=context)
+            except TypeError:
+                return get_flag(name)
+
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+        def accepts_keyword(parameter_name: str) -> bool:
+            parameter = parameters.get(parameter_name)
+            if parameter is None:
+                return False
+            return parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+
+        kwargs: dict[str, Any] = {}
+        if accepts_kwargs or accepts_keyword("user_id"):
+            kwargs["user_id"] = user_id
+        elif accepts_keyword("user_key"):
+            kwargs["user_key"] = user_id or "default"
+
+        if accepts_kwargs or accepts_keyword("context"):
+            kwargs["context"] = context
+        elif accepts_keyword("evaluation_context"):
+            kwargs["evaluation_context"] = context
+
+        return get_flag(name, **kwargs)
+
+    def _log_backend_failure(
+        self,
+        flag_name: str,
+        backend_identity: str,
+        error: Exception,
+    ) -> None:
+        """Log backend failures with fields when available."""
+        try:
+            logger.warning(
+                "Feature flag backend failed; trying next backend",
+                backend=backend_identity,
+                flag=flag_name,
+                error_type=error.__class__.__name__,
+                error=str(error),
+            )
+        except TypeError:
+            logger.warning(
+                "Feature flag backend failed; trying next backend "
+                "backend=%s flag=%s error_type=%s error=%s",
+                backend_identity,
+                flag_name,
+                error.__class__.__name__,
+                error,
+            )
     
-    def _coerce_value(self, flag: FeatureFlag, raw_value: str) -> Any:
+    def _coerce_value(self, flag: FeatureFlag, raw_value: Any) -> Any:
         """Convert string value to appropriate type."""
         if flag.flag_type == FlagType.BOOLEAN:
-            return raw_value.lower() in ("true", "1", "yes", "on")
+            if isinstance(raw_value, bool):
+                return raw_value
+            return str(raw_value).lower() in ("true", "1", "yes", "on")
         elif flag.flag_type == FlagType.INTEGER:
             return int(raw_value)
         elif flag.flag_type == FlagType.PERCENTAGE:
             return min(100, max(0, int(raw_value)))
         elif flag.flag_type == FlagType.JSON:
+            if not isinstance(raw_value, str):
+                return raw_value
             return json.loads(raw_value)
-        return raw_value
+        return str(raw_value)
     
-    def get(self, name: str, user_id: Optional[str] = None) -> Any:
+    def get(
+        self,
+        name: str,
+        user_id: Optional[str] = None,
+        context: Optional[FlagEvaluationContext] = None,
+    ) -> Any:
         """
         Get flag value, checking backends in order.
         
@@ -1073,44 +1649,57 @@ class FeatureFlagManager:
         
         flag = self.FLAGS[name]
         
+        effective_user_id = self._effective_user_id(user_id, context)
+
         # Check cache first
-        cache_key = f"{name}:{user_id}" if user_id else name
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        cache_key = self._cache_key(name, effective_user_id, context)
+        cache_hit, cached_value = self._get_cached(cache_key)
+        if cache_hit:
+            return cached_value
         
         # Check backends
         value = None
         for backend in self.backends:
-            raw_value = backend.get_flag(name)
-            if raw_value is not None:
-                value = self._coerce_value(flag, raw_value)
-                break
+            backend_identity = self._backend_identity(backend)
+            try:
+                raw_value = self._read_backend_flag(
+                    backend,
+                    name,
+                    effective_user_id,
+                    context,
+                )
+                if raw_value is not None:
+                    value = self._coerce_value(flag, raw_value)
+                    break
+            except Exception as e:
+                self._log_backend_failure(name, backend_identity, e)
+                continue
         
         if value is None:
             value = flag.default_value
         
         # Handle percentage rollout
-        if flag.flag_type == FlagType.PERCENTAGE and user_id:
+        if flag.flag_type == FlagType.PERCENTAGE and effective_user_id:
             # SHA-256 instead of builtin hash() because Python randomizes
             # hash() per process (PYTHONHASHSEED), which would land the same
             # user in different rollout buckets across replicas/restarts.
-            digest = hashlib.sha256(f"{name}:{user_id}".encode()).hexdigest()
+            digest = hashlib.sha256(
+                f"{name}:{effective_user_id}".encode()
+            ).hexdigest()
             user_hash = int(digest[:8], 16) % 100
             value = user_hash < value
         
-        # Evict an arbitrary entry once over the bound (simple FIFO via
-        # iteration order; replace with TTLCache if eviction policy matters).
-        if len(self._cache) >= self._cache_max_size:
-            try:
-                self._cache.pop(next(iter(self._cache)))
-            except StopIteration:
-                pass
-        self._cache[cache_key] = value
+        self._set_cached(cache_key, value)
         return value
     
-    def is_enabled(self, name: str, user_id: Optional[str] = None) -> bool:
+    def is_enabled(
+        self,
+        name: str,
+        user_id: Optional[str] = None,
+        context: Optional[FlagEvaluationContext] = None,
+    ) -> bool:
         """Check if a boolean flag is enabled."""
-        return bool(self.get(name, user_id))
+        return bool(self.get(name, user_id, context))
     
     def clear_cache(self) -> None:
         """Clear the flag cache to pick up changes."""
@@ -1120,25 +1709,36 @@ class FeatureFlagManager:
 _manager: Optional[FeatureFlagManager] = None
 
 
-def init_feature_flags(backends: list[FlagBackend]) -> FeatureFlagManager:
+def init_feature_flags(
+    backends: list[FlagBackend],
+    cache_ttl_seconds: float = 5.0,
+) -> FeatureFlagManager:
     """Initialize the global feature flag manager."""
     global _manager
-    _manager = FeatureFlagManager(backends)
+    _manager = FeatureFlagManager(backends, cache_ttl_seconds=cache_ttl_seconds)
     return _manager
 
 
-def get_flag(name: str, user_id: Optional[str] = None) -> Any:
+def get_flag(
+    name: str,
+    user_id: Optional[str] = None,
+    context: Optional[FlagEvaluationContext] = None,
+) -> Any:
     """Get a feature flag value using the global manager."""
     if _manager is None:
         raise RuntimeError("Feature flags not initialized")
-    return _manager.get(name, user_id)
+    return _manager.get(name, user_id, context)
 
 
-def is_enabled(name: str, user_id: Optional[str] = None) -> bool:
+def is_enabled(
+    name: str,
+    user_id: Optional[str] = None,
+    context: Optional[FlagEvaluationContext] = None,
+) -> bool:
     """Check if a feature is enabled using the global manager."""
     if _manager is None:
         raise RuntimeError("Feature flags not initialized")
-    return _manager.is_enabled(name, user_id)
+    return _manager.is_enabled(name, user_id, context)
 
 # ============================================================================
 # Block 9 (chapter listing #9)
@@ -1151,8 +1751,6 @@ Agent capability management with feature flag integration.
 
 from dataclasses import dataclass
 from typing import Optional
-
-from src.features.feature_flags import get_flag, is_enabled
 
 
 @dataclass
@@ -1221,9 +1819,36 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
-from pydantic import BaseModel, Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+yaml = optional_import(
+    "yaml",
+    hint="Install PyYAML to load layered YAML configuration files.",
+)
+try:
+    from pydantic import BaseModel, Field, SecretStr
+except ImportError:  # pragma: no cover - import smoke fallback
+    class BaseModel:
+        def __init__(self, **data: Any):
+            for name, value in self.__class__.__dict__.items():
+                if name.startswith("_") or callable(value):
+                    continue
+                setattr(self, name, data.pop(name, value))
+            for name, value in data.items():
+                setattr(self, name, value)
+
+    def Field(default: Any = None, default_factory=None, **_: Any) -> Any:
+        return default_factory() if default_factory is not None else default
+
+    class SecretStr(str):
+        def get_secret_value(self) -> str:
+            return str(self)
+
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except ImportError:  # pragma: no cover - optional config package
+    class BaseSettings(BaseModel):
+        pass
+
+    SettingsConfigDict = dict
 
 
 class DatabaseConfig(BaseModel):
@@ -1263,10 +1888,11 @@ class LLMConfig(BaseModel):
     """
     LLM provider configuration.
     
-    Model names should always be externalized to configuration rather than
-    hardcoded. This enables: (1) switching models without code changes,
-    (2) using different models per environment (cheaper models in dev),
-    (3) rapid response to model deprecations or pricing changes.
+    In production or shared deployable services, model names should be
+    externalized to configuration rather than hardcoded. This enables:
+    (1) switching models without code changes, (2) using different models
+    per environment (cheaper models in dev), (3) rapid response to model
+    deprecations or pricing changes. Toy and local scripts can stay simpler.
     """
     provider: str = "anthropic"
     model: str = "claude-sonnet-4-20250514"
@@ -1392,10 +2018,20 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, Awaitable, Optional
 
-import httpx
-import redis.asyncio as redis
-from sqlalchemy.ext.asyncio import AsyncEngine
-from sqlalchemy import text
+httpx = optional_import(
+    "httpx",
+    stub_exception_names=("RequestError", "HTTPStatusError"),
+)
+async_redis = optional_import("redis.asyncio")
+try:
+    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy import text
+except ImportError:  # pragma: no cover - optional database package
+    class AsyncEngine:
+        pass
+
+    def text(query: str) -> str:
+        return query
 
 
 class HealthStatus(Enum):
@@ -1422,10 +2058,11 @@ class HealthChecker:
     and non-critical checks (affect readiness only).
     """
     
-    def __init__(self):
+    def __init__(self, check_timeout_s: float = 10.0):
         self.checks: dict[str, tuple[Callable[[], Awaitable[CheckResult]], bool]] = {}
         self._startup_complete = False
         self._startup_time: Optional[datetime] = None
+        self.check_timeout_s = check_timeout_s
     
     def register(
         self,
@@ -1463,7 +2100,10 @@ class HealthChecker:
         start = datetime.now(timezone.utc)
         
         try:
-            result = await asyncio.wait_for(check_fn(), timeout=10.0)
+            result = await asyncio.wait_for(
+                check_fn(),
+                timeout=self.check_timeout_s,
+            )
             result.duration_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
             return result
         except asyncio.TimeoutError:
@@ -1471,7 +2111,7 @@ class HealthChecker:
                 name=name,
                 status=HealthStatus.UNHEALTHY,
                 message="Check timed out",
-                duration_ms=10000,
+                duration_ms=self.check_timeout_s * 1000,
                 timestamp=datetime.now(timezone.utc)
             )
         except Exception as e:
@@ -1498,11 +2138,14 @@ class HealthChecker:
         if not self._startup_complete:
             return False, {"status": "starting"}
         
-        results = await self.run_all_checks()
-        critical_results = {
-            name: result for name, result in results.items()
-            if self.checks[name][1]  # Is critical
-        }
+        critical_names = [
+            name for name, (_, critical) in self.checks.items()
+            if critical
+        ]
+        results = await asyncio.gather(
+            *(self.run_check(name) for name in critical_names)
+        )
+        critical_results = {result.name: result for result in results}
         
         is_healthy = all(
             r.status != HealthStatus.UNHEALTHY
@@ -1568,11 +2211,14 @@ async def create_database_check(engine: AsyncEngine) -> Callable[[], Awaitable[C
     return check
 
 
-async def create_redis_check(redis_client: redis.Redis) -> Callable[[], Awaitable[CheckResult]]:
+async def create_redis_check(
+    redis_client: async_redis.Redis,
+    ping_timeout_s: float = 2.0,
+) -> Callable[[], Awaitable[CheckResult]]:
     """Create a Redis connectivity check."""
     async def check() -> CheckResult:
         try:
-            await redis_client.ping()
+            await asyncio.wait_for(redis_client.ping(), timeout=ping_timeout_s)
             return CheckResult(
                 name="redis",
                 status=HealthStatus.HEALTHY,
@@ -1598,7 +2244,10 @@ async def create_llm_check(api_key: str) -> Callable[[], Awaitable[CheckResult]]
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     "https://api.anthropic.com/v1/models",
-                    headers={"x-api-key": api_key},
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
                     timeout=5.0
                 )
                 if response.status_code == 200:
@@ -1636,9 +2285,23 @@ async def create_llm_check(api_key: str) -> Callable[[], Awaitable[CheckResult]]
 Health check API endpoints.
 """
 
-from fastapi import APIRouter, Response, status
+try:
+    from fastapi import APIRouter, Response, status
+except ImportError:  # pragma: no cover - optional API package
+    class Response:
+        status_code: int = 200
 
-from src.health.checks import HealthChecker
+    class APIRouter:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        def get(self, *args: Any, **kwargs: Any):
+            def decorator(func):
+                return func
+            return decorator
+
+    class status:
+        HTTP_503_SERVICE_UNAVAILABLE = 503
 
 router = APIRouter(prefix="/health", tags=["health"])
 
@@ -1701,7 +2364,7 @@ def create_health_router(checker: HealthChecker) -> APIRouter:
 # src/lifecycle/shutdown.py
 """
 Graceful shutdown handling for agent systems.
-Ensures in-flight requests complete before termination.
+Allows in-flight requests to drain up to a configured deadline before termination.
 """
 
 import asyncio
@@ -1709,7 +2372,23 @@ import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Awaitable, Optional
-import structlog
+try:
+    import structlog
+except ImportError:  # pragma: no cover - optional structured logging package
+    class _FallbackStructLogger:
+        def info(self, event: str, **kwargs: Any) -> None:
+            logging.getLogger(__name__).info("%s %s", event, kwargs)
+
+        def warning(self, event: str, **kwargs: Any) -> None:
+            logging.getLogger(__name__).warning("%s %s", event, kwargs)
+
+        def error(self, event: str, **kwargs: Any) -> None:
+            logging.getLogger(__name__).error("%s %s", event, kwargs)
+
+    class structlog:
+        @staticmethod
+        def get_logger() -> _FallbackStructLogger:
+            return _FallbackStructLogger()
 
 logger = structlog.get_logger()
 
@@ -1725,7 +2404,8 @@ class GracefulShutdown:
     def __init__(
         self,
         shutdown_timeout: int = 30,
-        drain_timeout: int = 10
+        drain_timeout: int = 10,
+        callback_timeout: float = 5.0,
     ):
         """
         Initialize shutdown handler.
@@ -1733,13 +2413,26 @@ class GracefulShutdown:
         Args:
             shutdown_timeout: Max seconds to wait for requests to complete
             drain_timeout: Seconds to wait after stopping new requests
+            callback_timeout: Max seconds to wait for each shutdown callback
         """
         self.shutdown_timeout = shutdown_timeout
         self.drain_timeout = drain_timeout
+        self.callback_timeout = callback_timeout
         self._shutdown_event = asyncio.Event()
-        self._active_requests: set[str] = set()
+        self._active_requests: dict[str, int] = {}
+        # Event set by the request tracker each time the active count hits 0,
+        # cleared when the count goes above 0. Lets the drain loop exit early
+        # via asyncio.wait_for() rather than always burning the full
+        # drain_timeout.
+        self._drain_idle_event = asyncio.Event()
+        self._drain_idle_event.set()
         self._shutdown_callbacks: list[Callable[[], Awaitable[None]]] = []
         self._is_shutting_down = False
+
+    @staticmethod
+    def _callback_identity(callback: Callable[[], Awaitable[None]]) -> str:
+        """Return a readable callback name for shutdown logs."""
+        return getattr(callback, "__qualname__", repr(callback))
     
     def register_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
         """Register a callback to run during shutdown."""
@@ -1759,15 +2452,28 @@ class GracefulShutdown:
                 # Handle request
                 pass
         """
-        self._active_requests.add(request_id)
+        self._active_requests[request_id] = (
+            self._active_requests.get(request_id, 0) + 1
+        )
+        # First entry into a non-empty active set clears the idle event so
+        # the drain loop knows there's work outstanding.
+        self._drain_idle_event.clear()
         try:
             yield
         finally:
-            self._active_requests.discard(request_id)
+            remaining = self._active_requests.get(request_id, 0) - 1
+            if remaining > 0:
+                self._active_requests[request_id] = remaining
+            else:
+                self._active_requests.pop(request_id, None)
+            # When the last in-flight request completes, signal the drain
+            # loop so it can exit before drain_timeout elapses.
+            if not self._active_requests:
+                self._drain_idle_event.set()
     
     def active_request_count(self) -> int:
         """Return count of active requests."""
-        return len(self._active_requests)
+        return sum(self._active_requests.values())
     
     async def wait_for_shutdown(self) -> None:
         """Block until shutdown signal received."""
@@ -1786,20 +2492,38 @@ class GracefulShutdown:
             return
         
         self._is_shutting_down = True
-        logger.info("Initiating graceful shutdown", active_requests=self.active_request_count())
+        _log_with_fields(
+            "info",
+            "Initiating graceful shutdown",
+            active_requests=self.active_request_count(),
+        )
         
         # Signal that shutdown has started
         self._shutdown_event.set()
         
-        # Wait for drain period (allow load balancer to remove us)
-        logger.info("Entering drain period", duration_seconds=self.drain_timeout)
-        await asyncio.sleep(self.drain_timeout)
+        # Wait for drain period (allow load balancer to remove us). Exit
+        # early as soon as the request tracker reports zero in-flight work;
+        # only fall back to the full drain_timeout when traffic is still
+        # arriving past the LB removal.
+        _log_with_fields(
+            "info",
+            "Entering drain period",
+            duration_seconds=self.drain_timeout,
+        )
+        try:
+            await asyncio.wait_for(
+                self._drain_idle_event.wait(),
+                timeout=self.drain_timeout,
+            )
+        except asyncio.TimeoutError:
+            pass
         
         # Wait for active requests to complete
         shutdown_deadline = datetime.now(timezone.utc) + timedelta(seconds=self.shutdown_timeout)
         
         while self._active_requests and datetime.now(timezone.utc) < shutdown_deadline:
-            logger.info(
+            _log_with_fields(
+                "info",
                 "Waiting for requests to complete",
                 active_requests=self.active_request_count(),
                 remaining_seconds=(shutdown_deadline - datetime.now(timezone.utc)).seconds
@@ -1807,17 +2531,47 @@ class GracefulShutdown:
             await asyncio.sleep(1)
         
         if self._active_requests:
-            logger.warning(
+            _log_with_fields(
+                "warning",
                 "Shutdown timeout reached with active requests",
-                abandoned_requests=list(self._active_requests)
+                abandoned_requests=[
+                    {"request_id": request_id, "count": count}
+                    for request_id, count in self._active_requests.items()
+                ]
             )
         
-        # Run shutdown callbacks
+        # Run shutdown callbacks without letting one hung cleanup hook block
+        # process termination beyond the overall shutdown deadline.
         for callback in self._shutdown_callbacks:
+            callback_identity = self._callback_identity(callback)
+            remaining_seconds = (
+                shutdown_deadline - datetime.now(timezone.utc)
+            ).total_seconds()
+            if remaining_seconds <= 0:
+                _log_with_fields(
+                    "warning",
+                    "Skipping shutdown callback because deadline expired",
+                    callback=callback_identity,
+                )
+                continue
+
+            timeout_seconds = min(self.callback_timeout, remaining_seconds)
             try:
-                await callback()
+                await asyncio.wait_for(callback(), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                _log_with_fields(
+                    "error",
+                    "Shutdown callback timed out",
+                    callback=callback_identity,
+                    timeout_seconds=timeout_seconds,
+                )
             except Exception as e:
-                logger.error("Shutdown callback failed", error=str(e))
+                _log_with_fields(
+                    "error",
+                    "Shutdown callback failed",
+                    callback=callback_identity,
+                    error=str(e),
+                )
         
         logger.info("Graceful shutdown complete")
 
@@ -1827,7 +2581,7 @@ def setup_signal_handlers(shutdown: GracefulShutdown) -> None:
     loop = asyncio.get_running_loop()
 
     def handle_signal(sig: signal.Signals) -> None:
-        logger.info("Received signal", signal=sig.name)
+        _log_with_fields("info", "Received signal", signal=sig.name)
         # Hold a strong reference so the task is not garbage-collected mid-shutdown.
         shutdown._shutdown_task = asyncio.create_task(shutdown.initiate_shutdown())
     
@@ -1836,8 +2590,36 @@ def setup_signal_handlers(shutdown: GracefulShutdown) -> None:
 
 
 
-from fastapi import FastAPI, Request
-from starlette.middleware.base import BaseHTTPMiddleware
+try:
+    from fastapi import FastAPI, Request
+except ImportError:  # pragma: no cover - optional API package
+    class FastAPI:
+        pass
+
+    class Request:
+        headers: dict[str, str] = {}
+
+try:
+    from starlette.middleware.base import BaseHTTPMiddleware
+except ImportError:  # pragma: no cover - optional API package
+    class BaseHTTPMiddleware:
+        def __init__(self, app: Any):
+            self.app = app
+
+try:
+    from fastapi.responses import JSONResponse
+except ImportError:  # pragma: no cover - optional API package
+    class JSONResponse:
+        def __init__(
+            self,
+            *,
+            status_code: int,
+            content: dict[str, Any],
+            headers: Optional[dict[str, str]] = None,
+        ):
+            self.status_code = status_code
+            self.content = content
+            self.headers = headers or {}
 import uuid
 
 
@@ -1851,7 +2633,6 @@ class ShutdownMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Reject new requests during shutdown
         if self.shutdown.is_shutting_down():
-            from fastapi.responses import JSONResponse
             return JSONResponse(
                 status_code=503,
                 content={"error": "Service is shutting down"},

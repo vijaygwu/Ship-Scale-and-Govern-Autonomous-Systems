@@ -47,9 +47,30 @@ class Response:
     degraded: bool = False
 
 
-# TODO: wire to the real recommendation agent / error classifier in production.
-recommendation_agent = None
-classifier = None
+# Pedagogical placeholders for the multi-agent walkthrough in Block 15.
+# Replaced with fail-loud RequiredDependency so a copy-paste deployment
+# raises a clear error rather than silently no-oping. See the
+# Production Setup Checklist below.
+#
+# Production Setup Checklist
+# --------------------------
+# 1. Replace ``recommendation_agent`` with the real downstream agent
+#    client (HTTP, gRPC, or in-process callable).
+# 2. Replace ``classifier`` with the real error classifier (typically
+#    an instance of ErrorClassifier defined later in this chapter).
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _optional import _RequiredDependency  # noqa: E402
+
+recommendation_agent = _RequiredDependency(  # TODO[1]: see checklist
+    "recommendation_agent",
+    "Replace with the real downstream agent client.",
+)
+classifier = _RequiredDependency(  # TODO[2]: see checklist
+    "classifier",
+    "Replace with an ErrorClassifier instance (defined later in this chapter).",
+)
 
 
 class ErrorCategory(Enum):
@@ -117,6 +138,15 @@ class AgentError:
         deployments. These are starting defaults, not universal truths -
         tune based on your system's failure modes. Consider A/B testing
         recovery strategies to validate effectiveness for your workload.
+
+        Asymmetry worth noting between the two CRITICAL branches:
+        LLM_ERROR-CRITICAL routes to CIRCUIT_BREAK because the LLM API is
+        a recoverable upstream: opening a breaker diverts traffic to a
+        fallback model or surfaces a clean degradation. TOOL_FAILURE-CRITICAL
+        routes to DEAD_LETTER because a hard tool failure usually means a
+        side-effecting call we cannot safely retry without inspecting why
+        it failed; the operator gets a record to investigate rather than
+        an automated retry storm.
         """
         strategy_map = {
             (ErrorCategory.LLM_ERROR, ErrorSeverity.LOW): RecoveryStrategy.RETRY_IMMEDIATE,
@@ -241,9 +271,11 @@ class ErrorClassifier:
 # ============================================================================
 
 import asyncio
+import contextvars
 import random
 import time
 import threading
+from concurrent.futures import Executor, TimeoutError as FutureTimeoutError
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Set, TypeVar, Generic, Awaitable
@@ -283,20 +315,35 @@ class ExponentialBackoff(BackoffStrategy):
         multiplier: float = 2.0,
         max_delay: float = 60.0,
         jitter: bool = True,
-        jitter_factor: float = 0.1
+        jitter_factor: float = 0.1,
+        min_delay: float = 0.05,
     ):
+        if multiplier <= 0:
+            raise ValueError("multiplier must be positive")
+        if max_delay <= 0:
+            raise ValueError("max_delay must be positive")
+        if not 0 <= jitter_factor < 1:
+            raise ValueError("jitter_factor must be in [0, 1)")
+        if min_delay < 0:
+            raise ValueError("min_delay must be non-negative")
         self.multiplier = multiplier
         self.max_delay = max_delay
         self.jitter = jitter
         self.jitter_factor = jitter_factor
+        self.min_delay = min_delay
     
     def calculate_delay(self, attempt: int, base_delay: float) -> float:
-        # 'Full jitter' per the AWS Architecture Blog: pick uniformly in
-        # [0, exponential_cap]. This empirically minimizes contention vs.
-        # additive symmetric jitter when many clients retry simultaneously.
+        if attempt < 0:
+            raise ValueError("attempt must be non-negative")
+        if base_delay <= 0:
+            raise ValueError("base_delay must be positive")
+
+        # Bounded full jitter: preserve random spreading while keeping a small
+        # non-zero floor so a retry loop cannot spin immediately on delay=0.
         cap = min(base_delay * (self.multiplier ** attempt), self.max_delay)
         if self.jitter:
-            return random.uniform(0, cap)
+            floor = min(cap, max(self.min_delay, cap * self.jitter_factor))
+            return random.uniform(floor, cap)
         return cap
 
 
@@ -319,29 +366,35 @@ class DecorrelatedJitter(BackoffStrategy):
     compared to standard jittered exponential backoff, reducing
     the likelihood of synchronized retries across multiple clients.
 
-    Note: This implementation keeps per-sequence state in thread-local
-    storage. A single DecorrelatedJitter instance can be shared across
-    threads (and across concurrent retry sequences in a shared RetryPolicy)
-    without one sequence's prior delay leaking into another's.
+    Previous-delay state is held in a ContextVar for thread/task isolation
+    and reset when a new retry sequence starts at attempt 0.
     """
 
     def __init__(self, max_delay: float = 60.0):
         self.max_delay = max_delay
-        # Per-thread state so that concurrent retry sequences do not
-        # share _previous_delay through the same instance.
-        # NOTE: threading.local is sync-only; for asyncio use cases, a
-        # contextvars-based variant is recommended.
-        self._local = threading.local()
+        # ContextVar gives per-coroutine and per-thread isolation, so a
+        # single DecorrelatedJitter instance can be shared across a
+        # RetryPolicy used by many concurrent sequences.
+        self._previous_delay: contextvars.ContextVar[Optional[float]] = (
+            contextvars.ContextVar(
+                f"_decorrelated_jitter_prev_{id(self)}",
+                default=None,
+            )
+        )
 
     def calculate_delay(self, attempt: int, base_delay: float) -> float:
-        prev = getattr(self._local, "previous_delay", None)
+        prev = None if attempt <= 0 else self._previous_delay.get()
         if prev is None:
             prev = base_delay
 
         delay = random.uniform(base_delay, prev * 3)
         delay = min(delay, self.max_delay)
-        self._local.previous_delay = delay
+        self._previous_delay.set(delay)
         return delay
+
+
+class SyncAttemptStillRunningError(TimeoutError):
+    """Raised when a timed-out sync attempt cannot be confirmed stopped."""
 
 
 @dataclass
@@ -374,6 +427,9 @@ class RetryPolicy:
     error_classifier: ErrorClassifier = field(
         default_factory=ErrorClassifier
     )
+    retry_budget: Optional["RetryBudget"] = None
+    attempt_timeout: Optional[float] = None
+    sync_timeout_executor: Optional[Executor] = None
     
     def should_retry(self, error: AgentError, attempt: int) -> bool:
         """
@@ -416,10 +472,17 @@ class RetryPolicy:
             AgentError: If all retries exhausted or non-retryable error
         """
         last_error: Optional[AgentError] = None
+        if self.retry_budget:
+            self.retry_budget.record_call()
         
         for attempt in range(self.max_retries + 1):
             try:
-                return await operation()
+                if self.attempt_timeout is None:
+                    return await operation()
+                return await asyncio.wait_for(
+                    operation(),
+                    timeout=self.attempt_timeout
+                )
             except Exception as e:
                 agent_error = self.error_classifier.classify(
                     e, context=context, component=component
@@ -437,6 +500,14 @@ class RetryPolicy:
                     # from e` would self-reference (e IS that exception) and
                     # build a malformed __cause__ chain.
                     raise
+
+                if self.retry_budget and not self.retry_budget.can_retry():
+                    logger.warning(
+                        f"Retry budget exhausted for {component}; "
+                        "surfacing original failure.",
+                        extra={"error": agent_error.to_dict()}
+                    )
+                    raise
                 
                 delay = self.get_delay(attempt)
                 logger.info(
@@ -446,6 +517,9 @@ class RetryPolicy:
                 
                 if self.on_retry:
                     self.on_retry(agent_error, attempt)
+
+                if self.retry_budget:
+                    self.retry_budget.record_retry()
                 
                 await asyncio.sleep(delay)
         
@@ -464,27 +538,42 @@ class RetryPolicy:
     ) -> T:
         """Synchronous version of execute_async."""
         last_error: Optional[AgentError] = None
+        if self.retry_budget:
+            self.retry_budget.record_call()
         
         for attempt in range(self.max_retries + 1):
             try:
-                return operation()
+                return self._run_sync_attempt(operation)
+            except SyncAttemptStillRunningError:
+                raise
             except Exception as e:
                 agent_error = self.error_classifier.classify(
                     e, context=context, component=component
                 )
                 agent_error.retry_count = attempt
                 last_error = agent_error
-                
+
                 if not self.should_retry(agent_error, attempt):
+                    raise
+
+                if self.retry_budget and not self.retry_budget.can_retry():
+                    logger.warning(
+                        f"Retry budget exhausted for {component}; "
+                        "surfacing original failure.",
+                        extra={"error": agent_error.to_dict()}
+                    )
                     raise
                 
                 delay = self.get_delay(attempt)
                 logger.info(
                     f"Retry {attempt + 1}/{self.max_retries} after {delay:.2f}s"
                 )
-                
+
                 if self.on_retry:
                     self.on_retry(agent_error, attempt)
+
+                if self.retry_budget:
+                    self.retry_budget.record_retry()
                 
                 time.sleep(delay)
         
@@ -493,6 +582,49 @@ class RetryPolicy:
                 raise last_error.original_exception
             raise RuntimeError(f"Retries exhausted: {last_error.message}")
         raise RuntimeError("Unexpected retry loop termination")
+
+    def _run_sync_attempt(self, operation: Callable[[], T]) -> T:
+        """Run one sync attempt, optionally bounding caller wait time.
+
+        Python cannot safely interrupt arbitrary blocking synchronous code.
+        When ``attempt_timeout`` is set, callers must supply an executor. The
+        timeout bounds how long this retry loop waits for the result; if the
+        callable is already running in a worker thread, cancellation may not
+        stop that underlying work.
+        """
+        if self.attempt_timeout is None:
+            return operation()
+
+        if self.sync_timeout_executor is None:
+            raise ValueError(
+                "sync attempt_timeout requires sync_timeout_executor; "
+                "Python cannot interrupt arbitrary blocking synchronous code"
+            )
+
+        future = self.sync_timeout_executor.submit(operation)
+        try:
+            return future.result(timeout=self.attempt_timeout)
+        except FutureTimeoutError as e:
+            cancelled = future.cancel()
+            message = (
+                f"Sync operation exceeded per-attempt timeout "
+                f"of {self.attempt_timeout:.3f}s"
+            )
+            if not cancelled:
+                # Log the orphaned future's identity so operators can
+                # correlate this wedge with later cleanup or thread dumps;
+                # id() is sufficient for in-process correlation.
+                logger.warning(
+                    "Sync retry attempt timed out with uncancelable future "
+                    "future_id=%d timeout=%.3fs",
+                    id(future),
+                    self.attempt_timeout,
+                )
+                raise SyncAttemptStillRunningError(
+                    f"{message}; underlying work is still running, so retrying "
+                    "could duplicate non-idempotent side effects"
+                ) from e
+            raise TimeoutError(message) from e
 
 
 def with_retry(
@@ -646,6 +778,7 @@ from typing import Callable, Optional, TypeVar, Generic, Awaitable, Any, Dict
 from datetime import datetime, timedelta, timezone
 from collections import deque
 import asyncio
+import math
 
 T = TypeVar('T')
 
@@ -665,7 +798,36 @@ class CircuitBreakerConfig:
     half_open_max_calls: int = 3  # Max concurrent calls in half-open
     failure_rate_threshold: float = 0.5  # Alternative: failure rate trigger
     minimum_calls: int = 10  # Minimum calls before rate calculation
-    sliding_window_size: int = 100  # Size of measurement window
+    sliding_window_size: int = 100  # Max calls retained for measurement
+    sliding_window_duration: Optional[timedelta] = None  # Optional time window
+    latency_threshold: Optional[timedelta] = None  # Optional percentile trigger
+    latency_percentile: float = 0.99
+
+    def __post_init__(self) -> None:
+        if self.failure_threshold <= 0:
+            raise ValueError("failure_threshold must be positive")
+        if self.success_threshold <= 0:
+            raise ValueError("success_threshold must be positive")
+        if self.half_open_max_calls <= 0:
+            raise ValueError("half_open_max_calls must be positive")
+        if self.minimum_calls <= 0:
+            raise ValueError("minimum_calls must be positive")
+        if self.sliding_window_size <= 0:
+            raise ValueError("sliding_window_size must be positive")
+        if not 0 < self.failure_rate_threshold <= 1:
+            raise ValueError("failure_rate_threshold must be in (0, 1]")
+        if (
+            self.sliding_window_duration is not None
+            and self.sliding_window_duration <= timedelta(0)
+        ):
+            raise ValueError("sliding_window_duration must be positive")
+        if (
+            self.latency_threshold is not None
+            and self.latency_threshold <= timedelta(0)
+        ):
+            raise ValueError("latency_threshold must be positive")
+        if not 0 < self.latency_percentile <= 1:
+            raise ValueError("latency_percentile must be in (0, 1]")
 
 
 class CircuitBreakerError(Exception):
@@ -693,9 +855,10 @@ class CircuitBreaker(Generic[T]):
     """
     Production-ready circuit breaker with sliding window metrics.
     
-    This implementation supports both count-based and rate-based
-    failure detection, thread-safe state transitions, and 
-    comprehensive metrics for monitoring.
+    This implementation supports count-based, rate-based, and
+    percentile-latency failure detection over a count window, an optional
+    time window, or both. It also provides thread-safe state transitions
+    and comprehensive metrics for monitoring.
     """
     
     def __init__(
@@ -715,6 +878,7 @@ class CircuitBreaker(Generic[T]):
         self._last_failure_time: Optional[datetime] = None
         self._half_open_calls = 0
         self._half_open_successes = 0
+        self._half_open_generation = 0
         
         # Sliding window for metrics
         self._call_history: deque[CallResult] = deque(
@@ -751,6 +915,7 @@ class CircuitBreaker(Generic[T]):
         if new_state == CircuitState.HALF_OPEN:
             self._half_open_calls = 0
             self._half_open_successes = 0
+            self._half_open_generation += 1
         
         logger.info(
             f"Circuit '{self.name}' transitioned from {old_state.name} "
@@ -760,74 +925,170 @@ class CircuitBreaker(Generic[T]):
         if self.on_state_change:
             self.on_state_change(old_state, new_state)
     
-    def _record_success(self) -> None:
+    def _record_success(
+        self,
+        duration: timedelta,
+        half_open_generation: Optional[int] = None
+    ) -> None:
         """Record a successful call and potentially close circuit."""
         with self._state_lock:
             self._total_successes += 1
+            now = datetime.now(timezone.utc)
             self._call_history.append(CallResult(
-                timestamp=datetime.now(timezone.utc),
+                timestamp=now,
                 success=True,
-                duration=timedelta(0)  # Would be populated by actual call
+                duration=duration
             ))
             
-            if self._state == CircuitState.HALF_OPEN:
+            if (
+                half_open_generation is not None
+                and self._state == CircuitState.HALF_OPEN
+                and self._half_open_generation == half_open_generation
+            ):
+                # Release the half-open slot we acquired in _can_execute()
+                # so other probes can proceed; without this the breaker
+                # wedges once half_open_max_calls is reached.
+                self._half_open_calls = max(0, self._half_open_calls - 1)
                 self._half_open_successes += 1
                 if self._half_open_successes >= self.config.success_threshold:
                     self._transition_to(CircuitState.CLOSED)
+            elif (
+                self._state == CircuitState.CLOSED
+                and self.config.latency_threshold is not None
+                and self._should_open()
+            ):
+                self._last_failure_time = now
+                self._transition_to(CircuitState.OPEN)
     
-    def _record_failure(self, error: Exception) -> None:
+    def _record_failure(
+        self,
+        error: Exception,
+        duration: timedelta,
+        half_open_generation: Optional[int] = None
+    ) -> None:
         """Record a failure and potentially open circuit."""
         with self._state_lock:
             self._total_failures += 1
-            self._last_failure_time = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
+            self._last_failure_time = now
             self._call_history.append(CallResult(
-                timestamp=datetime.now(timezone.utc),
+                timestamp=now,
                 success=False,
-                duration=timedelta(0),
+                duration=duration,
                 error=error
             ))
             
-            if self._state == CircuitState.HALF_OPEN:
+            if (
+                half_open_generation is not None
+                and self._state == CircuitState.HALF_OPEN
+                and self._half_open_generation == half_open_generation
+            ):
+                # Release the half-open slot before transitioning so the
+                # counter is consistent if state changes again.
+                self._half_open_calls = max(0, self._half_open_calls - 1)
+                self._transition_to(CircuitState.OPEN)
+            elif (
+                half_open_generation is None
+                and self._state == CircuitState.HALF_OPEN
+            ):
+                self._half_open_calls = max(0, self._half_open_calls - 1)
                 self._transition_to(CircuitState.OPEN)
             elif self._state == CircuitState.CLOSED:
                 if self._should_open():
                     self._transition_to(CircuitState.OPEN)
+
+    def record_failure(
+        self,
+        error: Exception,
+        duration: Optional[timedelta] = None
+    ) -> None:
+        """Record a failure observed by an outer timeout/deadline wrapper."""
+        self._record_failure(error, duration or timedelta(0))
+
+    def _windowed_history(
+        self,
+        now: Optional[datetime] = None
+    ) -> list[CallResult]:
+        """Return calls inside the configured count and optional time window."""
+        calls = list(self._call_history)
+        if self.config.sliding_window_duration is None:
+            return calls
+
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - self.config.sliding_window_duration
+        return [call for call in calls if call.timestamp >= cutoff]
+
+    def _duration_at_percentile(
+        self,
+        calls: list[CallResult],
+        percentile: float
+    ) -> Optional[timedelta]:
+        """Nearest-rank percentile over recorded call durations."""
+        if not calls:
+            return None
+
+        durations = sorted(call.duration for call in calls)
+        rank = max(1, math.ceil(percentile * len(durations))) - 1
+        return durations[min(rank, len(durations) - 1)]
     
     def _should_open(self) -> bool:
         """Determine if circuit should open based on failure metrics."""
+        calls = self._windowed_history()
+        if not calls:
+            return False
+
         # Count-based threshold
-        recent_failures = sum(
-            1 for call in self._call_history
-            if not call.success
-            and (datetime.now(timezone.utc) - call.timestamp) < timedelta(minutes=1)
-        )
+        recent_failures = sum(1 for call in calls if not call.success)
         if recent_failures >= self.config.failure_threshold:
             return True
         
-        # Rate-based threshold
-        if len(self._call_history) >= self.config.minimum_calls:
-            failure_rate = sum(
-                1 for call in self._call_history if not call.success
-            ) / len(self._call_history)
+        # Rate- and latency-based thresholds need enough samples.
+        if len(calls) >= self.config.minimum_calls:
+            failure_rate = recent_failures / len(calls)
             if failure_rate >= self.config.failure_rate_threshold:
                 return True
+
+            if self.config.latency_threshold is not None:
+                percentile_duration = self._duration_at_percentile(
+                    calls,
+                    self.config.latency_percentile
+                )
+                if (
+                    percentile_duration is not None
+                    and percentile_duration > self.config.latency_threshold
+                ):
+                    return True
         
         return False
     
-    def _can_execute(self) -> bool:
-        """Check if a call can be executed given current state."""
+    def _acquire_execution_slot(self) -> tuple[bool, Optional[int]]:
+        """Return whether a call can run and the half-open generation it used."""
         with self._state_lock:
             current_state = self.state  # This may trigger state transition
             
             if current_state == CircuitState.CLOSED:
-                return True
+                return True, None
             elif current_state == CircuitState.OPEN:
-                return False
+                return False, None
             else:  # HALF_OPEN
                 if self._half_open_calls < self.config.half_open_max_calls:
                     self._half_open_calls += 1
-                    return True
-                return False
+                    return True, self._half_open_generation
+                return False, None
+
+    def _can_execute(self) -> bool:
+        """Check if a call can be executed given current state."""
+        can_execute, _ = self._acquire_execution_slot()
+        return can_execute
+
+    def _release_half_open_slot(self, half_open_generation: int) -> None:
+        """Release a half-open slot when a probe exits without a result."""
+        with self._state_lock:
+            if (
+                self._state == CircuitState.HALF_OPEN
+                and self._half_open_generation == half_open_generation
+            ):
+                self._half_open_calls = max(0, self._half_open_calls - 1)
     
     async def execute_async(
         self,
@@ -849,7 +1110,8 @@ class CircuitBreaker(Generic[T]):
         """
         self._total_calls += 1
         
-        if not self._can_execute():
+        can_execute, half_open_generation = self._acquire_execution_slot()
+        if not can_execute:
             self._total_rejections += 1
             if self.on_rejected:
                 self.on_rejected()
@@ -864,12 +1126,28 @@ class CircuitBreaker(Generic[T]):
             )
             raise CircuitBreakerError(self.name, time_until_retry)
         
+        start_time = datetime.now(timezone.utc)
         try:
             result = await operation()
-            self._record_success()
+            self._record_success(
+                datetime.now(timezone.utc) - start_time,
+                half_open_generation
+            )
             return result
+        except asyncio.CancelledError:
+            if half_open_generation is not None:
+                self._release_half_open_slot(half_open_generation)
+            raise
         except Exception as e:
-            self._record_failure(e)
+            self._record_failure(
+                e,
+                datetime.now(timezone.utc) - start_time,
+                half_open_generation
+            )
+            raise
+        except BaseException:
+            if half_open_generation is not None:
+                self._release_half_open_slot(half_open_generation)
             raise
     
     def execute_sync(
@@ -880,7 +1158,8 @@ class CircuitBreaker(Generic[T]):
         """Synchronous version of execute_async."""
         self._total_calls += 1
         
-        if not self._can_execute():
+        can_execute, half_open_generation = self._acquire_execution_slot()
+        if not can_execute:
             self._total_rejections += 1
             if self.on_rejected:
                 self.on_rejected()
@@ -895,22 +1174,35 @@ class CircuitBreaker(Generic[T]):
             )
             raise CircuitBreakerError(self.name, time_until_retry)
         
+        start_time = datetime.now(timezone.utc)
         try:
             result = operation()
-            self._record_success()
+            self._record_success(
+                datetime.now(timezone.utc) - start_time,
+                half_open_generation
+            )
             return result
         except Exception as e:
-            self._record_failure(e)
+            self._record_failure(
+                e,
+                datetime.now(timezone.utc) - start_time,
+                half_open_generation
+            )
+            raise
+        except BaseException:
+            if half_open_generation is not None:
+                self._release_half_open_slot(half_open_generation)
             raise
     
     def get_metrics(self) -> Dict[str, Any]:
         """Get current circuit breaker metrics for monitoring."""
         with self._state_lock:
-            recent_calls = [
-                c for c in self._call_history
-                if (datetime.now(timezone.utc) - c.timestamp) < timedelta(minutes=5)
-            ]
+            recent_calls = self._windowed_history(datetime.now(timezone.utc))
             recent_failures = sum(1 for c in recent_calls if not c.success)
+            latency_percentile = self._duration_at_percentile(
+                recent_calls,
+                self.config.latency_percentile
+            )
             
             return {
                 "name": self.name,
@@ -919,9 +1211,15 @@ class CircuitBreaker(Generic[T]):
                 "total_successes": self._total_successes,
                 "total_failures": self._total_failures,
                 "total_rejections": self._total_rejections,
+                "window_calls": len(recent_calls),
                 "recent_failure_rate": (
                     recent_failures / len(recent_calls)
                     if recent_calls else 0
+                ),
+                "latency_percentile": self.config.latency_percentile,
+                "latency_percentile_seconds": (
+                    latency_percentile.total_seconds()
+                    if latency_percentile is not None else None
                 ),
                 "last_failure_time": (
                     self._last_failure_time.isoformat()
@@ -957,9 +1255,10 @@ class CircuitBreakerRegistry:
         config: Optional[CircuitBreakerConfig] = None
     ) -> CircuitBreaker:
         """Register a new circuit breaker or return existing one."""
-        if name not in self._breakers:
-            self._breakers[name] = CircuitBreaker(name, config)
-        return self._breakers[name]
+        with self._lock:
+            if name not in self._breakers:
+                self._breakers[name] = CircuitBreaker(name, config)
+            return self._breakers[name]
     
     def get(self, name: str) -> Optional[CircuitBreaker]:
         """Get a circuit breaker by name."""
@@ -1000,6 +1299,16 @@ class CircuitBreakerRegistry:
 # Block 6 (chapter listing #6)
 # ============================================================================
 
+class FallbackError(Exception):
+    """Raised by a fallback to signal that the next one should be tried."""
+    pass
+
+
+class NoFallbackSucceeded(FallbackError):
+    """Raised when every configured fallback raised FallbackError."""
+    pass
+
+
 def call_primary_llm(req): ...
 def call_secondary_llm(req): ...
 def return_cached_answer(req): ...
@@ -1025,10 +1334,11 @@ if __name__ == "__main__":
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, TypeVar, Generic, Callable, Awaitable, Any
+from typing import List, Optional, TypeVar, Generic, Callable, Awaitable, Any, Dict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import asyncio
 
 T = TypeVar('T')
 
@@ -1203,27 +1513,73 @@ class FallbackResult(Generic[T]):
     degraded: bool  # True if not from primary provider
 
 
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 5.0
+_USE_DEFAULT_PROVIDER_TIMEOUT = object()
+
+
 class FallbackChain(Generic[T]):
     """
     Executes requests through a chain of fallback providers.
     
     Providers are tried in priority order until one succeeds.
     Comprehensive metrics are collected for monitoring and optimization.
+    Provider attempts use a bounded default timeout so a hung primary
+    cannot stall the whole chain. Use provider_timeouts for known slow
+    providers, and pass default_provider_timeout=None only with
+    allow_unbounded_provider_waits=True when an unbounded wait is intended.
     """
     
     def __init__(
         self,
         providers: List[FallbackProvider[T]],
-        on_fallback: Optional[Callable[[str, str, Exception], None]] = None
+        on_fallback: Optional[Callable[[str, str, Exception], None]] = None,
+        default_provider_timeout: Any = _USE_DEFAULT_PROVIDER_TIMEOUT,
+        provider_timeouts: Optional[Dict[str, Optional[float]]] = None,
+        allow_unbounded_provider_waits: bool = False
     ):
         # Sort by priority (lower = higher priority)
         self.providers = sorted(providers, key=lambda p: p.priority)
         self.on_fallback = on_fallback
+        self.allow_unbounded_provider_waits = allow_unbounded_provider_waits
+        if default_provider_timeout is _USE_DEFAULT_PROVIDER_TIMEOUT:
+            default_provider_timeout = DEFAULT_PROVIDER_TIMEOUT_SECONDS
+        self.default_provider_timeout = default_provider_timeout
+        self.provider_timeouts = provider_timeouts or {}
+
+        if (
+            self.default_provider_timeout is None
+            and not self.allow_unbounded_provider_waits
+        ):
+            raise ValueError(
+                "default_provider_timeout=None disables provider deadlines; "
+                "set allow_unbounded_provider_waits=True to opt in"
+            )
+        if (
+            self.default_provider_timeout is not None
+            and self.default_provider_timeout <= 0
+        ):
+            raise ValueError("default_provider_timeout must be positive")
+        for provider_name, timeout in self.provider_timeouts.items():
+            if timeout is None:
+                if not self.allow_unbounded_provider_waits:
+                    raise ValueError(
+                        f"Timeout for provider {provider_name!r} disables "
+                        "that provider deadline; set "
+                        "allow_unbounded_provider_waits=True to opt in"
+                    )
+                continue
+            if timeout <= 0:
+                raise ValueError(
+                    f"Timeout for provider {provider_name!r} must be positive"
+                )
         
         # Metrics
         self._total_requests = 0
         self._provider_usage: Dict[str, int] = {p.name: 0 for p in providers}
         self._fallback_counts: Dict[str, int] = {p.name: 0 for p in providers}
+        self._provider_timeout_counts: Dict[str, int] = {
+            p.name: 0 for p in providers
+        }
     
     async def execute(self, request: Any) -> FallbackResult[T]:
         """
@@ -1243,7 +1599,7 @@ class FallbackChain(Generic[T]):
             providers_tried.append(provider.name)
             
             try:
-                result = await provider.execute(request)
+                result = await self._execute_provider(provider, request)
                 self._provider_usage[provider.name] += 1
                 
                 return FallbackResult(
@@ -1272,6 +1628,54 @@ class FallbackChain(Generic[T]):
             f"Tried: {providers_tried}. "
             f"Last error: {last_error}"
         )
+
+    async def _execute_provider(
+        self,
+        provider: FallbackProvider[T],
+        request: Any
+    ) -> T:
+        """Execute one provider with its configured timeout."""
+        timeout = self.provider_timeouts.get(
+            provider.name,
+            self.default_provider_timeout
+        )
+        if timeout is None:
+            return await provider.execute(request)
+
+        start_time = datetime.now(timezone.utc)
+        task = asyncio.create_task(provider.execute(request))
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if task in done:
+            return await task
+
+        task.cancel()
+        task.add_done_callback(self._consume_provider_task_result)
+        duration = datetime.now(timezone.utc) - start_time
+        timeout_error = TimeoutError(
+            f"Provider {provider.name} exceeded timeout of {timeout:.3f}s"
+        )
+        self._provider_timeout_counts[provider.name] += 1
+        self._record_provider_timeout(provider, timeout_error, duration)
+        raise timeout_error
+
+    @staticmethod
+    def _consume_provider_task_result(task: asyncio.Task) -> None:
+        """Consume cancelled provider task results to avoid unhandled warnings."""
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    def _record_provider_timeout(
+        self,
+        provider: FallbackProvider[T],
+        error: TimeoutError,
+        duration: timedelta
+    ) -> None:
+        """Feed outer timeout failures into provider-owned circuit breakers."""
+        circuit_breaker = getattr(provider, "circuit_breaker", None)
+        if circuit_breaker:
+            circuit_breaker.record_failure(error, duration)
     
     def get_metrics(self) -> Dict[str, Any]:
         """Get fallback chain metrics for monitoring."""
@@ -1279,6 +1683,7 @@ class FallbackChain(Generic[T]):
             "total_requests": self._total_requests,
             "provider_usage": self._provider_usage,
             "fallback_counts": self._fallback_counts,
+            "provider_timeout_counts": self._provider_timeout_counts,
             "primary_success_rate": (
                 self._provider_usage.get(self.providers[0].name, 0) /
                 self._total_requests
@@ -1363,6 +1768,13 @@ if __name__ == "__main__":
         
         return FallbackChain(
             providers=providers,
+            default_provider_timeout=5.0,
+            provider_timeouts={
+                f"anthropic/{PRIMARY_MODEL}": 8.0,
+                f"anthropic/{SECONDARY_MODEL}": 4.0,
+                "semantic_cache": 1.0,
+                "static_fallback": 0.25,
+            },
             on_fallback=lambda prev, curr, err: logger.warning(
                 f"Fallback from {prev} to {curr}: {err}"
             )
@@ -1431,7 +1843,51 @@ class DegradationManager:
     
     def register_capability(self, capability: SystemCapability) -> None:
         """Register a system capability."""
+        previous = self._capabilities.get(capability.name)
         self._capabilities[capability.name] = capability
+        try:
+            cycle = self._find_dependency_cycle(capability.name)
+        except Exception:
+            if previous is None:
+                self._capabilities.pop(capability.name, None)
+            else:
+                self._capabilities[capability.name] = previous
+            raise
+
+        if cycle:
+            if previous is None:
+                self._capabilities.pop(capability.name, None)
+            else:
+                self._capabilities[capability.name] = previous
+            raise ValueError(
+                "Capability dependency cycle detected: "
+                + " -> ".join(cycle)
+            )
+
+    def _find_dependency_cycle(self, capability_name: str) -> Optional[List[str]]:
+        """Return a dependency cycle path if one is reachable."""
+        visited: Set[str] = set()
+        stack: List[str] = []
+
+        def visit(name: str) -> Optional[List[str]]:
+            if name in stack:
+                start = stack.index(name)
+                return stack[start:] + [name]
+            if name in visited:
+                return None
+
+            visited.add(name)
+            stack.append(name)
+            capability = self._capabilities.get(name)
+            if capability:
+                for dep in capability.dependencies:
+                    cycle = visit(dep)
+                    if cycle:
+                        return cycle
+            stack.pop()
+            return None
+
+        return visit(capability_name)
     
     def add_listener(
         self,
@@ -1464,6 +1920,17 @@ class DegradationManager:
     
     def is_available(self, capability_name: str) -> bool:
         """Check if a capability is available at current degradation level."""
+        return self._is_available(capability_name, [])
+
+    def _is_available(self, capability_name: str, stack: List[str]) -> bool:
+        """Check availability while reporting dependency cycles."""
+        if capability_name in stack:
+            cycle = stack[stack.index(capability_name):] + [capability_name]
+            raise ValueError(
+                "Capability dependency cycle detected: "
+                + " -> ".join(cycle)
+            )
+
         capability = self._capabilities.get(capability_name)
         if not capability:
             return False
@@ -1473,9 +1940,12 @@ class DegradationManager:
             return False
         
         # Check dependencies
+        stack.append(capability_name)
         for dep in capability.dependencies:
-            if not self.is_available(dep):
+            if not self._is_available(dep, stack):
+                stack.pop()
                 return False
+        stack.pop()
         
         return True
     
@@ -1564,8 +2034,9 @@ def setup_agent_degradation() -> DegradationManager:
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import uuid
+from collections import deque
 
 
 @dataclass
@@ -1627,26 +2098,39 @@ class MultiAgentErrorHandler:
     def __init__(
         self,
         max_concurrent_failures: int = 3,
-        failure_window: timedelta = timedelta(minutes=5)
+        failure_window: timedelta = timedelta(minutes=5),
+        max_contexts: int = 1000
     ):
+        if max_contexts <= 0:
+            raise ValueError("max_contexts must be positive")
         self.max_concurrent_failures = max_concurrent_failures
         self.failure_window = failure_window
-        self._error_contexts: List[AgentErrorContext] = []
+        self.max_contexts = max_contexts
+        self._error_contexts: deque[AgentErrorContext] = deque(
+            maxlen=max_contexts
+        )
         self._context_lock = threading.Lock()
+        self._contexts_evicted_by_cap = 0
+        self._contexts_expired_by_window = 0
     
     def record_error(self, context: AgentErrorContext) -> None:
         """Record an error context for analysis."""
         with self._context_lock:
-            self._error_contexts.append(context)
             self._cleanup_old_contexts()
+            if len(self._error_contexts) == self.max_contexts:
+                self._contexts_evicted_by_cap += 1
+            self._error_contexts.append(context)
     
     def _cleanup_old_contexts(self) -> None:
         """Remove contexts outside the failure window."""
         cutoff = datetime.now(timezone.utc) - self.failure_window
-        self._error_contexts = [
+        before = len(self._error_contexts)
+        retained = [
             ctx for ctx in self._error_contexts
             if ctx.error.timestamp > cutoff
         ]
+        self._contexts_expired_by_window += before - len(retained)
+        self._error_contexts = deque(retained, maxlen=self.max_contexts)
     
     def should_halt_orchestration(self) -> bool:
         """
@@ -1668,6 +2152,33 @@ class MultiAgentErrorHandler:
                 return True
             
             return False
+
+    def reset(self) -> None:
+        """Operator-invoked recovery: clear halt state and resume processing.
+
+        ``should_halt_orchestration`` returns True as long as enough
+        distinct agents have failed inside the rolling window. Reset
+        is deliberately manual: once an operator has investigated the
+        underlying cause, they call ``reset()`` to drop the recorded
+        error contexts so orchestration can resume. Do not call this
+        automatically; it exists to require human confirmation.
+        """
+        with self._context_lock:
+            self._error_contexts.clear()
+            logger.warning(
+                "MultiAgentErrorHandler reset by operator; halt state cleared."
+            )
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Expose context-retention metrics for monitoring."""
+        with self._context_lock:
+            self._cleanup_old_contexts()
+            return {
+                "contexts_in_window": len(self._error_contexts),
+                "max_contexts": self.max_contexts,
+                "contexts_evicted_by_cap": self._contexts_evicted_by_cap,
+                "contexts_expired_by_window": self._contexts_expired_by_window,
+            }
     
     def get_recovery_recommendation(
         self,
@@ -1715,13 +2226,15 @@ class MultiAgentErrorHandler:
 # ============================================================================
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any, Callable, Protocol
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 import json
 import uuid
 import threading
+import inspect
 from collections import deque
+from concurrent.futures import Executor, ThreadPoolExecutor
 
 
 class DLQEntryStatus(Enum):
@@ -1740,6 +2253,7 @@ class DLQEntry:
     error_context: Optional[AgentErrorContext] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_attempt_at: Optional[datetime] = None
+    processing_deadline: Optional[datetime] = None
     attempt_count: int = 0
     status: DLQEntryStatus = DLQEntryStatus.PENDING
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -1752,18 +2266,36 @@ class DLQEntry:
             "error": self.error_context.to_dict() if self.error_context else None,
             "created_at": self.created_at.isoformat(),
             "last_attempt_at": self.last_attempt_at.isoformat() if self.last_attempt_at else None,
+            "processing_deadline": (
+                self.processing_deadline.isoformat()
+                if self.processing_deadline
+                else None
+            ),
             "attempt_count": self.attempt_count,
             "status": self.status.name,
             "metadata": self.metadata
         }
 
 
+class DLQDurableSink(Protocol):
+    """
+    Durable storage hook for production DLQ capture.
+
+    Implement with SQS, Kafka, Postgres, Redis Streams, or another durable
+    store. The in-memory queue remains the active working set.
+    """
+
+    def save(self, entry: DLQEntry) -> None:
+        """Persist the current representation of a DLQ entry."""
+        ...
+
+
 class DeadLetterQueue:
     """
-    Production dead letter queue for failed agent tasks.
-    
-    Provides storage, retrieval, and reprocessing capabilities
-    for tasks that have exhausted normal error handling.
+    In-memory dead letter queue for failed agent tasks.
+
+    Use durable_sink in production to persist failed work and status changes
+    across process restarts.
     """
     
     def __init__(
@@ -1771,14 +2303,23 @@ class DeadLetterQueue:
         max_size: int = 10000,
         default_ttl: timedelta = timedelta(days=7),
         max_reprocess_attempts: int = 3,
+        processing_lease: timedelta = timedelta(minutes=15),
         on_entry_added: Optional[Callable[[DLQEntry], None]] = None,
-        on_entry_resolved: Optional[Callable[[DLQEntry], None]] = None
+        on_entry_resolved: Optional[Callable[[DLQEntry], None]] = None,
+        durable_sink: Optional[DLQDurableSink] = None
     ):
+        if max_size <= 0:
+            raise ValueError("max_size must be greater than 0")
+        if processing_lease <= timedelta(0):
+            raise ValueError("processing_lease must be positive")
+
         self.max_size = max_size
         self.default_ttl = default_ttl
         self.max_reprocess_attempts = max_reprocess_attempts
+        self.processing_lease = processing_lease
         self.on_entry_added = on_entry_added
         self.on_entry_resolved = on_entry_resolved
+        self.durable_sink = durable_sink
         
         self._entries: Dict[str, DLQEntry] = {}
         self._entry_order: deque[str] = deque()
@@ -1789,6 +2330,19 @@ class DeadLetterQueue:
         self._total_resolved = 0
         self._total_discarded = 0
         self._total_expired = 0
+
+    def _persist_entry(self, entry: DLQEntry) -> None:
+        """Persist an entry when a durable sink is configured."""
+        if self.durable_sink:
+            self.durable_sink.save(entry)
+
+    def _remove_active_entry(self, entry_id: str) -> None:
+        """Remove an entry from the active queue indexes."""
+        self._entries.pop(entry_id, None)
+        try:
+            self._entry_order.remove(entry_id)
+        except ValueError:
+            pass
     
     def add(
         self,
@@ -1807,15 +2361,22 @@ class DeadLetterQueue:
             error_context=error_context,
             metadata=metadata or {}
         )
-        
+
+        expired_entries: List[DLQEntry] = []
         with self._lock:
             # Evict oldest if at capacity
             while len(self._entries) >= self.max_size:
-                self._evict_oldest()
+                expired_entry = self._evict_oldest()
+                if expired_entry:
+                    expired_entries.append(expired_entry)
             
             self._entries[entry.id] = entry
             self._entry_order.append(entry.id)
             self._total_added += 1
+
+        for expired_entry in expired_entries:
+            self._persist_entry(expired_entry)
+        self._persist_entry(entry)
         
         logger.warning(
             f"Task added to DLQ: {entry.id}",
@@ -1827,14 +2388,18 @@ class DeadLetterQueue:
         
         return entry
     
-    def _evict_oldest(self) -> None:
+    def _evict_oldest(self) -> Optional[DLQEntry]:
         """Evict the oldest entry to make room."""
-        if self._entry_order:
+        while self._entry_order:
             oldest_id = self._entry_order.popleft()
-            if oldest_id in self._entries:
-                self._entries[oldest_id].status = DLQEntryStatus.EXPIRED
-                self._total_expired += 1
-                del self._entries[oldest_id]
+            entry = self._entries.pop(oldest_id, None)
+            if entry is None:
+                continue
+            entry.status = DLQEntryStatus.EXPIRED
+            entry.processing_deadline = None
+            self._total_expired += 1
+            return entry
+        return None
     
     def get(self, entry_id: str) -> Optional[DLQEntry]:
         """Get a specific DLQ entry by ID."""
@@ -1842,8 +2407,12 @@ class DeadLetterQueue:
     
     def get_pending(self, limit: int = 100) -> List[DLQEntry]:
         """Get pending entries for reprocessing."""
+        expired_entries: List[DLQEntry] = []
+        recovered_entries: List[DLQEntry] = []
         with self._lock:
-            self._expire_old_entries()
+            now = datetime.now(timezone.utc)
+            recovered_entries = self._release_stale_processing(now)
+            expired_entries = self._expire_old_entries(now)
             
             pending = [
                 entry for entry in self._entries.values()
@@ -1854,26 +2423,91 @@ class DeadLetterQueue:
             # Sort by creation time (oldest first)
             pending.sort(key=lambda e: e.created_at)
             
-            return pending[:limit]
+            result = pending[:limit]
+
+        for recovered_entry in recovered_entries:
+            self._persist_entry(recovered_entry)
+        for expired_entry in expired_entries:
+            self._persist_entry(expired_entry)
+
+        return result
     
-    def _expire_old_entries(self) -> None:
-        """Mark entries past TTL as expired."""
-        cutoff = datetime.now(timezone.utc) - self.default_ttl
-        for entry in self._entries.values():
+    def _expire_old_entries(self, now: datetime) -> List[DLQEntry]:
+        """Mark entries past TTL as expired and remove them from the queue."""
+        cutoff = now - self.default_ttl
+        expired_ids: list[str] = []
+        expired_entries: List[DLQEntry] = []
+        for entry_id, entry in self._entries.items():
             if entry.created_at < cutoff and entry.status == DLQEntryStatus.PENDING:
                 entry.status = DLQEntryStatus.EXPIRED
+                entry.processing_deadline = None
                 self._total_expired += 1
+                expired_ids.append(entry_id)
+                expired_entries.append(entry)
+        for entry_id in expired_ids:
+            # Drop from the active map and the FIFO order index so
+            # expired entries stop counting against max_size.
+            self._remove_active_entry(entry_id)
+        return expired_entries
+
+    def _release_stale_processing(self, now: datetime) -> List[DLQEntry]:
+        """Return expired processing leases to PENDING for another attempt."""
+        recovered_entries: List[DLQEntry] = []
+        terminal_ids: list[str] = []
+        for entry_id, entry in self._entries.items():
+            if (
+                entry.status == DLQEntryStatus.PROCESSING
+                and (
+                    entry.processing_deadline is None
+                    or entry.processing_deadline <= now
+                )
+            ):
+                if entry.attempt_count >= self.max_reprocess_attempts:
+                    entry.status = DLQEntryStatus.DISCARDED
+                    self._total_discarded += 1
+                    terminal_ids.append(entry_id)
+                else:
+                    entry.status = DLQEntryStatus.PENDING
+                entry.processing_deadline = None
+                recovered_entries.append(entry)
+        for entry_id in terminal_ids:
+            self._remove_active_entry(entry_id)
+        return recovered_entries
+
+    def recover_stale_processing(self) -> int:
+        """
+        Return expired PROCESSING leases to PENDING.
+
+        Call this after rehydrating a durable DLQ on startup. get_pending()
+        also runs it before selecting work, so crashed processors do not leave
+        entries stuck in PROCESSING forever.
+        """
+        with self._lock:
+            recovered_entries = self._release_stale_processing(
+                datetime.now(timezone.utc)
+            )
+
+        for entry in recovered_entries:
+            self._persist_entry(entry)
+        return len(recovered_entries)
     
     def mark_processing(self, entry_id: str) -> bool:
         """Mark an entry as being processed."""
+        entry_to_persist: Optional[DLQEntry] = None
         with self._lock:
             entry = self._entries.get(entry_id)
             if entry and entry.status == DLQEntryStatus.PENDING:
+                now = datetime.now(timezone.utc)
                 entry.status = DLQEntryStatus.PROCESSING
-                entry.last_attempt_at = datetime.now(timezone.utc)
+                entry.last_attempt_at = now
+                entry.processing_deadline = now + self.processing_lease
                 entry.attempt_count += 1
-                return True
-            return False
+                entry_to_persist = entry
+
+        if entry_to_persist:
+            self._persist_entry(entry_to_persist)
+            return True
+        return False
     
     def mark_resolved(
         self,
@@ -1881,31 +2515,44 @@ class DeadLetterQueue:
         resolution_notes: Optional[str] = None
     ) -> bool:
         """Mark an entry as successfully resolved."""
+        entry_to_persist: Optional[DLQEntry] = None
         with self._lock:
             entry = self._entries.get(entry_id)
             if entry:
                 entry.status = DLQEntryStatus.RESOLVED
+                entry.processing_deadline = None
                 entry.resolution_notes = resolution_notes
                 self._total_resolved += 1
-                
-                if self.on_entry_resolved:
-                    self.on_entry_resolved(entry)
-                
-                return True
-            return False
+                entry_to_persist = entry
+                self._remove_active_entry(entry_id)
+
+        if entry_to_persist:
+            self._persist_entry(entry_to_persist)
+            if self.on_entry_resolved:
+                self.on_entry_resolved(entry_to_persist)
+            return True
+        return False
     
     def mark_failed(self, entry_id: str) -> bool:
         """Mark a reprocessing attempt as failed, return to pending."""
+        entry_to_persist: Optional[DLQEntry] = None
         with self._lock:
             entry = self._entries.get(entry_id)
             if entry:
                 if entry.attempt_count >= self.max_reprocess_attempts:
                     entry.status = DLQEntryStatus.DISCARDED
+                    entry.processing_deadline = None
                     self._total_discarded += 1
+                    self._remove_active_entry(entry_id)
                 else:
                     entry.status = DLQEntryStatus.PENDING
-                return True
-            return False
+                    entry.processing_deadline = None
+                entry_to_persist = entry
+
+        if entry_to_persist:
+            self._persist_entry(entry_to_persist)
+            return True
+        return False
     
     def discard(
         self,
@@ -1913,14 +2560,21 @@ class DeadLetterQueue:
         reason: Optional[str] = None
     ) -> bool:
         """Manually discard an entry."""
+        entry_to_persist: Optional[DLQEntry] = None
         with self._lock:
             entry = self._entries.get(entry_id)
             if entry:
                 entry.status = DLQEntryStatus.DISCARDED
+                entry.processing_deadline = None
                 entry.resolution_notes = reason
                 self._total_discarded += 1
-                return True
-            return False
+                entry_to_persist = entry
+                self._remove_active_entry(entry_id)
+
+        if entry_to_persist:
+            self._persist_entry(entry_to_persist)
+            return True
+        return False
     
     def get_metrics(self) -> Dict[str, Any]:
         """Get DLQ metrics for monitoring."""
@@ -1959,17 +2613,32 @@ class DLQProcessor:
         dlq: DeadLetterQueue,
         reprocess_fn: Callable[[Dict[str, Any]], Any],
         batch_size: int = 10,
-        interval: timedelta = timedelta(minutes=5)
+        interval: timedelta = timedelta(minutes=5),
+        reprocess_timeout: Optional[timedelta] = timedelta(minutes=2),
+        blocking_executor: Optional[Executor] = None,
+        max_blocking_workers: int = 4
     ):
+        if reprocess_timeout is not None and reprocess_timeout <= timedelta(0):
+            raise ValueError("reprocess_timeout must be positive")
+        if max_blocking_workers <= 0:
+            raise ValueError("max_blocking_workers must be positive")
+
         self.dlq = dlq
         self.reprocess_fn = reprocess_fn
         self.batch_size = batch_size
         self.interval = interval
+        self.reprocess_timeout = reprocess_timeout
+        self._owns_executor = blocking_executor is None
+        self._blocking_executor = blocking_executor or ThreadPoolExecutor(
+            max_workers=max_blocking_workers,
+            thread_name_prefix="dlq-reprocess"
+        )
         self._running = False
         self._task: Optional[asyncio.Task] = None
     
     async def start(self) -> None:
         """Start the DLQ processor."""
+        self.dlq.recover_stale_processing()
         self._running = True
         self._task = asyncio.create_task(self._process_loop())
         logger.info("DLQ processor started")
@@ -1983,6 +2652,8 @@ class DLQProcessor:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self._owns_executor:
+            self._blocking_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("DLQ processor stopped")
     
     async def _process_loop(self) -> None:
@@ -2004,7 +2675,7 @@ class DLQProcessor:
                 continue
             
             try:
-                await self.reprocess_fn(entry.original_request)
+                await self._run_reprocess(entry.original_request)
                 self.dlq.mark_resolved(entry.id, "Automatic reprocessing succeeded")
                 logger.info(f"DLQ entry {entry.id} resolved")
             except Exception as e:
@@ -2014,11 +2685,35 @@ class DLQProcessor:
                     extra={"attempt": entry.attempt_count}
                 )
 
+    async def _run_reprocess(self, request: Dict[str, Any]) -> Any:
+        """Run one reprocessor with a per-entry timeout."""
+        async def invoke() -> Any:
+            if inspect.iscoroutinefunction(self.reprocess_fn):
+                return await self.reprocess_fn(request)
+
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                self._blocking_executor,
+                self.reprocess_fn,
+                request
+            )
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        if self.reprocess_timeout is None:
+            return await invoke()
+
+        return await asyncio.wait_for(
+            invoke(),
+            timeout=self.reprocess_timeout.total_seconds()
+        )
+
 # ============================================================================
 # Block 13 (chapter listing #13)
 # ============================================================================
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timedelta, timezone
@@ -2057,42 +2752,103 @@ class ErrorAggregator:
         self,
         window_size: timedelta = timedelta(hours=1),
         pattern_threshold: int = 3,
-        max_samples_per_pattern: int = 5
+        max_samples_per_pattern: int = 5,
+        max_patterns: int = 1000,
+        max_temporal_buckets: int = 120,
+        max_affected_operations: int = 25,
+        max_errors_per_window: int = 10_000,
+        max_errors_per_bucket: int = 1_000,
     ):
         self.window_size = window_size
         self.pattern_threshold = pattern_threshold
         self.max_samples_per_pattern = max_samples_per_pattern
+        self.max_patterns = max(1, max_patterns)
+        self.max_temporal_buckets = max(1, max_temporal_buckets)
+        self.max_affected_operations = max(1, max_affected_operations)
+        self.max_errors_per_window = max(1, max_errors_per_window)
+        self.max_errors_per_bucket = max(1, max_errors_per_bucket)
         
-        self._errors: List[AgentError] = []
+        self._errors = deque(maxlen=self.max_errors_per_window)
         self._patterns: Dict[str, ErrorPattern] = {}
         self._lock = threading.Lock()
         
         # Correlation tracking
         self._component_correlations: Dict[Tuple[str, str], int] = defaultdict(int)
-        self._temporal_buckets: Dict[str, List[AgentError]] = defaultdict(list)
+        self._temporal_buckets = defaultdict(
+            lambda: deque(maxlen=self.max_errors_per_bucket)
+        )
     
     def record(self, error: AgentError) -> None:
         """Record an error for aggregation."""
         with self._lock:
             self._errors.append(error)
-            self._cleanup_old_errors()
+            self._cleanup_windowed_state()
+    
+    def _cleanup_windowed_state(self) -> None:
+        """Keep all aggregate state scoped to the analysis window."""
+        cutoff = datetime.now(timezone.utc) - self.window_size
+        self._errors = deque(
+            (e for e in self._errors if e.timestamp > cutoff),
+            maxlen=self.max_errors_per_window
+        )
+        self._patterns.clear()
+        self._component_correlations.clear()
+        self._temporal_buckets = defaultdict(
+            lambda: deque(maxlen=self.max_errors_per_bucket)
+        )
+
+        for error in self._errors:
             self._update_patterns(error)
             self._update_correlations(error)
-    
-    def _cleanup_old_errors(self) -> None:
-        """Remove errors outside the analysis window."""
-        cutoff = datetime.now(timezone.utc) - self.window_size
-        self._errors = [e for e in self._errors if e.timestamp > cutoff]
-    
+
+        self._expire_temporal_buckets(cutoff)
+        self._cap_patterns()
+
+    def _expire_temporal_buckets(self, cutoff: datetime) -> None:
+        """Drop old or excess temporal buckets, then rebuild correlations."""
+        bucket_cutoff = cutoff.strftime("%Y-%m-%d-%H-%M")
+        for bucket_key in list(self._temporal_buckets):
+            if bucket_key < bucket_cutoff:
+                del self._temporal_buckets[bucket_key]
+
+        if len(self._temporal_buckets) > self.max_temporal_buckets:
+            keep = set(sorted(self._temporal_buckets)[-self.max_temporal_buckets:])
+            for bucket_key in list(self._temporal_buckets):
+                if bucket_key not in keep:
+                    del self._temporal_buckets[bucket_key]
+
+        self._component_correlations.clear()
+        for bucket_errors in self._temporal_buckets.values():
+            bucket_snapshot = list(bucket_errors)
+            for index, error in enumerate(bucket_snapshot):
+                if not error.component:
+                    continue
+                for other in bucket_snapshot[:index]:
+                    if other.component and other.component != error.component:
+                        pair = tuple(sorted([error.component, other.component]))
+                        self._component_correlations[pair] += 1
+
+    def _cap_patterns(self) -> None:
+        """Bound retained patterns by count, keeping frequent recent patterns."""
+        if len(self._patterns) <= self.max_patterns:
+            return
+
+        ranked = sorted(
+            self._patterns.items(),
+            key=lambda item: (item[1].occurrence_count, item[1].last_seen),
+            reverse=True
+        )
+        self._patterns = dict(ranked[:self.max_patterns])
+
     def _get_message_signature(self, message: str) -> str:
         """
         Create a signature from an error message for grouping.
-        
+
         Normalizes variable parts (IDs, timestamps, etc.) to group
         similar errors together.
         """
         import re
-        
+
         # Replace UUIDs
         signature = re.sub(
             r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
@@ -2100,29 +2856,33 @@ class ErrorAggregator:
             message,
             flags=re.IGNORECASE
         )
-        
+
         # Replace numbers
         signature = re.sub(r'\b\d+\b', '<NUM>', signature)
-        
+
         # Replace quoted strings
         signature = re.sub(r'"[^"]*"', '"<STR>"', signature)
         signature = re.sub(r"'[^']*'", "'<STR>'", signature)
-        
+
         # Normalize whitespace
         signature = ' '.join(signature.split())
-        
+
         return signature[:200]  # Limit signature length
-    
+
     def _update_patterns(self, error: AgentError) -> None:
         """Update pattern tracking with new error."""
         signature = self._get_message_signature(error.message)
         pattern_key = f"{error.category.name}:{error.component}:{signature}"
-        
+
         if pattern_key in self._patterns:
             pattern = self._patterns[pattern_key]
             pattern.occurrence_count += 1
             pattern.last_seen = error.timestamp
-            if error.context.get("operation"):
+            if (
+                error.context.get("operation")
+                and error.context["operation"] not in pattern.affected_operations
+                and len(pattern.affected_operations) < self.max_affected_operations
+            ):
                 pattern.affected_operations.append(error.context["operation"])
             if len(pattern.sample_errors) < self.max_samples_per_pattern:
                 pattern.sample_errors.append(error)
@@ -2137,81 +2897,104 @@ class ErrorAggregator:
                 affected_operations=[error.context.get("operation", "unknown")],
                 sample_errors=[error]
             )
-    
+
     def _update_correlations(self, error: AgentError) -> None:
         """Track correlations between component failures."""
         # Bucket by minute for temporal correlation
         bucket_key = error.timestamp.strftime("%Y-%m-%d-%H-%M")
         self._temporal_buckets[bucket_key].append(error)
-        
+
         # Check for correlations in the same time bucket
-        bucket_errors = self._temporal_buckets[bucket_key]
+        bucket_errors = list(self._temporal_buckets[bucket_key])
         if len(bucket_errors) > 1 and error.component:
             for other in bucket_errors[:-1]:
                 if other.component and other.component != error.component:
                     pair = tuple(sorted([error.component, other.component]))
                     self._component_correlations[pair] += 1
-    
+
     def get_patterns(
         self,
         min_occurrences: Optional[int] = None
     ) -> List[ErrorPattern]:
         """Get detected error patterns, optionally filtered by occurrence count."""
         threshold = min_occurrences or self.pattern_threshold
-        
+
         with self._lock:
-            return [
-                pattern for pattern in self._patterns.values()
-                if pattern.occurrence_count >= threshold
-            ]
-    
+            self._cleanup_windowed_state()
+            return self._get_patterns_unlocked(threshold)
+
+    def _get_patterns_unlocked(self, threshold: int) -> List[ErrorPattern]:
+        return [
+            pattern for pattern in self._patterns.values()
+            if pattern.occurrence_count >= threshold
+        ]
+
     def get_top_patterns(self, limit: int = 10) -> List[ErrorPattern]:
         """Get the most frequent error patterns."""
-        patterns = self.get_patterns(min_occurrences=1)
-        patterns.sort(key=lambda p: p.occurrence_count, reverse=True)
+        with self._lock:
+            self._cleanup_windowed_state()
+            return self._get_top_patterns_unlocked(limit)
+
+    def _get_top_patterns_unlocked(self, limit: int = 10) -> List[ErrorPattern]:
+        patterns = self._get_patterns_unlocked(1)
+        patterns.sort(key=lambda p: (p.occurrence_count, p.last_seen), reverse=True)
         return patterns[:limit]
-    
+
     def get_correlations(
         self,
         min_correlation: int = 2
     ) -> List[Tuple[str, str, int]]:
         """Get correlated component failures."""
         with self._lock:
-            correlations = [
-                (comp1, comp2, count)
-                for (comp1, comp2), count in self._component_correlations.items()
-                if count >= min_correlation
-            ]
-            correlations.sort(key=lambda x: x[2], reverse=True)
-            return correlations
-    
+            self._cleanup_windowed_state()
+            return self._get_correlations_unlocked(min_correlation)
+
+    def _get_correlations_unlocked(
+        self,
+        min_correlation: int = 2
+    ) -> List[Tuple[str, str, int]]:
+        correlations = [
+            (comp1, comp2, count)
+            for (comp1, comp2), count in self._component_correlations.items()
+            if count >= min_correlation
+        ]
+        correlations.sort(key=lambda x: x[2], reverse=True)
+        return correlations
+
     def get_error_rate_by_category(self) -> Dict[str, float]:
         """Get error rate per hour by category."""
         with self._lock:
-            if not self._errors:
-                return {}
-            
-            window_hours = self.window_size.total_seconds() / 3600
-            category_counts = defaultdict(int)
-            
-            for error in self._errors:
-                category_counts[error.category.name] += 1
-            
-            return {
-                category: count / window_hours
-                for category, count in category_counts.items()
-            }
+            self._cleanup_windowed_state()
+            return self._get_error_rate_by_category_unlocked()
+
+    def _get_error_rate_by_category_unlocked(self) -> Dict[str, float]:
+        if not self._errors:
+            return {}
+
+        window_hours = self.window_size.total_seconds() / 3600
+        category_counts = defaultdict(int)
+
+        for error in self._errors:
+            category_counts[error.category.name] += 1
+
+        return {
+            category: count / window_hours
+            for category, count in category_counts.items()
+        }
     
     def get_summary(self) -> Dict[str, Any]:
         """Get comprehensive error aggregation summary."""
         with self._lock:
-            patterns = self.get_patterns()
-            correlations = self.get_correlations()
+            self._cleanup_windowed_state()
+            patterns = self._get_patterns_unlocked(self.pattern_threshold)
+            top_patterns = self._get_top_patterns_unlocked(5)
+            correlations = self._get_correlations_unlocked()
+            error_rate_by_category = self._get_error_rate_by_category_unlocked()
             
             return {
                 "total_errors": len(self._errors),
                 "unique_patterns": len(patterns),
-                "error_rate_by_category": self.get_error_rate_by_category(),
+                "error_rate_by_category": error_rate_by_category,
                 "top_patterns": [
                     {
                         "signature": p.message_signature[:100],
@@ -2220,7 +3003,7 @@ class ErrorAggregator:
                         "count": p.occurrence_count,
                         "frequency_per_hour": round(p.frequency, 2)
                     }
-                    for p in self.get_top_patterns(5)
+                    for p in top_patterns
                 ],
                 "component_correlations": [
                     {"components": [c1, c2], "correlation_count": count}
@@ -2247,10 +3030,19 @@ llm_circuit = CircuitBreaker(
 )
 
 @with_retry(max_retries=3, base_delay=1.0)
-async def get_product_recommendation(user_query: str) -> str:
+async def get_product_recommendation(
+    user_query: str,
+    fallback_chain: FallbackChain[str]
+) -> str:
+    async def recommendation_fallback() -> str:
+        result = await fallback_chain.execute({
+            "messages": [{"role": "user", "content": user_query}]
+        })
+        return result.value
+
     return await llm_circuit.execute_async(
         lambda: llm_client.complete(user_query),
-        fallback=lambda: fallback_chain.execute({"query": user_query})
+        fallback=recommendation_fallback
     )
 
 # ============================================================================
@@ -2314,14 +3106,29 @@ if __name__ == "__main__":
 # Block 17 (chapter listing #17)
 # ============================================================================
 
-async def handle_with_resilience(request: UserRequest) -> Response:
-    fallback_chain = await create_production_fallback_chain()
-    degradation_manager = setup_agent_degradation()
+async def handle_with_resilience(
+    request: UserRequest,
+    fallback_chain_factory: Callable[[], Awaitable[FallbackChain[str]]],
+    simple_response_handler: Callable[[UserRequest], Awaitable[Response]],
+    cached_response_handler: Callable[[UserRequest], Awaitable[Response]],
+    dead_letter_queue: DeadLetterQueue,
+    error_classifier: Optional[ErrorClassifier] = None,
+    degradation_manager: Optional[DegradationManager] = None
+) -> Response:
+    """Handle a request with injected resilience collaborators.
+
+    The chapter's production app wires these dependencies at startup. Keeping
+    them explicit avoids import-time NameError failures when readers reuse this
+    function outside the demo ``__main__`` blocks.
+    """
+    fallback_chain = await fallback_chain_factory()
+    degradation_manager = degradation_manager or setup_agent_degradation()
+    error_classifier = error_classifier or ErrorClassifier()
     
     try:
         # Check degradation level first
         if not degradation_manager.is_available("multi_step_reasoning"):
-            return await simple_response(request)
+            return await simple_response_handler(request)
         
         # Try with fallback chain
         result = await fallback_chain.execute({
@@ -2339,12 +3146,12 @@ async def handle_with_resilience(request: UserRequest) -> Response:
         
     except Exception as e:
         # Last resort: add to DLQ and return cached response
-        dlq.add(
+        dead_letter_queue.add(
             request=request.to_dict(),
             error_context=AgentErrorContext(
-                error=classifier.classify(e),
+                error=error_classifier.classify(e),
                 agent_id="orchestrator",
                 agent_type="main"
             )
         )
-        return await cached_response(request)
+        return await cached_response_handler(request)

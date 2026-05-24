@@ -73,44 +73,62 @@ Code Navigation (line numbers are approximate):
 """
 
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Callable, Optional
-import botocore.exceptions
+from typing import Any, Callable, Optional, Protocol
+import http.client
+import importlib.util as _importlib_util
+import queue
+import sys as _sys
+import sysconfig as _sysconfig
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _optional import optional_import  # noqa: E402
+
+# botocore is an optional provider SDK; guard it so the module imports
+# cleanly without AWS installed. Bind the exceptions namespace directly;
+# this file's name makes indirect `botocore.exceptions` paths easy to
+# misbind in tests and minimal environments.
+botocore_exceptions = optional_import(
+    "botocore.exceptions", stub_exception_names=("ClientError",)
+)
 import hashlib
 import json
 import logging
-import secrets
+import random
 import threading
 import time
+from urllib.parse import urlparse
 import weakref
 
-try:  # Optional provider SDK; keep this module importable without it.
-    import hvac  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover - dependency not required for examples
-    class _HvacStub:
-        """Fallback shim so ``except hvac.exceptions.*`` clauses still resolve.
+# Use the shared optional-import helper so the stub exception classes
+# inherit from RetryableError (matching the other guarded SDKs in this
+# repo) and so this file does not redefine the fallback pattern inline.
+hvac = optional_import(
+    "hvac",
+    stub_exception_names=("VaultError", "Forbidden", "InvalidPath"),
+)
 
-        When the real ``hvac`` package is not installed, the Vault provider's
-        error-handling clauses (``except hvac.exceptions.Forbidden`` and
-        friends) would otherwise raise ``NameError`` at except-evaluation
-        time. The stub exposes the exception names this module references;
-        the stub classes never actually fire because no real call site can
-        raise them.
-        """
 
-        class exceptions:
-            class VaultError(Exception):
-                pass
+def _load_stdlib_secrets():
+    """Load stdlib secrets without resolving to this chapter's secrets.py."""
 
-            class Forbidden(VaultError):
-                pass
+    stdlib_secrets_path = _Path(_sysconfig.get_path("stdlib")) / "secrets.py"
+    spec = _importlib_util.spec_from_file_location(
+        "_book2_stdlib_secrets",
+        stdlib_secrets_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load stdlib secrets from {stdlib_secrets_path}")
 
-            class InvalidPath(VaultError):
-                pass
+    module = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    hvac = _HvacStub  # type: ignore[assignment,misc]
+
+_stdlib_secrets = _load_stdlib_secrets()
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +159,13 @@ class CachedSecret:
     metadata: SecretMetadata
     cached_at: datetime
     ttl_seconds: int
-    
+
+    def __post_init__(self) -> None:
+        # Coerce naive datetimes to UTC so ``is_expired`` does not raise
+        # TypeError when subtracting against ``datetime.now(timezone.utc)``.
+        if self.cached_at.tzinfo is None:
+            self.cached_at = self.cached_at.replace(tzinfo=timezone.utc)
+
     @property
     def is_expired(self) -> bool:
         """Check if the cached value has expired."""
@@ -177,8 +201,10 @@ class StructuredAuditLogger(AuditLogger):
     """
     Structured audit logger that outputs JSON-formatted events.
     
-    In production, this would write to a secure, append-only log
-    aggregation system like Splunk, ELK, or CloudWatch Logs.
+    This logger formats security-relevant metadata; it must not receive
+    secret values or sensitive payloads in event context. Tamper evidence
+    requires shipping these events to an append-only or Chapter 4-style
+    tamper-evident audit store.
     """
     
     def __init__(
@@ -257,7 +283,14 @@ class SecretBackendProvider(ABC):
     @abstractmethod
     def revoke_secret(self, secret_id: str, version: Optional[str] = None) -> None:
         """
-        Revoke a secret, making it immediately invalid.
+        Request backend-specific revocation or deletion.
+
+        Revocation semantics are intentionally provider-specific: Vault KV v2
+        can destroy a stored version or delete metadata, AWS Secrets Manager can
+        remove staging labels or schedule secret deletion, and the environment
+        provider cannot revoke. None of these operations can invalidate copies
+        already fetched by other processes or credentials already accepted by a
+        downstream service.
         
         Args:
             secret_id: The identifier of the secret to revoke.
@@ -298,13 +331,30 @@ class HashiCorpVaultProvider(SecretBackendProvider):
         role_id: str,
         secret_id: str,
         namespace: Optional[str] = None,
-        mount_point: str = "secret"
+        mount_point: str = "secret",
+        max_retries: int = 2,
+        retry_base_delay: float = 0.25,
+        retry_max_delay: float = 2.0,
+        connect_timeout: float = 5.0,
+        read_timeout: float = 10.0,
     ):
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if retry_base_delay <= 0 or retry_max_delay <= 0:
+            raise ValueError("retry delays must be positive")
+        if connect_timeout <= 0 or read_timeout <= 0:
+            raise ValueError("timeouts must be positive")
+
         self._vault_addr = vault_addr
         self._role_id = role_id
         self._secret_id = secret_id
         self._namespace = namespace
         self._mount_point = mount_point
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._retry_max_delay = retry_max_delay
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
         self._client: Optional[Any] = None
         self._token_expiry: Optional[datetime] = None
         self._lock = threading.Lock()
@@ -317,25 +367,35 @@ class HashiCorpVaultProvider(SecretBackendProvider):
             # Check if we need to re-authenticate
             if self._client is None or self._is_token_expired():
                 # Explicit (connect, read) timeouts so a hung Vault doesn't
-                # freeze the calling agent; 5s connect / 10s read fits typical
-                # WAN deployments. Raise for high-latency network paths and
-                # tune in conjunction with the retry policy below.
-                self._client = hvac.Client(
+                # freeze the calling agent; defaults of 5s connect / 10s read
+                # fit typical WAN deployments. Raise via constructor for
+                # high-latency network paths and tune alongside the retry
+                # policy below.
+                client = hvac.Client(
                     url=self._vault_addr,
                     namespace=self._namespace,
-                    timeout=(5, 10),
+                    timeout=(self._connect_timeout, self._read_timeout),
                 )
                 
                 # Authenticate with AppRole
-                auth_response = self._client.auth.approle.login(
-                    role_id=self._role_id,
-                    secret_id=self._secret_id
+                auth_response = self._with_retry(
+                    "vault approle login",
+                    lambda: client.auth.approle.login(
+                        role_id=self._role_id,
+                        secret_id=self._secret_id
+                    )
                 )
                 
                 # Track token expiry for renewal
                 # Note: lease_duration behavior may vary by Vault version (tested with Vault 1.12+)
-                ttl = auth_response['auth']['lease_duration']
-                self._token_expiry = datetime.now(timezone.utc) + timedelta(seconds=ttl - 60)
+                ttl = int(auth_response['auth']['lease_duration'])
+                renewal_margin = min(60, max(1, ttl // 10))
+                refresh_after = max(1, ttl - renewal_margin)
+                self._token_expiry = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=refresh_after)
+                )
+                self._client = client
                 
             return self._client
     
@@ -344,6 +404,46 @@ class HashiCorpVaultProvider(SecretBackendProvider):
         if self._token_expiry is None:
             return True
         return datetime.now(timezone.utc) >= self._token_expiry
+
+    def _retry_delay(self, attempt: int) -> float:
+        """Calculate exponential backoff with full jitter."""
+        cap = min(
+            self._retry_max_delay,
+            self._retry_base_delay * (2 ** (attempt - 1))
+        )
+        return random.uniform(0, cap)
+
+    def _is_retryable_vault_error(self, error: Exception) -> bool:
+        """Return True for transient Vault failures worth retrying."""
+        status_code = getattr(error, "status_code", None)
+        if status_code is None:
+            response = getattr(error, "response", None)
+            status_code = getattr(response, "status_code", None)
+        if status_code is None:
+            return True
+        return status_code in {429, 500, 502, 503, 504}
+
+    def _with_retry(self, operation_name: str, operation: Callable[[], Any]) -> Any:
+        """Run a Vault operation with bounded retries and jitter."""
+        attempts = self._max_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+            except (hvac.exceptions.Forbidden, hvac.exceptions.InvalidPath):
+                raise
+            except hvac.exceptions.VaultError as e:
+                if attempt == attempts or not self._is_retryable_vault_error(e):
+                    raise
+                delay = self._retry_delay(attempt)
+                logger.warning(
+                    "%s failed on attempt %s/%s; retrying in %.2fs: %s",
+                    operation_name,
+                    attempt,
+                    attempts,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
         
     def get_secret(self, secret_id: str, version: Optional[str] = None) -> tuple[str, SecretMetadata]:
         """Retrieve a secret from Vault."""
@@ -351,10 +451,13 @@ class HashiCorpVaultProvider(SecretBackendProvider):
         
         try:
             # Read from KV v2 secrets engine
-            response = client.secrets.kv.v2.read_secret_version(
-                path=secret_id,
-                version=int(version) if version else None,
-                mount_point=self._mount_point
+            response = self._with_retry(
+                "vault read secret",
+                lambda: client.secrets.kv.v2.read_secret_version(
+                    path=secret_id,
+                    version=int(version) if version else None,
+                    mount_point=self._mount_point
+                )
             )
             
             data = response['data']
@@ -404,9 +507,12 @@ class HashiCorpVaultProvider(SecretBackendProvider):
         
         # Read current secret to preserve tags
         try:
-            current = client.secrets.kv.v2.read_secret_version(
-                path=secret_id,
-                mount_point=self._mount_point
+            current = self._with_retry(
+                "vault read secret for rotation",
+                lambda: client.secrets.kv.v2.read_secret_version(
+                    path=secret_id,
+                    mount_point=self._mount_point
+                )
             )
             tags = current['data']['data'].get('tags', {})
         except hvac.exceptions.InvalidPath:
@@ -417,35 +523,45 @@ class HashiCorpVaultProvider(SecretBackendProvider):
             )
             tags = {}
 
-        # Generate new secret value. (secrets imported at module top.)
-        new_value = secrets.token_urlsafe(32)
+        # Generate new secret value with the stdlib module loaded under a
+        # private alias so this file cannot shadow it on sys.path.
+        new_value = _stdlib_secrets.token_urlsafe(32)
         
         # Write new version
-        client.secrets.kv.v2.create_or_update_secret(
-            path=secret_id,
-            secret={'value': new_value, 'tags': tags},
-            mount_point=self._mount_point
+        self._with_retry(
+            "vault write rotated secret",
+            lambda: client.secrets.kv.v2.create_or_update_secret(
+                path=secret_id,
+                secret={'value': new_value, 'tags': tags},
+                mount_point=self._mount_point
+            )
         )
         
         # Retrieve updated metadata
         return self.get_secret(secret_id)
     
     def revoke_secret(self, secret_id: str, version: Optional[str] = None) -> None:
-        """Revoke a secret version in Vault."""
+        """Destroy a Vault KV v2 version or delete stored secret metadata."""
         client = self._get_client()
         
         if version:
             # Destroy specific version
-            client.secrets.kv.v2.destroy_secret_versions(
-                path=secret_id,
-                versions=[int(version)],
-                mount_point=self._mount_point
+            self._with_retry(
+                "vault destroy secret version",
+                lambda: client.secrets.kv.v2.destroy_secret_versions(
+                    path=secret_id,
+                    versions=[int(version)],
+                    mount_point=self._mount_point
+                )
             )
         else:
             # Delete all versions (metadata remains)
-            client.secrets.kv.v2.delete_metadata_and_all_versions(
-                path=secret_id,
-                mount_point=self._mount_point
+            self._with_retry(
+                "vault delete secret metadata and versions",
+                lambda: client.secrets.kv.v2.delete_metadata_and_all_versions(
+                    path=secret_id,
+                    mount_point=self._mount_point
+                )
             )
 
 
@@ -461,11 +577,15 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
         self,
         region_name: str = "us-east-1",
         aws_access_key_id: Optional[str] = None,
-        aws_secret_access_key: Optional[str] = None
+        aws_secret_access_key: Optional[str] = None,
+        deletion_recovery_window_days: int = 7
     ):
+        if not 7 <= deletion_recovery_window_days <= 30:
+            raise ValueError("deletion_recovery_window_days must be 7-30")
         self._region_name = region_name
         self._aws_access_key_id = aws_access_key_id
         self._aws_secret_access_key = aws_secret_access_key
+        self._deletion_recovery_window_days = deletion_recovery_window_days
         self._client: Optional[Any] = None
         
     def _get_client(self) -> Any:
@@ -512,7 +632,14 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
                 secret_value = response['SecretString']
             else:
                 import base64
-                secret_value = base64.b64decode(response['SecretBinary']).decode()
+                # Binary secrets may not be valid UTF-8 (DER certificates,
+                # raw key material). ``errors='replace'`` surfaces a logged
+                # value instead of bubbling UnicodeDecodeError to the caller;
+                # the metadata records the original byte length so callers
+                # can detect a non-text payload.
+                secret_value = base64.b64decode(
+                    response['SecretBinary']
+                ).decode("utf-8", errors="replace")
             
             # Get additional metadata
             describe_response = client.describe_secret(SecretId=secret_id)
@@ -539,23 +666,39 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
         
         try:
             # Trigger the rotation Lambda
-            client.rotate_secret(SecretId=secret_id)
+            rotation_response = client.rotate_secret(SecretId=secret_id)
+            pending_version_id = rotation_response.get("VersionId")
             
             # Wait for rotation to complete with exponential backoff + jitter
             # so a flaky describe_secret endpoint does not get hammered by a
             # tight 1-second poll loop. Total budget is roughly the same
             # (~30s worst case) but the backoff distributes load.
-            import random
             max_attempts = 8
             base_delay = 0.5
             cap = 8.0
             for attempt in range(max_attempts):
                 response = client.describe_secret(SecretId=secret_id)
-                if not response.get('RotationInProgress', False):
+                version_stages = response.get("VersionIdsToStages", {})
+                if pending_version_id:
+                    pending_stages = set(
+                        version_stages.get(pending_version_id, [])
+                    )
+                    if (
+                        "AWSCURRENT" in pending_stages
+                        and "AWSPENDING" not in pending_stages
+                    ):
+                        break
+                elif not any(
+                    "AWSPENDING" in stages
+                    for stages in version_stages.values()
+                ):
                     break
                 # Exponential backoff: 0.5, 1, 2, 4, 8, 8, 8, 8 seconds
                 # with full jitter per the AWS exponential-backoff guidance.
                 delay = min(cap, base_delay * (2 ** attempt))
+                logger.debug(
+                    f"rotation poll attempt={attempt} sleeping={delay:.2f}s"
+                )
                 time.sleep(random.uniform(0, delay))
             else:
                 raise SecretRotationError(
@@ -564,27 +707,29 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
             
             return self.get_secret(secret_id)
 
-        except botocore.exceptions.ClientError as e:
+        except botocore_exceptions.ClientError as e:
             raise SecretRotationError(f"Failed to rotate {secret_id}: {e}") from e
             
     def revoke_secret(self, secret_id: str, version: Optional[str] = None) -> None:
-        """Mark a secret for deletion in AWS Secrets Manager."""
+        """Remove an AWS version label or schedule recoverable deletion."""
         client = self._get_client()
         
         if version:
             # AWS doesn't support deleting specific versions directly
-            # We can deprecate by updating version stage
+            # Remove AWSCURRENT from the compromised version to stop normal
+            # default reads without deleting the entire secret record.
             client.update_secret_version_stage(
                 SecretId=secret_id,
                 VersionStage='AWSCURRENT',
                 RemoveFromVersionId=version
             )
         else:
-            # Schedule deletion (minimum 7 days in AWS)
-            # For immediate revocation, update the secret value instead
+            # Schedule recoverable deletion. Do not use force deletion for the
+            # normal recovery path; rotate the credential or remove staging
+            # labels when the emergency objective is to stop future reads.
             client.delete_secret(
                 SecretId=secret_id,
-                ForceDeleteWithoutRecovery=True
+                RecoveryWindowInDays=self._deletion_recovery_window_days
             )
 
 # ============================================================================
@@ -596,27 +741,26 @@ class SecretManager:
     Unified secret management for agentic AI systems.
     
     This class provides a high-level interface for secret management with:
-    - Multi-backend support (Vault, AWS, Azure)
+    - Multi-backend support for Vault and AWS, with Azure as an extension point
     - Automatic caching with TTL
-    - Background rotation monitoring
+    - Lazy background rotation monitoring for registered callbacks
     - Comprehensive audit logging
     - Scope-based access control
     
     Example:
-        >>> manager = SecretManager(
+        >>> with SecretManager(
         ...     agent_id="research-agent-1",
         ...     agent_role="research",
         ...     backend=SecretBackend.AWS_SECRETS_MANAGER,
         ...     backend_config={"region_name": "us-east-1"}
-        ... )
-        >>> 
-        >>> # Get a secret with automatic caching
-        >>> api_key = manager.get_secret("openai/api-key")
-        >>> 
-        >>> # Use context manager for JIT injection
-        >>> with manager.scoped_secret("sensitive/payment-key") as key:
-        ...     process_payment(key)
-        >>> # Secret is cleared from memory after context exits
+        ... ) as manager:
+        ...     # Get a secret with automatic caching
+        ...     api_key = manager.get_secret("openai/api-key")
+        ...
+        ...     # Use context manager for JIT injection
+        ...     with manager.scoped_secret("sensitive/payment-key") as key:
+        ...         process_payment(key)
+        ...     # Manager-held references are dropped after context exit
     """
     
     def __init__(
@@ -628,7 +772,7 @@ class SecretManager:
         allowed_secret_patterns: Optional[list[str]] = None,
         default_cache_ttl: int = 300,
         audit_logger: Optional[AuditLogger] = None,
-        rotation_check_interval: int = 3600
+        rotation_check_interval: Optional[int] = 3600
     ):
         """
         Initialize the SecretManager.
@@ -642,16 +786,24 @@ class SecretManager:
             default_cache_ttl: Default cache TTL in seconds.
             audit_logger: Custom audit logger implementation.
             rotation_check_interval: How often to check for rotation needs (seconds).
+                Set to None to disable the background monitor. The monitor starts
+                lazily when the first rotation callback is registered.
         """
+        if rotation_check_interval is not None and rotation_check_interval <= 0:
+            raise ValueError("rotation_check_interval must be positive or None")
+
         self._agent_id = agent_id
         self._agent_role = agent_role
         self._allowed_patterns = allowed_secret_patterns or ["*"]
         self._default_cache_ttl = default_cache_ttl
         self._audit_logger = audit_logger or StructuredAuditLogger()
         self._rotation_check_interval = rotation_check_interval
+        provider_config = dict(backend_config)
+        if backend == SecretBackend.ENVIRONMENT:
+            self._validate_environment_backend(provider_config)
         
         # Initialize backend provider
-        self._provider = self._create_provider(backend, backend_config)
+        self._provider = self._create_provider(backend, provider_config)
         
         # Secret cache (bounded to avoid unbounded growth in long-running agents)
         from cachetools import TTLCache
@@ -662,9 +814,56 @@ class SecretManager:
         self._rotation_callbacks: dict[str, list[Callable[[str, str], None]]] = {}
         self._rotation_monitor_thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
         
-        # Start rotation monitor
-        self._start_rotation_monitor()
+        # The monitor starts only after a callback is registered, avoiding one
+        # daemon thread per short-lived manager that never uses rotation events.
+
+    def __enter__(self) -> "SecretManager":
+        """Enter a managed lifecycle for the secret manager."""
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Close the manager and drop cached references on context exit."""
+        self.close()
+
+    def _validate_environment_backend(self, config: dict[str, Any]) -> None:
+        """Reject the development-only environment backend in production."""
+        import os
+
+        environment = os.environ.get("ENVIRONMENT", "").strip().lower()
+        development_override = (
+            config.pop("allow_environment_backend_in_production", False) is True
+        )
+        if environment not in {"production", "prod"} or development_override:
+            return
+
+        error = (
+            "Environment secret backend is development-only; set "
+            "allow_environment_backend_in_production=True only for an explicit "
+            "development override."
+        )
+        context = {
+            "backend": SecretBackend.ENVIRONMENT.value,
+            "environment": environment,
+            "development_override": False,
+        }
+        self._audit(
+            "secret_backend_configuration",
+            "backend/environment",
+            "configure",
+            "denied",
+            context=context,
+            error=error,
+        )
+        logger.warning(
+            "Denied environment secret backend while ENVIRONMENT=%s",
+            environment,
+            extra=context,
+        )
+        raise SecretAccessDeniedError(error)
         
     def _create_provider(
         self,
@@ -677,12 +876,19 @@ class SecretManager:
         elif backend == SecretBackend.AWS_SECRETS_MANAGER:
             return AWSSecretsManagerProvider(**config)
         elif backend == SecretBackend.AZURE_KEY_VAULT:
-            # Azure implementation would go here
-            raise NotImplementedError("Azure Key Vault support coming soon")
+            # Extension point for readers who need an Azure Key Vault provider.
+            raise NotImplementedError(
+                "Azure Key Vault provider is an extension point in this chapter"
+            )
         elif backend == SecretBackend.ENVIRONMENT:
             return EnvironmentSecretProvider(**config)
         else:
             raise ValueError(f"Unknown backend: {backend}")
+
+    def _ensure_open(self) -> None:
+        """Raise if this manager has already been closed."""
+        if self._closed:
+            raise RuntimeError("SecretManager is closed")
             
     def _is_secret_allowed(self, secret_id: str) -> bool:
         """Check if this agent is allowed to access the specified secret."""
@@ -732,7 +938,7 @@ class SecretManager:
         Args:
             secret_id: The identifier of the secret to retrieve.
             version: Optional specific version to retrieve.
-            bypass_cache: If True, skip the cache and fetch fresh.
+            bypass_cache: If True, skip cache reads and writes.
             cache_ttl: Override the default cache TTL for this secret.
             context: Additional context for audit logging.
             
@@ -743,6 +949,8 @@ class SecretManager:
             SecretAccessDeniedError: If this agent cannot access the secret.
             SecretNotFoundError: If the secret does not exist.
         """
+        self._ensure_open()
+
         # Check access control
         if not self._is_secret_allowed(secret_id):
             self._audit(
@@ -758,7 +966,7 @@ class SecretManager:
                 f"is not allowed to access secret {secret_id}"
             )
         
-        cache_key = f"{secret_id}:{version or 'latest'}"
+        cache_key = f"{secret_id}:{version or 'default'}"
         
         # Check cache first (unless bypassing)
         if not bypass_cache:
@@ -780,17 +988,19 @@ class SecretManager:
         try:
             value, metadata = self._provider.get_secret(secret_id, version)
             
-            # Cache the result
-            ttl = cache_ttl or self._default_cache_ttl
-            cached_secret = CachedSecret(
-                value=value,
-                metadata=metadata,
-                cached_at=datetime.now(timezone.utc),
-                ttl_seconds=ttl
-            )
-            
-            with self._cache_lock:
-                self._cache[cache_key] = cached_secret
+            # Cache only normal reads. JIT and explicit fresh-fetch callers
+            # should not leave a manager-held cached reference behind.
+            if not bypass_cache:
+                ttl = cache_ttl or self._default_cache_ttl
+                cached_secret = CachedSecret(
+                    value=value,
+                    metadata=metadata,
+                    cached_at=datetime.now(timezone.utc),
+                    ttl_seconds=ttl
+                )
+
+                with self._cache_lock:
+                    self._cache[cache_key] = cached_secret
             
             self._audit(
                 "secret_access",
@@ -820,17 +1030,19 @@ class SecretManager:
         context: Optional[dict] = None
     ) -> "ScopedSecretContext":
         """
-        Get a secret with automatic cleanup via context manager.
+        Get a secret with scoped manager-held references.
         
         This implements just-in-time secret injection. The secret is
-        fetched when entering the context and cleared from memory
-        when exiting.
+        fetched when entering the context and the context manager's
+        reference is dropped when exiting. Python string zeroization
+        cannot be proven from application code.
         
         Example:
             >>> with manager.scoped_secret("api/key") as key:
             ...     make_api_call(key)
-            >>> # key is now cleared from memory
+            >>> # manager-held reference has been dropped
         """
+        self._ensure_open()
         return ScopedSecretContext(self, secret_id, context)
         
     def invalidate_cache(self, secret_id: Optional[str] = None) -> None:
@@ -841,6 +1053,7 @@ class SecretManager:
             secret_id: If provided, invalidate only this secret.
                       If None, invalidate all cached secrets.
         """
+        self._ensure_open()
         with self._cache_lock:
             if secret_id:
                 keys_to_remove = [
@@ -864,9 +1077,13 @@ class SecretManager:
             secret_id: The secret to monitor.
             callback: Function to call with (secret_id, new_version).
         """
-        if secret_id not in self._rotation_callbacks:
-            self._rotation_callbacks[secret_id] = []
-        self._rotation_callbacks[secret_id].append(callback)
+        with self._lifecycle_lock:
+            self._ensure_open()
+            if secret_id not in self._rotation_callbacks:
+                self._rotation_callbacks[secret_id] = []
+            self._rotation_callbacks[secret_id].append(callback)
+
+        self._start_rotation_monitor()
         
     def force_rotation(
         self,
@@ -883,6 +1100,7 @@ class SecretManager:
         Returns:
             The new secret value.
         """
+        self._ensure_open()
         if not self._is_secret_allowed(secret_id):
             self._audit(
                 "secret_rotation",
@@ -940,14 +1158,17 @@ class SecretManager:
         """
         Emergency revocation of a secret.
         
-        This immediately invalidates the secret. Use with caution
-        as it may disrupt running operations.
+        This requests the backend's revocation operation and invalidates this
+        manager's cache. It does not guarantee immediate invalidation of copies
+        already fetched by other agents, open connections, or static credentials
+        that must be disabled in the downstream service.
         
         Args:
             secret_id: The secret to revoke.
             version: Optional specific version to revoke.
             context: Additional context for audit logging.
         """
+        self._ensure_open()
         self._audit(
             "secret_revocation",
             secret_id,
@@ -985,16 +1206,32 @@ class SecretManager:
             raise
             
     def _start_rotation_monitor(self) -> None:
-        """Start the background rotation monitoring thread."""
-        self._rotation_monitor_thread = threading.Thread(
-            target=self._rotation_monitor_loop,
-            daemon=True,
-            name=f"SecretRotationMonitor-{self._agent_id}"
-        )
-        self._rotation_monitor_thread.start()
+        """Start the background rotation monitor if configured and needed."""
+        if self._rotation_check_interval is None:
+            return
+
+        with self._lifecycle_lock:
+            if self._closed or not self._rotation_callbacks:
+                return
+            if (
+                self._rotation_monitor_thread
+                and self._rotation_monitor_thread.is_alive()
+            ):
+                return
+
+            self._shutdown_event.clear()
+            self._rotation_monitor_thread = threading.Thread(
+                target=self._rotation_monitor_loop,
+                daemon=True,
+                name=f"SecretRotationMonitor-{self._agent_id}"
+            )
+            self._rotation_monitor_thread.start()
         
     def _rotation_monitor_loop(self) -> None:
         """Background loop that checks for needed rotations."""
+        if self._rotation_check_interval is None:
+            return
+
         while not self._shutdown_event.is_set():
             try:
                 self._check_rotation_due()
@@ -1005,41 +1242,68 @@ class SecretManager:
             
     def _check_rotation_due(self) -> None:
         """Check all monitored secrets for rotation needs."""
+        due_callbacks: list[tuple[str, Callable[[str, str], None]]] = []
+
         with self._cache_lock:
+            now = datetime.now(timezone.utc)
             for cache_key, cached in list(self._cache.items()):
                 if cached.metadata.rotation_due:
-                    if datetime.now(timezone.utc) >= cached.metadata.rotation_due:
+                    if now >= cached.metadata.rotation_due:
                         secret_id = cached.metadata.secret_id
                         logger.info(f"Secret {secret_id} is due for rotation")
-                        # Trigger rotation callbacks
+
+                        # Copy callbacks while holding the cache lock, then
+                        # invoke them after release so callbacks can fetch
+                        # fresh secrets without deadlocking this manager.
                         for callback in self._rotation_callbacks.get(secret_id, []):
-                            try:
-                                callback(secret_id, "rotation_due")
-                            except Exception as e:
-                                logger.error(f"Rotation callback failed: {e}")
-                                
-    def shutdown(self) -> None:
-        """Gracefully shut down the secret manager."""
-        self._shutdown_event.set()
-        if self._rotation_monitor_thread:
-            self._rotation_monitor_thread.join(timeout=5)
+                            due_callbacks.append((secret_id, callback))
+
+        for secret_id, callback in due_callbacks:
+            try:
+                callback(secret_id, "rotation_due")
+            except Exception as e:
+                logger.error(f"Rotation callback failed: {e}")
+
+    def close(self) -> None:
+        """Close the secret manager, stop monitoring, and drop cached secrets."""
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._shutdown_event.set()
+            monitor_thread = self._rotation_monitor_thread
+
+        if (
+            monitor_thread
+            and monitor_thread.is_alive()
+            and monitor_thread is not threading.current_thread()
+        ):
+            monitor_thread.join(timeout=5)
         
-        # Clear all cached secrets from memory
+        # Drop cached secret references held by this manager.
         with self._cache_lock:
             for cached in self._cache.values():
-                # Overwrite secret value before clearing.
-                # NOTE: Python string immutability means this is BEST-EFFORT
-                # illustrative; use bytearray for true memory wipe.
+                # Rebinding only removes this CachedSecret's reference to the
+                # original str. Python string zeroization cannot be proven.
                 cached.value = "0" * len(cached.value)
             self._cache.clear()
+
+        audit_close = getattr(self._audit_logger, "close", None)
+        if callable(audit_close):
+            audit_close()
+
+    def shutdown(self) -> None:
+        """Backward-compatible alias for close()."""
+        self.close()
 
 
 class ScopedSecretContext:
     """
     Context manager for just-in-time secret injection.
     
-    This ensures secrets are fetched only when needed and cleared
-    from memory as soon as they are no longer required.
+    This helps secrets be fetched only when needed and keeps the
+    manager-held reference scoped to the context block. It does not
+    prove zeroization of Python string objects.
     """
     
     def __init__(
@@ -1063,11 +1327,10 @@ class ScopedSecretContext:
         return self._value
         
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Clear the secret from memory on context exit."""
+        """Drop the manager-held secret reference on context exit."""
         if self._value:
-            # Overwrite the string in memory
-            # Note: Python strings are immutable, so this creates a new string
-            # For true secure deletion, use a SecureString class with ctypes
+            # Rebinding creates a new string and then drops this reference.
+            # It does not prove the original bytes were zeroized by CPython.
             self._value = "0" * len(self._value)
             self._value = None
         return False
@@ -1078,8 +1341,10 @@ class EnvironmentSecretProvider(SecretBackendProvider):
     Environment variable-based secret provider.
 
     WARNING: This provider is intended for local development only.
-    Never use environment variables for secrets in production.
-    See twelve-factor app methodology for config vs secrets distinction.
+    Avoid long-lived plaintext environment variables for production secrets.
+    If your platform injects secrets through the process environment, keep
+    scope narrow, rotate aggressively, and account for residual exposure in
+    process dumps, inherited environments, logs, and compromised hosts.
     """
     
     def __init__(self, prefix: str = "SECRET_"):
@@ -1190,12 +1455,13 @@ def example_jit_injection():
     def process_payment(amount: float, recipient: str):
         """Process a payment using JIT secret injection."""
         
-        # Secret is fetched here and cleared after the block
+        # Secret is fetched here and the manager-held reference is dropped
+        # after the block.
         with manager.scoped_secret("finance/payment-gateway-key") as api_key:
-            # api_key is only in memory during this block
+            # api_key is intentionally referenced only during this block.
             result = call_payment_api(api_key, amount, recipient)
             
-        # api_key is now cleared from memory
+        # The scoped manager no longer holds api_key.
         return result
     
     def call_payment_api(key: str, amount: float, recipient: str) -> dict:
@@ -1228,8 +1494,8 @@ def example_rotation_handling():
         # Invalidate any cached connections using the old key
         invalidate_api_connections(secret_id)
         
-        # Pre-warm cache with new secret
-        manager.get_secret(secret_id, bypass_cache=True)
+        # Pre-warm cache with new secret after invalidating stale entries
+        manager.get_secret(secret_id)
     
     def invalidate_api_connections(secret_id: str):
         """Invalidate connections using rotated secret."""
@@ -1255,7 +1521,7 @@ def example_multi_tenant_isolation():
     
     class TenantAwareSecretManager:
         """
-        Wrapper that ensures tenant isolation for secret access.
+        Wrapper that helps enforce tenant isolation for secret access.
         
         Each tenant can only access secrets within their namespace.
         """
@@ -1365,11 +1631,52 @@ def example_emergency_revocation():
 # ============================================================================
 
 class CustomerServiceAgent:
-    def __init__(self, client_id: str):
+    def __init__(self, client_id: str, secret_manager: SecretManager):
+        self.client_id = client_id
+        self.secret_manager = secret_manager
         self.config = load_config(f"/app/config/{client_id}.json")
-        self.crm_api_key = self.config["crm_api_key"]
-        self.email_api_key = self.config["email_api_key"]
-        self.slack_webhook = self.config["slack_webhook"]
+        self.crm_secret_id = self.config["crm_secret_id"]
+        self.email_secret_id = self.config["email_secret_id"]
+        self.slack_webhook_secret_id = self.config["slack_webhook_secret_id"]
+        self.crm_base_url = self.config["crm_base_url"]
+        self.support_email = self.config["support_email"]
+
+    def handle_ticket(self, ticket: dict[str, Any]) -> dict[str, Any]:
+        """Handle one ticket with secrets fetched only at use time."""
+        context = {
+            "client_id": self.client_id,
+            "ticket_id": str(ticket["id"])
+        }
+
+        with self.secret_manager.scoped_secret(
+            self.crm_secret_id,
+            context={**context, "purpose": "crm_lookup"}
+        ) as crm_api_key:
+            customer = fetch_customer_record(
+                self.crm_base_url,
+                crm_api_key,
+                ticket["customer_id"]
+            )
+
+        with self.secret_manager.scoped_secret(
+            self.email_secret_id,
+            context={**context, "purpose": "email_reply"}
+        ) as email_api_key:
+            send_customer_email(
+                self.support_email,
+                email_api_key,
+                ticket,
+                customer
+            )
+
+        if ticket.get("notify_slack"):
+            with self.secret_manager.scoped_secret(
+                self.slack_webhook_secret_id,
+                context={**context, "purpose": "slack_notification"}
+            ) as slack_webhook:
+                post_slack_notification(slack_webhook, ticket)
+
+        return {"ticket_id": ticket["id"], "customer": customer}
 
 # ============================================================================
 # Block 8 (chapter listing #8)
@@ -1405,42 +1712,626 @@ def create_client_agent(client_id: str) -> CustomerServiceAgent:
 import os
 import uuid  # noqa: F401  (used elsewhere in this module's examples)
 
-# Module identifier embedded with audit events; bump on platform releases.
-__version__ = "1.0.0"
+# Module identifier embedded with audit events. Resolved from the
+# installed package metadata (pyproject.toml) so a redeploy bumps this
+# automatically; falls back to a sentinel for direct-from-source runs
+# where the package isn't pip-installed.
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+    __version__ = _pkg_version("agentic-ai-production")
+except (PackageNotFoundError, ImportError):  # pragma: no cover
+    __version__ = "0.0.0+unknown"
 
 
-def send_to_siem(endpoint: str, event: dict) -> None:
-    """Sync stub; replace with your SIEM client.
+@dataclass(frozen=True)
+class SIEMDeliveryResult:
+    """Outcome returned by the SIEM delivery path."""
+    delivered: bool
+    attempts: int
+    status_code: Optional[int] = None
+    error: Optional[str] = None
+    queued: bool = False
+    buffered: bool = False
+    queue_depth: int = 0
+    dropped_queue_full_total: int = 0
+    dropped_failed_events_total: int = 0
+    circuit_open: bool = False
 
-    If you wrap an async client, use ``asyncio.run()`` at the boundary or
-    convert ``SIEMAuditLogger.log`` itself to ``async``. Earlier drafts of
-    this stub were declared ``async`` with no ``await`` site in the sync
-    ``log`` caller, which silently dropped every audit event as an
-    un-awaited coroutine.
 
-    TODO: wire to your SIEM transport (HTTPS POST, syslog, Kafka topic, ...).
+@dataclass(frozen=True)
+class SIEMAuditMetrics:
+    """Snapshot of SIEM audit queue, delivery, and breaker state."""
+    queued_events: int
+    queue_capacity: int
+    buffered_failed_events: int
+    enqueued_total: int
+    delivered_total: int
+    failed_delivery_total: int
+    dropped_queue_full_total: int
+    dropped_failed_events_total: int
+    circuit_open: bool
+    circuit_open_total: int
+
+
+class SIEMSender(Protocol):
+    """Callable transport used by SIEM delivery; inject one in tests."""
+    def __call__(
+        self,
+        endpoint: str,
+        event: dict[str, Any],
+        connect_timeout: float,
+        read_timeout: float,
+    ) -> int:
+        """Send one event and return an HTTP-like status code."""
+        ...
+
+
+def _http_json_sender(
+    endpoint: str,
+    event: dict[str, Any],
+    connect_timeout: float,
+    read_timeout: float,
+) -> int:
+    """Send one audit event as HTTPS JSON using bounded socket timeouts."""
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("siem_endpoint must be an https:// URL")
+
+    body = json.dumps(event, default=str).encode("utf-8")
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    connection = http.client.HTTPSConnection(
+        parsed.netloc,
+        timeout=connect_timeout,
+    )
+    try:
+        connection.request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        if connection.sock is not None:
+            connection.sock.settimeout(read_timeout)
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
+def send_to_siem(
+    endpoint: str,
+    event: dict[str, Any],
+    *,
+    sender: Optional[SIEMSender] = None,
+    connect_timeout: float = 2.0,
+    read_timeout: float = 5.0,
+    max_retries: int = 2,
+    backoff_seconds: float = 0.25,
+) -> SIEMDeliveryResult:
+    """Deliver one audit event to a SIEM endpoint.
+
+    The default sender performs an HTTPS POST with explicit connect/read
+    timeouts. Tests should pass ``sender=...`` so no network is used.
     """
-    return None
+    if max_retries < 0:
+        raise ValueError("max_retries must be >= 0")
+
+    transport = sender or _http_json_sender
+    attempts = max_retries + 1
+    last_error: Optional[str] = None
+    last_status: Optional[int] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            status_code = transport(
+                endpoint,
+                event,
+                connect_timeout,
+                read_timeout,
+            )
+            last_status = status_code
+            if 200 <= status_code < 300:
+                return SIEMDeliveryResult(
+                    delivered=True,
+                    attempts=attempt,
+                    status_code=status_code,
+                )
+            last_error = f"SIEM endpoint returned HTTP {status_code}"
+        except Exception as exc:
+            last_error = str(exc)
+
+        if attempt < attempts:
+            time.sleep(backoff_seconds * attempt)
+
+    return SIEMDeliveryResult(
+        delivered=False,
+        attempts=attempts,
+        status_code=last_status,
+        error=last_error,
+    )
 
 
 class SIEMAuditLogger(AuditLogger):
-    """Audit logger that sends events to the SIEM system."""
+    """Audit logger that queues events and delivers them off the secret path."""
     
-    def __init__(self, siem_endpoint: str, client_id: str):
+    def __init__(
+        self,
+        siem_endpoint: str,
+        client_id: str,
+        *,
+        sender: Optional[SIEMSender] = None,
+        connect_timeout: float = 2.0,
+        read_timeout: float = 5.0,
+        max_retries: int = 2,
+        backoff_seconds: float = 0.25,
+        delivery_queue_size: int = 1000,
+        failure_buffer_size: int = 100,
+        circuit_failure_threshold: int = 3,
+        circuit_reset_seconds: float = 30.0,
+    ):
+        if delivery_queue_size < 1:
+            raise ValueError("delivery_queue_size must be >= 1")
+        if failure_buffer_size < 1:
+            raise ValueError("failure_buffer_size must be >= 1")
+        if circuit_failure_threshold < 1:
+            raise ValueError("circuit_failure_threshold must be >= 1")
+        if circuit_reset_seconds < 0:
+            raise ValueError("circuit_reset_seconds must be >= 0")
+
         self._endpoint = siem_endpoint
         self._client_id = client_id
+        self._sender = sender
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+        self._max_retries = max_retries
+        self._backoff_seconds = backoff_seconds
+        self._delivery_queue: queue.Queue = queue.Queue(
+            maxsize=delivery_queue_size
+        )
+        self._failed_events: deque[dict[str, Any]] = deque(
+            maxlen=failure_buffer_size
+        )
+        self._failed_events_lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
+        self._enqueued_total = 0
+        self._delivered_total = 0
+        self._failed_delivery_total = 0
+        self._dropped_queue_full_total = 0
+        self._dropped_failed_events_total = 0
+        self._consecutive_failures = 0
+        self._circuit_failure_threshold = circuit_failure_threshold
+        self._circuit_reset_seconds = circuit_reset_seconds
+        self._circuit_open_until = 0.0
+        self._circuit_open_total = 0
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            name=f"siem-audit-{client_id}",
+            daemon=True,
+        )
+        self._worker_thread.start()
         
-    def log(self, event: AuditEvent) -> None:
-        """Send audit event to SIEM."""
+    @property
+    def failed_events(self) -> tuple[dict[str, Any], ...]:
+        """Bounded in-memory DLQ for events that could not be delivered."""
+        with self._failed_events_lock:
+            return tuple(self._failed_events)
+
+    @property
+    def dropped_failed_events_total(self) -> int:
+        """Number of failed audit events evicted before redelivery."""
+        with self._failed_events_lock:
+            return self._dropped_failed_events_total
+
+    @property
+    def metrics(self) -> SIEMAuditMetrics:
+        """Return a point-in-time snapshot for monitoring/backpressure alerts."""
+        with self._metrics_lock:
+            enqueued_total = self._enqueued_total
+            delivered_total = self._delivered_total
+            failed_delivery_total = self._failed_delivery_total
+            dropped_queue_full_total = self._dropped_queue_full_total
+            circuit_open = self._is_circuit_open_locked()
+            circuit_open_total = self._circuit_open_total
+
+        with self._failed_events_lock:
+            buffered_failed_events = len(self._failed_events)
+            dropped_failed_events_total = self._dropped_failed_events_total
+
+        return SIEMAuditMetrics(
+            queued_events=self._delivery_queue.qsize(),
+            queue_capacity=self._delivery_queue.maxsize,
+            buffered_failed_events=buffered_failed_events,
+            enqueued_total=enqueued_total,
+            delivered_total=delivered_total,
+            failed_delivery_total=failed_delivery_total,
+            dropped_queue_full_total=dropped_queue_full_total,
+            dropped_failed_events_total=dropped_failed_events_total,
+            circuit_open=circuit_open,
+            circuit_open_total=circuit_open_total,
+        )
+
+    def _is_circuit_open_locked(self) -> bool:
+        """Check breaker state while holding _metrics_lock."""
+        return time.monotonic() < self._circuit_open_until
+
+    def _circuit_open(self) -> bool:
+        """Check breaker state."""
+        with self._metrics_lock:
+            return self._is_circuit_open_locked()
+
+    def _circuit_wait_seconds(self) -> float:
+        """Return seconds until the breaker allows another send attempt."""
+        with self._metrics_lock:
+            return max(0.0, self._circuit_open_until - time.monotonic())
+
+    def _wait_for_circuit(self) -> bool:
+        """Wait until half-open, returning False if shutdown interrupts."""
+        while True:
+            wait_seconds = self._circuit_wait_seconds()
+            if wait_seconds <= 0:
+                return True
+            if self._shutdown_event.wait(min(wait_seconds, 0.1)):
+                return False
+
+    def _record_delivery_success(self) -> None:
+        """Update metrics after a successful background delivery."""
+        with self._metrics_lock:
+            self._delivered_total += 1
+            self._consecutive_failures = 0
+            self._circuit_open_until = 0.0
+
+    def _record_delivery_failure(self) -> bool:
+        """Update metrics after a failed delivery and maybe open the breaker."""
+        with self._metrics_lock:
+            self._failed_delivery_total += 1
+            self._consecutive_failures += 1
+            if self._consecutive_failures < self._circuit_failure_threshold:
+                return False
+
+            self._consecutive_failures = 0
+            self._circuit_open_until = (
+                time.monotonic() + self._circuit_reset_seconds
+            )
+            self._circuit_open_total += 1
+            return True
+
+    def _buffer_failed_event(
+        self,
+        event: dict[str, Any],
+        result: SIEMDeliveryResult
+    ) -> None:
+        """Buffer a failed delivery and make bounded-buffer loss explicit."""
+        with self._failed_events_lock:
+            if len(self._failed_events) == self._failed_events.maxlen:
+                evicted = self._failed_events.popleft()
+                evicted_event = evicted.get("event", {})
+                self._dropped_failed_events_total += 1
+                logger.error(
+                    (
+                        "SIEM failed-event buffer full; dropping oldest "
+                        "event metadata"
+                    ),
+                    extra={
+                        "client_id": self._client_id,
+                        "evicted_event_type": evicted_event.get("event_type"),
+                        "evicted_secret_id": evicted_event.get("secret_id"),
+                        "evicted_operation": evicted_event.get("operation"),
+                        "evicted_result": evicted_event.get("result"),
+                        "evicted_timestamp": evicted_event.get("timestamp"),
+                        "evicted_attempts": evicted.get("attempts"),
+                        "evicted_status_code": evicted.get("status_code"),
+                        "evicted_error": evicted.get("error"),
+                        "dropped_failed_events_total": (
+                            self._dropped_failed_events_total
+                        ),
+                    },
+                )
+
+            self._failed_events.append(
+                {
+                    "event": event,
+                    "error": result.error,
+                    "attempts": result.attempts,
+                    "status_code": result.status_code,
+                }
+            )
+
+    def _dropped_failed_total(self) -> int:
+        """Return failed-buffer drop count."""
+        with self._failed_events_lock:
+            return self._dropped_failed_events_total
+
+    def _worker_loop(self) -> None:
+        """Deliver queued audit events outside the secret access path."""
+        while not self._shutdown_event.is_set() or not self._delivery_queue.empty():
+            try:
+                event = self._delivery_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                self._deliver_event(event)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                result = SIEMDeliveryResult(
+                    delivered=False,
+                    attempts=0,
+                    error=f"SIEM worker error: {exc}",
+                    buffered=True,
+                    dropped_failed_events_total=self._dropped_failed_total(),
+                    circuit_open=self._circuit_open(),
+                )
+                self._buffer_failed_event(event, result)
+                logger.exception(
+                    "SIEM audit worker failed; event buffered",
+                    extra={
+                        "client_id": self._client_id,
+                        "secret_id": event.get("secret_id"),
+                    },
+                )
+            finally:
+                self._delivery_queue.task_done()
+
+    def _deliver_event(self, event: dict[str, Any]) -> None:
+        """Send one queued event or buffer it if delivery is unavailable."""
+        if not self._wait_for_circuit():
+            result = SIEMDeliveryResult(
+                delivered=False,
+                attempts=0,
+                error="SIEM circuit breaker open during shutdown",
+                buffered=True,
+                dropped_failed_events_total=self._dropped_failed_total(),
+                circuit_open=True,
+            )
+            self._buffer_failed_event(event, result)
+            return
+
+        result = send_to_siem(
+            self._endpoint,
+            event,
+            sender=self._sender,
+            connect_timeout=self._connect_timeout,
+            read_timeout=self._read_timeout,
+            max_retries=self._max_retries,
+            backoff_seconds=self._backoff_seconds,
+        )
+        if result.delivered:
+            self._record_delivery_success()
+            return
+
+        self._buffer_failed_event(event, result)
+        circuit_opened = self._record_delivery_failure()
+        logger.warning(
+            "SIEM audit delivery failed; event buffered for retry",
+            extra={
+                "client_id": self._client_id,
+                "secret_id": event.get("secret_id"),
+                "attempts": result.attempts,
+                "status_code": result.status_code,
+                "error": result.error,
+                "dropped_failed_events_total": (
+                    self._dropped_failed_total()
+                ),
+                "circuit_open": self._circuit_open(),
+            },
+        )
+        if circuit_opened:
+            logger.error(
+                "SIEM circuit breaker opened after delivery failures",
+                extra={
+                    "client_id": self._client_id,
+                    "circuit_reset_seconds": self._circuit_reset_seconds,
+                    "failed_delivery_total": (
+                        self.metrics.failed_delivery_total
+                    ),
+                    "circuit_open_total": self.metrics.circuit_open_total,
+                },
+            )
+
+    def drain_failed_events(
+        self,
+        max_events: Optional[int] = None
+    ) -> list[SIEMDeliveryResult]:
+        """
+        Retry buffered SIEM events, removing only successful deliveries.
+
+        Stops after the first failed redelivery so callers can schedule this
+        method with external backoff instead of hammering an unhealthy SIEM.
+        """
+        if max_events is not None and max_events < 1:
+            raise ValueError("max_events must be >= 1")
+
+        with self._failed_events_lock:
+            events_to_attempt = len(self._failed_events)
+        if max_events is not None:
+            events_to_attempt = min(events_to_attempt, max_events)
+
+        results: list[SIEMDeliveryResult] = []
+        for _ in range(events_to_attempt):
+            if self._circuit_open():
+                result = SIEMDeliveryResult(
+                    delivered=False,
+                    attempts=0,
+                    error="SIEM circuit breaker open",
+                    buffered=True,
+                    dropped_failed_events_total=self._dropped_failed_total(),
+                    circuit_open=True,
+                )
+                results.append(result)
+                break
+
+            with self._failed_events_lock:
+                if not self._failed_events:
+                    break
+                buffered_event = self._failed_events[0]
+            event = buffered_event["event"]
+            result = send_to_siem(
+                self._endpoint,
+                event,
+                sender=self._sender,
+                connect_timeout=self._connect_timeout,
+                read_timeout=self._read_timeout,
+                max_retries=self._max_retries,
+                backoff_seconds=self._backoff_seconds,
+            )
+            if result.delivered:
+                with self._failed_events_lock:
+                    if (
+                        self._failed_events
+                        and self._failed_events[0] is buffered_event
+                    ):
+                        self._failed_events.popleft()
+                    elif buffered_event in self._failed_events:
+                        self._failed_events.remove(buffered_event)
+                self._record_delivery_success()
+                results.append(result)
+                continue
+
+            with self._failed_events_lock:
+                buffered_event["error"] = result.error
+                buffered_event["attempts"] = (
+                    buffered_event.get("attempts", 0) + result.attempts
+                )
+                buffered_event["status_code"] = result.status_code
+                dropped_failed_events_total = self._dropped_failed_events_total
+            self._record_delivery_failure()
+            retained_result = SIEMDeliveryResult(
+                delivered=False,
+                attempts=result.attempts,
+                status_code=result.status_code,
+                error=result.error,
+                buffered=True,
+                dropped_failed_events_total=dropped_failed_events_total,
+                circuit_open=self._circuit_open(),
+            )
+            results.append(retained_result)
+            logger.warning(
+                "SIEM audit redelivery failed; leaving event buffered",
+                extra={
+                    "client_id": self._client_id,
+                    "secret_id": event.get("secret_id"),
+                    "attempts": result.attempts,
+                    "status_code": result.status_code,
+                    "error": result.error,
+                    "dropped_failed_events_total": (
+                        dropped_failed_events_total
+                    ),
+                    "circuit_open": self._circuit_open(),
+                },
+            )
+            break
+
+        return results
+
+    def log(self, event: AuditEvent) -> SIEMDeliveryResult:
+        """Queue an audit event without performing network I/O inline."""
         enriched_event = {
             **event.__dict__,
             "client_id": self._client_id,
             "environment": os.environ.get("ENVIRONMENT", "unknown"),
             "platform_version": __version__
         }
+
+        if self._shutdown_event.is_set():
+            return SIEMDeliveryResult(
+                delivered=False,
+                attempts=0,
+                error="SIEM audit logger is closed",
+                queue_depth=self._delivery_queue.qsize(),
+                dropped_queue_full_total=(
+                    self.metrics.dropped_queue_full_total
+                ),
+                dropped_failed_events_total=self._dropped_failed_total(),
+                circuit_open=self._circuit_open(),
+            )
         
-        # Sync send to SIEM (see send_to_siem docstring for async wrapping)
-        send_to_siem(self._endpoint, enriched_event)
+        try:
+            self._delivery_queue.put_nowait(enriched_event)
+        except queue.Full:
+            with self._metrics_lock:
+                self._dropped_queue_full_total += 1
+                dropped_queue_full_total = self._dropped_queue_full_total
+            logger.error(
+                "SIEM audit queue full; dropping event metadata",
+                extra={
+                    "client_id": self._client_id,
+                    "secret_id": event.secret_id,
+                    "operation": event.operation,
+                    "result": event.result,
+                    "queue_depth": self._delivery_queue.qsize(),
+                    "dropped_queue_full_total": dropped_queue_full_total,
+                    "circuit_open": self._circuit_open(),
+                },
+            )
+            return SIEMDeliveryResult(
+                delivered=False,
+                attempts=0,
+                error="SIEM audit delivery queue full",
+                queue_depth=self._delivery_queue.qsize(),
+                dropped_queue_full_total=dropped_queue_full_total,
+                dropped_failed_events_total=self._dropped_failed_total(),
+                circuit_open=self._circuit_open(),
+            )
+
+        with self._metrics_lock:
+            self._enqueued_total += 1
+            dropped_queue_full_total = self._dropped_queue_full_total
+
+        return SIEMDeliveryResult(
+            delivered=False,
+            attempts=0,
+            queued=True,
+            queue_depth=self._delivery_queue.qsize(),
+            dropped_queue_full_total=dropped_queue_full_total,
+            dropped_failed_events_total=self._dropped_failed_total(),
+            circuit_open=self._circuit_open(),
+        )
+
+    def flush(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the delivery queue to drain; return False on timeout."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be >= 0")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._delivery_queue.all_tasks_done:
+            while self._delivery_queue.unfinished_tasks:
+                if deadline is None:
+                    self._delivery_queue.all_tasks_done.wait()
+                    continue
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._delivery_queue.all_tasks_done.wait(remaining)
+        return True
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop the background worker after draining or buffering queued work."""
+        self._shutdown_event.set()
+        if (
+            self._worker_thread.is_alive()
+            and self._worker_thread is not threading.current_thread()
+        ):
+            self._worker_thread.join(timeout=timeout)
+
+    def shutdown(self) -> None:
+        """Backward-compatible alias for close()."""
+        self.close()
+
+    def __enter__(self) -> "SIEMAuditLogger":
+        """Use this logger as a context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Ensure the background worker is asked to stop."""
+        self.close()
 
 # ============================================================================
 # Block 10 (chapter listing #10)

@@ -1,0 +1,23 @@
+# Development dependencies (test, lint, type-check) for Book 2 companion code.
+# Install alongside requirements.txt:
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Or via project extras:
+#
+#     pip install -e ".[dev]"
+
+# Test runner and helpers
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# Property-based testing
+hypothesis>=6.92.0
+
+# HTTP and recording for replayable integration tests
+respx>=0.20.0
+vcrpy>=6.0.0
+
+# Linting and type-checking
+ruff>=0.5.0
+mypy>=1.10.0

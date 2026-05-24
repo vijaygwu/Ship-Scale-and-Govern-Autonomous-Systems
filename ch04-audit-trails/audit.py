@@ -68,9 +68,9 @@ fields @timestamp, @message
 """
 audit_logger.py - Production audit logging for AI agents
 
-This module provides a comprehensive audit logging system designed for
-AI agents operating in regulated environments. It implements structured
-logging, tamper-evident chains, and privacy-preserving features.
+This module demonstrates reference audit logging components for AI agents
+operating in regulated environments. It implements structured logging,
+tamper-evident chains, and privacy-preserving features.
 
 Code Navigation (line numbers are approximate):
 - Event Types & Severity Enums ... ~30
@@ -85,16 +85,20 @@ Code Navigation (line numbers are approximate):
 import hashlib
 import json
 import logging
+import os
+import queue
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Protocol, TypeVar
+from pathlib import Path
+from typing import Any, Callable, Protocol, TypeVar
 from uuid import UUID, uuid4
 
 
@@ -284,71 +288,195 @@ class AuditSink(ABC):
         pass
 
 
+class _SinkIODeadlineExceeded(TimeoutError):
+    """Raised when a sink operation does not finish inside its deadline."""
+
+
+class _SinkIOWorker:
+    """
+    Single-worker, bounded queue for one sink's blocking I/O calls.
+
+    The daemon worker keeps per-sink I/O serialized while allowing the caller
+    to stop waiting at a deadline. A timed-out sink may still finish its
+    current OS call later, so the logger treats a missed write acknowledgement
+    as a sink-local chain break and stops sending later events to that sink.
+    """
+
+    def __init__(self, name: str, queue_capacity: int = 1):
+        self._tasks: queue.Queue[
+            tuple[Future[None], Callable[[], None]] | None
+        ] = queue.Queue(maxsize=queue_capacity)
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"audit-sink-io-{name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, func: Callable[[], None], timeout: float) -> Future[None]:
+        """Submit one sink operation, waiting only up to ``timeout`` seconds."""
+        future: Future[None] = Future()
+        if self._closed.is_set():
+            future.set_exception(RuntimeError("audit sink I/O worker is closed"))
+            return future
+
+        try:
+            self._tasks.put((future, func), timeout=max(0.0, timeout))
+        except queue.Full:
+            future.set_exception(
+                _SinkIODeadlineExceeded(
+                    "Audit sink I/O queue did not accept task before deadline"
+                )
+            )
+        return future
+
+    def shutdown(self) -> None:
+        """Stop accepting work and ask the worker to exit when possible."""
+        self._closed.set()
+        try:
+            self._tasks.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def _run(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+
+            future, func = task
+            if not future.set_running_or_notify_cancel():
+                continue
+
+            try:
+                func()
+            except Exception as exc:  # noqa: BLE001 -- propagate sink failure
+                future.set_exception(exc)
+            else:
+                future.set_result(None)
+
+
+@dataclass
+class _SinkChainState:
+    """Committed hash-chain head for one audit sink."""
+    sequence_num: int = 0
+    previous_hash: str = "genesis"
+    next_write_sequence_num: int = 1
+    disabled_reason: str | None = None
+    condition: threading.Condition = field(
+        default_factory=threading.Condition,
+        repr=False,
+    )
+
+
 class FileSink(AuditSink):
     """
     Writes audit events to append-only log files.
-    
+
     Files are rotated based on size or time. Each line contains
     a complete JSON event for easy parsing and streaming.
+
+    Default is durable=True: each acknowledged write is flushed and fsynced
+    before write() returns, subject to the durability behavior of the
+    filesystem and storage device. This is the correct default for compliance
+    audit trails. Pass durable=False only for non-compliance throughput paths
+    where losing up to buffer_size - 1 events on a process crash is acceptable.
     """
-    
+
     def __init__(
         self,
-        base_path: str,
+        base_path: str | Path,
         max_size_bytes: int = 100 * 1024 * 1024,  # 100MB
         buffer_size: int = 100,
+        durable: bool = True,
     ):
-        self._base_path = base_path
+        if buffer_size < 1:
+            raise ValueError("buffer_size must be at least 1")
+
+        self._base_path = Path(base_path)
+        self._base_path.mkdir(parents=True, exist_ok=True)
         self._max_size = max_size_bytes
         self._buffer_size = buffer_size
+        self._durable = durable
         self._buffer: list[AuditEvent] = []
         self._current_file: Any = None
         self._current_size = 0
         self._lock = threading.Lock()
         self._file_counter = 0
-        
+
         self._open_new_file()
-    
+
     def _open_new_file(self) -> None:
         """Open a new log file."""
         if self._current_file:
+            self._sync_file(fsync=self._durable)
             self._current_file.close()
-        
+
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"{self._base_path}/audit_{timestamp}_{self._file_counter}.jsonl"
+        filename = self._base_path / f"audit_{timestamp}_{self._file_counter}.jsonl"
         # Explicit UTF-8 encoding (the audit log carries JSON with potentially
         # non-ASCII PII); line buffering so each event is durable on flush even
         # if the writer dies mid-buffer.
-        self._current_file = open(filename, "a", encoding="utf-8", buffering=1)
+        self._current_file = filename.open("a", encoding="utf-8", buffering=1)
         self._current_size = 0
         self._file_counter += 1
-    
+        if self._durable:
+            self._fsync_directory()
+
     def write(self, event: AuditEvent) -> None:
         """Buffer and write event to file."""
         with self._lock:
+            if self._durable:
+                self._write_event(event)
+                self._sync_file(fsync=True)
+                return
+
             self._buffer.append(event)
             if len(self._buffer) >= self._buffer_size:
                 self._flush_buffer()
-    
+
+    def _write_event(self, event: AuditEvent) -> None:
+        """Write one event to the current file, rotating first if needed."""
+        line = event.to_json() + "\n"
+        line_bytes = len(line.encode("utf-8"))
+
+        if self._current_size + line_bytes > self._max_size:
+            self._open_new_file()
+
+        self._current_file.write(line)
+        self._current_size += line_bytes
+
     def _flush_buffer(self) -> None:
         """Write buffered events to file."""
         for event in self._buffer:
-            line = event.to_json() + "\n"
-            line_bytes = len(line.encode("utf-8"))
-            
-            if self._current_size + line_bytes > self._max_size:
-                self._open_new_file()
-            
-            self._current_file.write(line)
-            self._current_size += line_bytes
-        
+            self._write_event(event)
+
         self._buffer.clear()
+        self._sync_file(fsync=False)
+
+    def _sync_file(self, fsync: bool) -> None:
+        """Flush Python and, when requested, OS buffers for the current file."""
         self._current_file.flush()
+        if fsync:
+            os.fsync(self._current_file.fileno())
+
+    def _fsync_directory(self) -> None:
+        """Best-effort sync for newly created rotated file directory entries."""
+        try:
+            dir_fd = os.open(self._base_path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     
     def flush(self) -> None:
         """Flush buffer to disk."""
         with self._lock:
             self._flush_buffer()
+            self._sync_file(fsync=True)
     
     def close(self) -> None:
         """Close the sink."""
@@ -370,7 +498,7 @@ class AuditLogger:
         logger = AuditLogger(
             agent_id="customer-service-v2",
             agent_version="2.3.1",
-            sinks=[FileSink("/var/log/agent-audit")],
+            sinks=[FileSink("/var/log/agent-audit", durable=True)],
         )
         
         with logger.session() as session:
@@ -395,14 +523,34 @@ class AuditLogger:
         environment: str = "production",
         max_retries: int = 3,
         initial_backoff_seconds: float = 0.1,
+        sink_io_deadline_seconds: float = 5.0,
         dlq_capacity: int = 1000,
+        allow_no_sinks: bool = False,
     ):
+        if not sinks and not allow_no_sinks:
+            raise ValueError(
+                "AuditLogger requires at least one audit sink; pass a durable "
+                "sink such as FileSink(..., durable=True), or set "
+                "allow_no_sinks=True only for explicit no-op/test usage."
+            )
+        if sink_io_deadline_seconds <= 0:
+            raise ValueError("sink_io_deadline_seconds must be positive")
         self._agent_id = agent_id
         self._agent_version = agent_version
         self._sinks = sinks
         self._pii_tokenizer = pii_tokenizer
         self._environment = environment
         self._sequence_lock = threading.Lock()
+        # Each sink owns its committed hash-chain head. If one sink is down,
+        # other sinks can keep acknowledging events without forcing the
+        # recovered sink to accept a previous_hash for an event it missed.
+        self._sink_chain_states = [_SinkChainState() for _ in sinks]
+        self._sink_io_workers = [
+            _SinkIOWorker(f"{index}-{type(sink).__name__}")
+            for index, sink in enumerate(sinks)
+        ]
+        # Compatibility snapshot for code that reads the historical private
+        # logger head; updated from the first sink that acknowledges an event.
         self._sequence_num = 0
         self._previous_hash = "genesis"
 
@@ -413,6 +561,7 @@ class AuditLogger:
         # with chapter 7's RetryPolicy and a durable DLQ (e.g., S3, SQS).
         self._max_retries = max_retries
         self._initial_backoff_seconds = initial_backoff_seconds
+        self._sink_io_deadline_seconds = sink_io_deadline_seconds
         # Bounded deque so a sustained outage cannot exhaust memory. Older
         # un-replayed events are dropped first; the failure counter still
         # captures the total loss count for alerting.
@@ -427,6 +576,12 @@ class AuditLogger:
             "flush": 0,
             "close": 0,
         }
+        self._dropped_event_count = 0
+        if not sinks:
+            logging.warning(
+                "AuditLogger initialized without sinks; audit events will be "
+                "dropped and counted. Use only for explicit no-op/test usage."
+            )
     
     @contextmanager
     def session(
@@ -485,47 +640,195 @@ class AuditLogger:
         context: EventContext,
         payload: dict[str, Any],
     ) -> AuditEvent:
-        """Create an audit event with integrity chain."""
-        # Tokenize PII in payload
+        """Create an audit event for the first sink's committed chain head."""
         if self._pii_tokenizer:
             payload = self._tokenize_payload(payload)
-        
+
+        with self._sequence_lock:
+            state = (
+                self._sink_chain_states[0]
+                if self._sink_chain_states
+                else _SinkChainState(self._sequence_num, self._previous_hash)
+            )
+            event = self._build_event_for_chain_head(
+                event_type=event_type,
+                severity=severity,
+                context=context,
+                payload=payload,
+                sequence_num=state.sequence_num + 1,
+                previous_hash=state.previous_hash,
+            )
+
+        return event
+
+    def _log_event(
+        self,
+        event_type: EventType,
+        severity: Severity,
+        context: EventContext,
+        payload: dict[str, Any],
+    ) -> AuditEvent:
+        """Create, persist, then commit each sink's event to its hash chain."""
+        if self._pii_tokenizer:
+            payload = self._tokenize_payload(payload)
+
+        event_id = uuid4()
+        timestamp = datetime.now(timezone.utc)
         with self._sequence_lock:
             self._sequence_num += 1
             sequence_num = self._sequence_num
             previous_hash = self._previous_hash
-        
-        # Create event without hash first
+            sink_entries = list(
+                zip(self._sinks, self._sink_chain_states, self._sink_io_workers)
+            )
+
+        if not sink_entries:
+            event = self._build_event_for_chain_head(
+                event_type=event_type,
+                severity=severity,
+                context=context,
+                payload=payload,
+                sequence_num=sequence_num,
+                previous_hash=previous_hash,
+                event_id=event_id,
+                timestamp=timestamp,
+            )
+            self._record_dropped_event(event)
+            return event
+
+        attempted_event: AuditEvent | None = None
+        acknowledged_event: AuditEvent | None = None
+
+        for sink_index, (sink, state, worker) in enumerate(sink_entries):
+            event, acknowledged = self._write_reserved_event_to_sink(
+                sink=sink,
+                state=state,
+                worker=worker,
+                sequence_num=sequence_num,
+                event_type=event_type,
+                severity=severity,
+                context=context,
+                payload=payload,
+                event_id=event_id,
+                timestamp=timestamp,
+            )
+            attempted_event = attempted_event or event
+            if acknowledged and acknowledged_event is None:
+                acknowledged_event = event
+            if acknowledged and sink_index == 0:
+                with self._sequence_lock:
+                    self._previous_hash = (
+                        event.integrity.event_hash or self._previous_hash
+                    )
+
+        return acknowledged_event or attempted_event
+
+    def _write_reserved_event_to_sink(
+        self,
+        sink: AuditSink,
+        state: _SinkChainState,
+        worker: _SinkIOWorker,
+        sequence_num: int,
+        event_type: EventType,
+        severity: Severity,
+        context: EventContext,
+        payload: dict[str, Any],
+        event_id: UUID,
+        timestamp: datetime,
+    ) -> tuple[AuditEvent, bool]:
+        """Write one reserved sequence to one sink and commit only on ack."""
+        with state.condition:
+            while state.next_write_sequence_num != sequence_num:
+                state.condition.wait()
+
+            event = self._build_event_for_chain_head(
+                event_type=event_type,
+                severity=severity,
+                context=context,
+                payload=payload,
+                sequence_num=sequence_num,
+                previous_hash=state.previous_hash,
+                event_id=event_id,
+                timestamp=timestamp,
+            )
+
+            disabled_reason = state.disabled_reason
+
+        if disabled_reason is not None:
+            self._record_failure(
+                "write",
+                event,
+                RuntimeError(f"sink disabled after prior failure: {disabled_reason}"),
+            )
+            with state.condition:
+                state.next_write_sequence_num += 1
+                state.condition.notify_all()
+            return event, False
+
+        acknowledged = False
+        try:
+            acknowledged = self._write_event(
+                sink,
+                worker,
+                event,
+                deadline_monotonic=(
+                    time.monotonic() + self._sink_io_deadline_seconds
+                ),
+            )
+            return event, acknowledged
+        finally:
+            with state.condition:
+                if acknowledged:
+                    state.sequence_num = event.integrity.sequence_num
+                    state.previous_hash = (
+                        event.integrity.event_hash or state.previous_hash
+                    )
+                else:
+                    state.disabled_reason = "write failed before acknowledgement"
+                state.next_write_sequence_num += 1
+                state.condition.notify_all()
+
+    def _build_event_for_chain_head(
+        self,
+        event_type: EventType,
+        severity: Severity,
+        context: EventContext,
+        payload: dict[str, Any],
+        sequence_num: int,
+        previous_hash: str,
+        event_id: UUID | None = None,
+        timestamp: datetime | None = None,
+    ) -> AuditEvent:
+        """Build the next event without mutating committed chain state."""
         integrity = IntegrityData(
             sequence_num=sequence_num,
             previous_hash=previous_hash,
         )
-        
+
         event = AuditEvent(
-            event_id=uuid4(),
-            timestamp=datetime.now(timezone.utc),
+            event_id=event_id or uuid4(),
+            timestamp=timestamp or datetime.now(timezone.utc),
             event_type=event_type,
             severity=severity,
             context=context,
             payload=payload,
             integrity=integrity,
         )
-        
+
         # Calculate event hash over a canonical serialization that excludes
         # the event_hash field itself, so the hash is independent of dict
         # ordering and self-referential fields.
-        payload = event.to_dict()
-        payload.get("integrity", {}).pop("event_hash", None)
+        event_payload = event.to_dict()
+        integrity_payload = {
+            key: value
+            for key, value in event_payload["integrity"].items()
+            if key != "event_hash"
+        }
+        event_payload = {**event_payload, "integrity": integrity_payload}
         canonical = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), default=str
+            event_payload, sort_keys=True, separators=(",", ":"), default=str
         )
-        event_hash = hashlib.sha256(canonical.encode()).hexdigest()
-        event.integrity.event_hash = event_hash
-        
-        # Update chain
-        with self._sequence_lock:
-            self._previous_hash = event_hash
-        
+        event.integrity.event_hash = hashlib.sha256(canonical.encode()).hexdigest()
         return event
     
     def _tokenize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -552,6 +855,7 @@ class AuditLogger:
         op_name: str,
         func: Any,
         event: AuditEvent | None = None,
+        deadline_monotonic: float | None = None,
     ) -> bool:
         """
         Run ``func`` with bounded exponential backoff retries.
@@ -563,14 +867,30 @@ class AuditLogger:
         """
         last_error: Exception | None = None
         for attempt in range(self._max_retries):
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                last_error = _SinkIODeadlineExceeded(
+                    f"Audit {op_name} exceeded per-sink deadline"
+                )
+                break
             try:
                 func()
                 return True
+            except _SinkIODeadlineExceeded as e:
+                last_error = e
+                break
             except Exception as e:  # noqa: BLE001 -- intentional broad catch
                 last_error = e
                 if attempt < self._max_retries - 1:
                     # Exponential backoff: 0.1s, 0.2s, 0.4s, ...
                     backoff = self._initial_backoff_seconds * (2 ** attempt)
+                    if deadline_monotonic is not None:
+                        remaining = deadline_monotonic - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        backoff = min(backoff, remaining)
                     logging.warning(
                         "Audit %s attempt %d/%d failed: %s; retrying in %.2fs",
                         op_name, attempt + 1, self._max_retries, e, backoff,
@@ -578,6 +898,16 @@ class AuditLogger:
                     time.sleep(backoff)
 
         # All retries exhausted -- record the failure for forensics + alerting.
+        self._record_failure(op_name, event, last_error)
+        return False
+
+    def _record_failure(
+        self,
+        op_name: str,
+        event: AuditEvent | None,
+        last_error: Exception | None,
+    ) -> None:
+        """Record an audit pipeline failure for alerting and forensics."""
         with self._dlq_lock:
             self._failure_counts[op_name] = self._failure_counts.get(op_name, 0) + 1
             if event is not None:
@@ -590,25 +920,104 @@ class AuditLogger:
             op_name, self._max_retries, op_name,
             self._failure_counts[op_name], last_error,
         )
-        return False
 
-    def _write_event(self, event: AuditEvent) -> None:
-        """Write event to all configured sinks with bounded retry + DLQ."""
-        for sink in self._sinks:
-            self._retry_with_backoff(
-                "write", lambda s=sink: s.write(event), event=event
+    def _record_dropped_event(self, event: AuditEvent) -> None:
+        """Count and warn when explicit no-sink mode drops an audit event."""
+        with self._dlq_lock:
+            self._dropped_event_count += 1
+            dropped_count = self._dropped_event_count
+        logging.warning(
+            "Audit event %s dropped because no audit sinks are configured; "
+            "audit_dropped_events_total=%d",
+            event.event_id,
+            dropped_count,
+        )
+
+    def _run_sink_io(
+        self,
+        worker: _SinkIOWorker,
+        op_name: str,
+        func: Callable[[], None],
+        deadline_monotonic: float | None,
+    ) -> None:
+        """Run one blocking sink operation behind a caller-visible deadline."""
+        deadline = deadline_monotonic or (
+            time.monotonic() + self._sink_io_deadline_seconds
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _SinkIODeadlineExceeded(
+                f"Audit {op_name} exceeded per-sink deadline"
             )
+
+        future = worker.submit(func, timeout=remaining)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            future.cancel()
+            raise _SinkIODeadlineExceeded(
+                f"Audit {op_name} exceeded per-sink deadline"
+            )
+
+        try:
+            future.result(timeout=remaining)
+        except FutureTimeoutError:
+            future.cancel()
+            raise _SinkIODeadlineExceeded(
+                f"Audit {op_name} exceeded per-sink deadline"
+            ) from None
+
+    def _write_event(
+        self,
+        sink: AuditSink,
+        worker: _SinkIOWorker,
+        event: AuditEvent,
+        deadline_monotonic: float | None = None,
+    ) -> bool:
+        """Write event to one sink; return whether that sink acknowledged it."""
+        return self._retry_with_backoff(
+            "write",
+            lambda: self._run_sink_io(
+                worker,
+                "write",
+                lambda: sink.write(event),
+                deadline_monotonic,
+            ),
+            event=event,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def _flush_all(self) -> None:
         """Flush all sinks with bounded retry."""
-        for sink in self._sinks:
-            self._retry_with_backoff("flush", sink.flush)
+        for sink, worker in zip(self._sinks, self._sink_io_workers):
+            deadline_monotonic = time.monotonic() + self._sink_io_deadline_seconds
+            self._retry_with_backoff(
+                "flush",
+                lambda s=sink, w=worker, d=deadline_monotonic: self._run_sink_io(
+                    w,
+                    "flush",
+                    s.flush,
+                    d,
+                ),
+                deadline_monotonic=deadline_monotonic,
+            )
 
     def close(self) -> None:
         """Close the logger and all sinks with bounded retry."""
         self._flush_all()
-        for sink in self._sinks:
-            self._retry_with_backoff("close", sink.close)
+        for sink, worker in zip(self._sinks, self._sink_io_workers):
+            deadline_monotonic = time.monotonic() + self._sink_io_deadline_seconds
+            self._retry_with_backoff(
+                "close",
+                lambda s=sink, w=worker, d=deadline_monotonic: self._run_sink_io(
+                    w,
+                    "close",
+                    s.close,
+                    d,
+                ),
+                deadline_monotonic=deadline_monotonic,
+            )
+        for worker in self._sink_io_workers:
+            worker.shutdown()
 
     @property
     def dead_letter_queue(self) -> tuple[tuple[str, AuditEvent, str], ...]:
@@ -621,6 +1030,12 @@ class AuditLogger:
         """Per-operation failure counters for monitoring."""
         with self._dlq_lock:
             return dict(self._failure_counts)
+
+    @property
+    def dropped_event_count(self) -> int:
+        """Number of audit events explicitly dropped in no-sink mode."""
+        with self._dlq_lock:
+            return self._dropped_event_count
 
 
 class AuditSession:
@@ -677,13 +1092,12 @@ class AuditSession:
         payload: dict[str, Any],
     ) -> AuditEvent:
         """Log a generic audit event."""
-        event = self._logger._create_event(
+        event = self._logger._log_event(
             event_type=event_type,
             severity=severity,
             context=self._context,
             payload=payload,
         )
-        self._logger._write_event(event)
         self._event_count += 1
         return event
     
@@ -908,11 +1322,12 @@ class AuditSession:
 # ============================================================================
 
 """
-decision_trail.py - Capture complete agent decision trails
+decision_trail.py - Capture decision rationale summaries
 
-Decision trails provide a complete record of how an agent arrived
-at a conclusion, including all intermediate reasoning steps, data
-consulted, and alternatives considered.
+Decision trails record observable steps, evidence summaries, policy checks,
+and rationale summaries. They do not capture hidden chain-of-thought, raw
+prompts, or raw retrieved content; summarize and redact those artifacts before
+logging.
 """
 
 
@@ -928,8 +1343,8 @@ from uuid import UUID, uuid4
 # symbols are already in scope when the chapter file is run end-to-end.
 
 
-class ReasoningStepType(Enum):
-    """Types of reasoning steps in a decision trail."""
+class RationaleStepType(Enum):
+    """Types of observable steps in a decision-rationale trail."""
     GOAL_FORMATION = "goal_formation"
     INFORMATION_GATHERING = "information_gathering"
     HYPOTHESIS_GENERATION = "hypothesis_generation"
@@ -942,14 +1357,14 @@ class ReasoningStepType(Enum):
 
 
 @dataclass
-class ReasoningStep:
-    """A single step in the agent's reasoning process."""
+class RationaleStep:
+    """A redacted summary of one observable decision step."""
     step_id: UUID
-    step_type: ReasoningStepType
+    step_type: RationaleStepType
     timestamp: datetime
     input_state: dict[str, Any]
     output_state: dict[str, Any]
-    reasoning: str
+    rationale_summary: str
     confidence: float | None = None
     duration_ms: float | None = None
 
@@ -957,10 +1372,11 @@ class ReasoningStep:
 @dataclass
 class DecisionTrail:
     """
-    Complete record of the reasoning process for a decision.
+    Record of observable decision steps and rationale summaries.
     
-    A decision trail captures the full chain of reasoning that led
-    to an agent decision. This is essential for:
+    A decision trail captures evidence summaries, policy checks,
+    alternatives, and the summarized rationale that led to an agent
+    decision. This is essential for:
     - Explaining decisions to stakeholders
     - Debugging unexpected behavior
     - Compliance with explainability requirements
@@ -970,28 +1386,28 @@ class DecisionTrail:
     goal: str
     started_at: datetime
     completed_at: datetime | None = None
-    steps: list[ReasoningStep] = field(default_factory=list)
+    steps: list[RationaleStep] = field(default_factory=list)
     final_decision: str | None = None
     final_confidence: float | None = None
     outcome: str | None = None
     
     def add_step(
         self,
-        step_type: ReasoningStepType,
+        step_type: RationaleStepType,
         input_state: dict[str, Any],
         output_state: dict[str, Any],
-        reasoning: str,
+        rationale_summary: str,
         confidence: float | None = None,
         duration_ms: float | None = None,
-    ) -> ReasoningStep:
-        """Add a reasoning step to the trail."""
-        step = ReasoningStep(
+    ) -> RationaleStep:
+        """Add a redacted rationale summary to the trail."""
+        step = RationaleStep(
             step_id=uuid4(),
             step_type=step_type,
             timestamp=datetime.now(timezone.utc),
             input_state=input_state,
             output_state=output_state,
-            reasoning=reasoning,
+            rationale_summary=rationale_summary,
             confidence=confidence,
             duration_ms=duration_ms,
         )
@@ -1023,7 +1439,7 @@ class DecisionTrail:
                     "step_id": str(step.step_id),
                     "step_type": step.step_type.value,
                     "timestamp": step.timestamp.isoformat(),
-                    "reasoning": step.reasoning,
+                    "rationale_summary": step.rationale_summary,
                     "confidence": step.confidence,
                     "duration_ms": step.duration_ms,
                 }
@@ -1040,7 +1456,7 @@ class DecisionTrailCapture:
     Captures decision trails during agent execution.
     
     This class integrates with the audit logger to capture and
-    persist complete decision trails.
+    persist decision rationale trails.
     
     Example usage:
         
@@ -1049,10 +1465,15 @@ class DecisionTrailCapture:
         with capture.trail("Determine refund eligibility") as trail:
             # Information gathering
             trail.add_step(
-                step_type=ReasoningStepType.INFORMATION_GATHERING,
-                input_state={"customer_id": "12345"},
-                output_state={"order_history": [...], "refund_history": [...]},
-                reasoning="Retrieved customer order and refund history",
+                step_type=RationaleStepType.INFORMATION_GATHERING,
+                input_state={"customer_ref": "[PII:CUSTOMER:c8a01f]"},
+                output_state={
+                    "order_history_summary": "2 orders; 1 prior refund"
+                },
+                rationale_summary=(
+                    "Retrieved summarized order and refund history; raw "
+                    "customer records remain in the governed source system."
+                ),
             )
             
             # Decision logic...
@@ -1112,17 +1533,21 @@ class DecisionTrailContext:
     
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_type is not None:
+            safe_error = self._safe_exception_summary(exc_type, exc_val)
             # Record error in trail
             self._trail.add_step(
-                step_type=ReasoningStepType.CONSTRAINT_CHECK,
-                input_state={"error_type": str(exc_type)},
-                output_state={"error": str(exc_val)},
-                reasoning=f"Trail terminated due to error: {exc_val}",
+                step_type=RationaleStepType.CONSTRAINT_CHECK,
+                input_state={"error_type": safe_error},
+                output_state={"error": "[redacted]"},
+                rationale_summary=(
+                    "Trail terminated due to an exception; raw error details "
+                    "are not logged in the audit rationale."
+                ),
             )
             self._trail.complete(
                 decision="error",
                 confidence=0.0,
-                outcome=f"Failed: {exc_val}",
+                outcome=f"Failed: {safe_error}",
             )
         elif self._trail.final_decision is None:
             # Trail not explicitly completed
@@ -1133,6 +1558,16 @@ class DecisionTrailContext:
             )
         
         self._capture._finalize_trail(self._trail)
+
+    @staticmethod
+    def _safe_exception_summary(exc_type: Any, exc_val: Any) -> str:
+        """Return exception type and numeric code without raw exception text."""
+        type_name = getattr(exc_type, "__name__", "Exception")
+        for attr_name in ("code", "errno", "status_code"):
+            code = getattr(exc_val, attr_name, None)
+            if isinstance(code, int):
+                return f"{type_name}(code={code})"
+        return type_name
 
 # ============================================================================
 # Block 7 (chapter listing #7)
@@ -1152,7 +1587,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 
 class VerificationResult(Enum):
@@ -1202,9 +1637,12 @@ class IntegrityVerifier:
             for anomaly in report.anomalies:
                 print(f"  Event {anomaly['sequence_num']}: {anomaly['issue']}")
     """
+
+    def __init__(self, max_anomalies: int = 100):
+        self._max_anomalies = max_anomalies
     
     def verify_file(self, file_path: str | Path) -> VerificationReport:
-        """Verify integrity of events in a log file."""
+        """Verify integrity of events in a log file without loading it all."""
         path = Path(file_path)
         if not path.exists():
             return VerificationReport(
@@ -1215,26 +1653,25 @@ class IntegrityVerifier:
                 anomalies=[],
             )
         
-        events = list(self._read_events(path))
-        return self.verify_events(events)
+        return self.verify_events(self._read_events(path))
     
-    def verify_events(self, events: list[dict[str, Any]]) -> VerificationReport:
-        """Verify integrity of a list of events."""
-        if not events:
-            return VerificationReport(
-                result=VerificationResult.VALID,
-                events_checked=0,
-                first_invalid_event=None,
-                details="No events to verify",
-                anomalies=[],
-            )
-        
+    def verify_events(
+        self,
+        events: Iterable[dict[str, Any]],
+    ) -> VerificationReport:
+        """Verify integrity of an event iterable, streaming one event at a time."""
         anomalies: list[dict[str, Any]] = []
+        anomaly_count = 0
         expected_previous_hash = "genesis"
         expected_sequence = 1
         last_timestamp: datetime | None = None
+        events_checked = 0
+        first_invalid_event: int | None = None
+        first_critical_issue: str | None = None
+        saw_error = False
         
         for i, event in enumerate(events):
+            events_checked += 1
             integrity = event.get("integrity", {})
             sequence_num = integrity.get("sequence_num")
             previous_hash = integrity.get("previous_hash")
@@ -1242,82 +1679,122 @@ class IntegrityVerifier:
             
             # Check sequence continuity
             if sequence_num != expected_sequence:
-                anomalies.append({
+                anomaly_count += 1
+                anomaly = {
                     "event_index": i,
                     "sequence_num": sequence_num,
                     "issue": f"Sequence gap: expected {expected_sequence}, got {sequence_num}",
                     "severity": "error",
-                })
+                }
+                if first_invalid_event is None:
+                    first_invalid_event = i
+                saw_error = True
+                if len(anomalies) < self._max_anomalies:
+                    anomalies.append(anomaly)
             
             # Check chain continuity
             if previous_hash != expected_previous_hash:
-                anomalies.append({
+                anomaly_count += 1
+                anomaly = {
                     "event_index": i,
                     "sequence_num": sequence_num,
                     "issue": f"Chain broken: expected previous_hash {expected_previous_hash[:16]}..., got {previous_hash[:16] if previous_hash else 'None'}...",
                     "severity": "critical",
-                })
+                }
+                if first_invalid_event is None:
+                    first_invalid_event = i
+                if first_critical_issue is None:
+                    first_critical_issue = anomaly["issue"]
+                if len(anomalies) < self._max_anomalies:
+                    anomalies.append(anomaly)
             
             # Verify event hash
             calculated_hash = self._calculate_event_hash(event)
             if calculated_hash != stored_hash:
-                anomalies.append({
+                anomaly_count += 1
+                anomaly = {
                     "event_index": i,
                     "sequence_num": sequence_num,
-                    "issue": f"Hash mismatch: stored {stored_hash[:16]}..., calculated {calculated_hash[:16]}...",
+                    "issue": f"Hash mismatch: stored {stored_hash[:16] if stored_hash else 'None'}..., calculated {calculated_hash[:16]}...",
                     "severity": "critical",
-                })
+                }
+                if first_invalid_event is None:
+                    first_invalid_event = i
+                if first_critical_issue is None:
+                    first_critical_issue = anomaly["issue"]
+                if len(anomalies) < self._max_anomalies:
+                    anomalies.append(anomaly)
             
-            # Check timestamp ordering
+            # Check timestamp ordering. Equal timestamps within a single
+            # microsecond are permitted: clock granularity and concurrent
+            # writers can legitimately produce back-to-back events at the
+            # same wall-clock instant. Only strictly out-of-order timestamps
+            # are flagged below.
             event_timestamp = datetime.fromisoformat(
                 event["timestamp"].replace("Z", "+00:00")
             )
             if last_timestamp and event_timestamp < last_timestamp:
-                anomalies.append({
+                anomaly_count += 1
+                anomaly = {
                     "event_index": i,
                     "sequence_num": sequence_num,
                     "issue": f"Timestamp anomaly: {event_timestamp} is before previous {last_timestamp}",
                     "severity": "warning",
-                })
+                }
+                if first_invalid_event is None:
+                    first_invalid_event = i
+                if len(anomalies) < self._max_anomalies:
+                    anomalies.append(anomaly)
             
             # Update expectations for next event
             expected_previous_hash = stored_hash
             expected_sequence = sequence_num + 1
             last_timestamp = event_timestamp
         
-        # Determine overall result
-        if not anomalies:
+        if events_checked == 0:
             return VerificationReport(
                 result=VerificationResult.VALID,
-                events_checked=len(events),
+                events_checked=0,
+                first_invalid_event=None,
+                details="No events to verify",
+                anomalies=[],
+            )
+
+        # Determine overall result
+        if anomaly_count == 0:
+            return VerificationReport(
+                result=VerificationResult.VALID,
+                events_checked=events_checked,
                 first_invalid_event=None,
                 details="All events verified successfully",
                 anomalies=[],
             )
         
-        critical_anomalies = [a for a in anomalies if a["severity"] == "critical"]
-        if critical_anomalies:
-            first_critical = critical_anomalies[0]
-            if "Hash mismatch" in first_critical["issue"]:
+        if first_critical_issue:
+            if "Hash mismatch" in first_critical_issue:
                 result = VerificationResult.INVALID_HASH
             else:
                 result = VerificationResult.BROKEN_CHAIN
-        elif any(a["severity"] == "error" for a in anomalies):
+        elif saw_error:
             result = VerificationResult.SEQUENCE_GAP
         else:
             result = VerificationResult.TIMESTAMP_ANOMALY
+
+        sample_note = ""
+        if anomaly_count > len(anomalies):
+            sample_note = f" (showing first {len(anomalies)})"
         
         return VerificationReport(
             result=result,
-            events_checked=len(events),
-            first_invalid_event=anomalies[0]["event_index"],
-            details=f"Found {len(anomalies)} anomalies in audit log",
+            events_checked=events_checked,
+            first_invalid_event=first_invalid_event,
+            details=f"Found {anomaly_count} anomalies in audit log{sample_note}",
             anomalies=anomalies,
         )
     
     def _read_events(self, path: Path) -> Iterator[dict[str, Any]]:
         """Read events from a JSONL file."""
-        with open(path) as f:
+        with path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -1341,8 +1818,8 @@ class PeriodicCheckpointer:
     Creates periodic integrity checkpoints.
     
     Checkpoints capture the state of the audit chain at specific
-    points, enabling detection of tampering even if an attacker
-    tries to rewrite history consistently.
+    points. When checkpoint records are independently preserved,
+    they let verifiers detect attempts to rewrite history consistently.
     
     Checkpoints can be:
     - Stored in a separate, append-only system
@@ -1353,7 +1830,7 @@ class PeriodicCheckpointer:
     def __init__(
         self,
         checkpoint_interval: int = 1000,
-        checkpoint_sink: callable | None = None,
+        checkpoint_sink: Callable | None = None,
     ):
         self._interval = checkpoint_interval
         self._sink = checkpoint_sink
@@ -1369,7 +1846,12 @@ class PeriodicCheckpointer:
         self._events_since_checkpoint += 1
         
         if self._events_since_checkpoint >= self._interval:
-            checkpoint = self._create_checkpoint(event_hash, sequence_num)
+            events_in_interval = self._events_since_checkpoint
+            checkpoint = self._create_checkpoint(
+                event_hash,
+                sequence_num,
+                events_in_interval,
+            )
             self._events_since_checkpoint = 0
             
             if self._sink:
@@ -1383,6 +1865,7 @@ class PeriodicCheckpointer:
         self,
         event_hash: str,
         sequence_num: int,
+        events_in_interval: int,
     ) -> dict[str, Any]:
         """Create an integrity checkpoint."""
         checkpoint = {
@@ -1391,7 +1874,7 @@ class PeriodicCheckpointer:
             "sequence_num": sequence_num,
             "event_hash": event_hash,
             "previous_checkpoint_hash": self._last_checkpoint_hash,
-            "events_in_interval": self._events_since_checkpoint,
+            "events_in_interval": events_in_interval,
         }
         
         # Calculate checkpoint hash
@@ -1419,9 +1902,23 @@ and routine audits.
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Callable, Iterator
 import json
 from pathlib import Path
+import re
+
+MAX_QUERY_REGEX_PATTERN_CHARS = 256
+MAX_QUERY_REGEX_TARGET_CHARS = 4096
+_UNSAFE_REPEATED_GROUP = re.compile(
+    r"\((?:[^()\\]|\\.)*(?:[+*{]|\|)(?:[^()\\]|\\.)*\)(?:[+*{])"
+)
+
+
+@lru_cache(maxsize=512)
+def _compile_query_regex(pattern: str) -> re.Pattern[str]:
+    """Compile and cache validated audit query regex patterns."""
+    return re.compile(pattern)
 
 
 class QueryOperator(Enum):
@@ -1462,10 +1959,25 @@ class QueryCondition:
         elif self.operator == QueryOperator.IN:
             return actual in self.value
         elif self.operator == QueryOperator.REGEX:
-            import re
-            return bool(re.search(self.value, str(actual)))
+            return self._safe_regex_match(self.value, str(actual))
         
         return False
+
+    def _safe_regex_match(self, pattern: Any, text: str) -> bool:
+        """Run a bounded regex search for operator-controlled audit queries."""
+        if not isinstance(pattern, str):
+            return False
+        if len(pattern) > MAX_QUERY_REGEX_PATTERN_CHARS:
+            raise ValueError("regex pattern is too long for audit query")
+        if _UNSAFE_REPEATED_GROUP.search(pattern):
+            raise ValueError("nested or repeated regex groups are not allowed")
+
+        target = text[:MAX_QUERY_REGEX_TARGET_CHARS]
+        try:
+            compiled = _compile_query_regex(pattern)
+        except re.error:
+            return False
+        return bool(compiled.search(target))
     
     def _get_nested_value(self, obj: dict, path: str) -> Any:
         """Get a value from a nested dictionary using dot notation."""
@@ -1553,11 +2065,15 @@ class AuditQuery:
     
     def limit(self, count: int) -> AuditQuery:
         """Limit the number of results."""
+        if count < 0:
+            raise ValueError("limit must be non-negative")
         self._limit_value = count
         return self
     
     def offset(self, count: int) -> AuditQuery:
         """Skip the first N results."""
+        if count < 0:
+            raise ValueError("offset must be non-negative")
         self._offset_value = count
         return self
 
@@ -1585,38 +2101,75 @@ class FileQueryEngine:
     Elasticsearch or a similar search system.
     """
     
-    def __init__(self, log_directory: str | Path):
+    def __init__(
+        self,
+        log_directory: str | Path,
+        max_ordered_matches: int = 100_000,
+        max_unordered_results: int = 10_000,
+    ):
         self._log_dir = Path(log_directory)
+        self._max_ordered_matches = max_ordered_matches
+        self._max_unordered_results = max_unordered_results
     
     def execute(self, query: AuditQuery) -> QueryResult:
         """Execute a query and return results."""
         import time
         start_time = time.time()
         
-        matching_events: list[dict[str, Any]] = []
-        
         # Find relevant log files based on time range
         log_files = self._find_log_files(query._time_range)
-        
-        for log_file in log_files:
-            for event in self._read_events(log_file):
-                if self._matches_query(event, query):
-                    matching_events.append(event)
-        
-        # Apply ordering
+
         if query._order_by_field:
+            matching_events: list[dict[str, Any]] = []
+
+            for log_file in log_files:
+                for event in self._read_events(log_file):
+                    if self._matches_query(event, query):
+                        matching_events.append(event)
+                        if len(matching_events) > self._max_ordered_matches:
+                            raise ValueError(
+                                "Ordered audit query matched more than "
+                                f"{self._max_ordered_matches} events; narrow "
+                                "the filters or use an indexed search backend"
+                            )
+
             matching_events.sort(
                 key=lambda e: self._get_nested_value(e, query._order_by_field) or "",
                 reverse=query._order_descending,
             )
-        
-        total_count = len(matching_events)
-        
-        # Apply offset and limit
-        if query._offset_value:
-            matching_events = matching_events[query._offset_value:]
-        if query._limit_value:
-            matching_events = matching_events[:query._limit_value]
+
+            total_count = len(matching_events)
+            if query._offset_value:
+                matching_events = matching_events[query._offset_value:]
+            if query._limit_value is not None:
+                matching_events = matching_events[:query._limit_value]
+        else:
+            matching_events = []
+            total_count = 0
+
+            for log_file in log_files:
+                for event in self._read_events(log_file):
+                    if not self._matches_query(event, query):
+                        continue
+
+                    total_count += 1
+                    if total_count <= query._offset_value:
+                        continue
+                    if (
+                        query._limit_value is not None
+                        and len(matching_events) >= query._limit_value
+                    ):
+                        continue
+                    if (
+                        query._limit_value is None
+                        and len(matching_events) >= self._max_unordered_results
+                    ):
+                        raise ValueError(
+                            "Unordered audit query would return more than "
+                            f"{self._max_unordered_results} events; add a "
+                            "limit or narrow the filters"
+                        )
+                    matching_events.append(event)
         
         query_time_ms = (time.time() - start_time) * 1000
         
@@ -1630,14 +2183,65 @@ class FileQueryEngine:
         """Find log files that may contain events in the time range."""
         if not self._log_dir.exists():
             return []
-        
-        # For simplicity, return all log files
-        # A production implementation would filter by file timestamps
-        return sorted(self._log_dir.glob("audit_*.jsonl"))
+
+        log_files = sorted(self._log_dir.glob("audit_*.jsonl"))
+        if time_range is None:
+            return log_files
+
+        start = self._to_utc(time_range.start)
+        end = self._to_utc(time_range.end)
+        if end < start:
+            return []
+
+        always_include: set[Path] = set()
+        timestamped_files: list[tuple[Path, datetime]] = []
+        for path in log_files:
+            timestamp = self._timestamp_from_log_filename(path)
+            if timestamp is None:
+                # Unknown filename shapes may still contain matching events.
+                always_include.add(path)
+            else:
+                timestamped_files.append((path, timestamp))
+
+        included = set(always_include)
+        timestamped_files.sort(key=lambda item: (item[1], item[0].name))
+        for index, (path, file_start) in enumerate(timestamped_files):
+            next_file_start = (
+                timestamped_files[index + 1][1]
+                if index + 1 < len(timestamped_files)
+                else None
+            )
+            may_overlap = (
+                file_start <= end
+                and (next_file_start is None or next_file_start >= start)
+            )
+            if may_overlap:
+                included.add(path)
+
+        return sorted(included)
+
+    def _timestamp_from_log_filename(self, path: Path) -> datetime | None:
+        """Parse audit_YYYYMMDD_HHMMSS...jsonl rotation timestamps."""
+        prefix = "audit_"
+        if not path.name.startswith(prefix) or path.suffix != ".jsonl":
+            return None
+
+        timestamp_text = path.name[len(prefix):len(prefix) + 15]
+        try:
+            parsed = datetime.strptime(timestamp_text, "%Y%m%d_%H%M%S")
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=timezone.utc)
+
+    def _to_utc(self, value: datetime) -> datetime:
+        """Normalize query bounds before comparing them with file timestamps."""
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
     
     def _read_events(self, path: Path) -> Iterator[dict[str, Any]]:
         """Read events from a log file."""
-        with open(path) as f:
+        with path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -1647,10 +2251,12 @@ class FileQueryEngine:
         """Check if an event matches a query."""
         # Check time range
         if query._time_range:
-            event_time = datetime.fromisoformat(
-                event["timestamp"].replace("Z", "+00:00")
+            event_time = self._to_utc(
+                datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
             )
-            if event_time < query._time_range.start or event_time > query._time_range.end:
+            start = self._to_utc(query._time_range.start)
+            end = self._to_utc(query._time_range.end)
+            if event_time < start or event_time > end:
                 return False
         
         # Check all conditions

@@ -17,13 +17,140 @@ To use a particular class or function, copy it into your own project and
 provide the surrounding context (imports, dependencies) as needed.
 """
 
+import pytest
+
 
 # ============================================================================
 # Block 1 (chapter listing #1)
 # ============================================================================
 
+# Module-top stubs so this demo test can be imported without NameError.
+# Replaced with fail-loud RequiredDependency placeholders: any attempt
+# to call ``Agent(...)`` or iterate ``tool_registry`` raises a clear
+# RuntimeError pointing at what to wire. The ``agent_class`` fixture
+# below catches the unwired case and pytest-skips, so the test file
+# stays collectable in a fresh checkout.
+#
+# Production Setup Checklist
+# --------------------------
+# 1. Replace ``Agent`` with your real agent class.
+# 2. Replace ``tool_registry`` with your real tool registry (or use
+#    the ToolRegistry defined later in this chapter).
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _optional import _RequiredDependency  # noqa: E402
+
+
+def _identity_decorator(*args, **kwargs):
+    """Return a no-op decorator for optional test-library annotations."""
+    if args and callable(args[0]) and len(args) == 1 and not kwargs:
+        return args[0]
+
+    def decorate(func):
+        return func
+
+    return decorate
+
+
+class _MissingStrategyNamespace:
+    def text(self, *args, **kwargs):
+        return object()
+
+    def lists(self, *args, **kwargs):
+        return object()
+
+    def sampled_from(self, *args, **kwargs):
+        return object()
+
+
+class _MissingRespx:
+    mock = staticmethod(_identity_decorator)
+
+    def get(self, *args, **kwargs):
+        return _RequiredDependency(
+            "respx route",
+            "Install respx before running these integration tests.",
+        )
+
+
+class _MissingVCR:
+    use_cassette = staticmethod(_identity_decorator)
+
+
+class _MissingModule:
+    def __init__(self, module_name: str):
+        self.module_name = module_name
+
+    def __getattr__(self, attr: str):
+        return _RequiredDependency(
+            f"{self.module_name}.{attr}",
+            f"Install or provide `{self.module_name}` before running this example.",
+        )
+
+
+def _optional_test_module(module_name: str):
+    try:
+        return __import__(module_name, fromlist=["*"])
+    except ImportError:
+        return _MissingModule(module_name)
+
+Agent = _RequiredDependency(  # TODO[1]: see checklist
+    "Agent",
+    "Replace with your real Agent class when adapting this example.",
+)
+tool_registry = _RequiredDependency(  # TODO[2]: see checklist
+    "tool_registry",
+    "Replace with your real tool registry (or the chapter's ToolRegistry).",
+)
+
+
+class MockToolCall:
+    """Minimal tool-call fake for this introductory test."""
+
+    def __init__(self, id: str, name: str, arguments: dict[str, str]) -> None:
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+
+
+class MockResponse:
+    """Minimal response fake for this introductory test."""
+
+    def __init__(
+        self,
+        content: str | None = None,
+        tool_calls: list[MockToolCall] | None = None,
+    ) -> None:
+        self.content = content
+        self.tool_calls = tool_calls or []
+
+
+class MockLLM:
+    """Minimal scripted LLM fake for this introductory test."""
+
+    def __init__(self) -> None:
+        self.responses: list[MockResponse] = []
+        self.call_count = 0
+
+    def add_response(self, response: MockResponse) -> None:
+        self.responses.append(response)
+
+
+@pytest.fixture
+def agent_class():
+    """Return the configured Agent class for examples that need one."""
+    # Detect the unwired pedagogical placeholder via repr (avoids
+    # importing _RequiredDependency into the fixture's local namespace).
+    if isinstance(Agent, _RequiredDependency) or isinstance(tool_registry, _RequiredDependency):
+        pytest.skip(
+            "Configure the Agent class and tool_registry before running this example"
+        )
+    return Agent
+
+
 # A simple agent test that checks tool selection
-def test_agent_uses_search_for_questions():
+def test_agent_uses_search_for_questions(agent_class, tool_registry):
     """Agent should use the search tool when asked a factual question."""
     # Create a mock that returns a predetermined response
     mock_llm = MockLLM()
@@ -33,7 +160,7 @@ def test_agent_uses_search_for_questions():
     mock_llm.add_response(MockResponse(content="Here are the best practices..."))
 
     # Create agent with mock LLM
-    agent = Agent(llm=mock_llm, tools=tool_registry)
+    agent = agent_class(llm=mock_llm, tools=tool_registry)
 
     # Run and verify
     result = agent.run("What are Python best practices?")
@@ -141,6 +268,7 @@ Mock LLM implementation for deterministic agent testing.
 
 import json
 import re
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Literal
@@ -225,11 +353,35 @@ class MockLLM:
         # Bounded so long-running property-based / hypothesis tests don't
         # accumulate unbounded call records. Default fits typical pytest
         # suites; raise it for replay-heavy integration runs.
+        self._max_history = max_history
         self._call_history: deque[dict[str, Any]] = deque(maxlen=max_history)
+        # Track silent eviction so property-based tests don't lose evidence
+        # without warning the developer.
+        self._evicted_count: int = 0
+        self._eviction_warned: bool = False
         self._default_response: MockResponse | None = None
         self._should_stream: bool = False
         self._error_on_call: int | None = None
         self._error_type: type[Exception] = RuntimeError
+
+    def _record_call(self, entry: dict[str, Any]) -> None:
+        """Append a call record, accounting for ring-buffer eviction."""
+        if len(self._call_history) == self._max_history:
+            self._evicted_count += 1
+            if not self._eviction_warned:
+                self._eviction_warned = True
+                warnings.warn(
+                    f"MockLLM.call_history reached max_history={self._max_history}; "
+                    "earliest calls will be silently dropped. Raise max_history "
+                    "or check call_count before relying on call_history.",
+                    stacklevel=3,
+                )
+        self._call_history.append(entry)
+
+    @property
+    def evicted_count(self) -> int:
+        """Number of call records silently dropped from the ring buffer."""
+        return self._evicted_count
     
     def add_response(self, response: MockResponse) -> MockLLM:
         """Add a response to the sequential queue."""
@@ -275,6 +427,8 @@ class MockLLM:
         """Reset the mock to initial state."""
         self._call_index = 0
         self._call_history.clear()
+        self._evicted_count = 0
+        self._eviction_warned = False
     
     @property
     def call_count(self) -> int:
@@ -368,16 +522,16 @@ class MockLLM:
         Returns:
             MockResponse with the predetermined content/tool calls
         """
-        self._call_history.append({
+        self._record_call({
             "messages": messages,
             "tools": tools,
             "kwargs": kwargs,
         })
-        
+
         # Check for simulated error
         if self._error_on_call == len(self._call_history) - 1:
             raise self._error_type("Simulated error")
-        
+
         return self._find_response(messages)
     
     def stream(
@@ -397,7 +551,7 @@ class MockLLM:
         Yields:
             MockStreamChunk objects
         """
-        self._call_history.append({
+        self._record_call({
             "messages": messages,
             "tools": tools,
             "kwargs": kwargs,
@@ -483,27 +637,79 @@ class MockLLMBuilder:
 """
 Property-based tests for agent invariants using Hypothesis.
 """
-from hypothesis import given, strategies as st, settings
+import pytest
+try:
+    import hypothesis
+    import hypothesis.strategies as st
+except ImportError:  # pragma: no cover - optional property-test dependency
+    hypothesis = None
+    st = _MissingStrategyNamespace()
+
+    def _skip_missing_hypothesis(func):
+        reason = "Install hypothesis before running these property-based tests."
+
+        def skipped_test(*args, **kwargs):
+            del args, kwargs
+            pytest.skip(reason)
+
+        skipped_test.__name__ = func.__name__
+        skipped_test.__qualname__ = func.__qualname__
+        skipped_test.__doc__ = func.__doc__
+        skipped_test.__module__ = func.__module__
+        return pytest.mark.skip(reason=reason)(skipped_test)
+
+    def _skip_hypothesis_decorator(*args, **kwargs):
+        if args and callable(args[0]) and len(args) == 1 and not kwargs:
+            return _skip_missing_hypothesis(args[0])
+
+        def decorate(func):
+            return _skip_missing_hypothesis(func)
+
+        return decorate
+
+    given = _skip_hypothesis_decorator
+    settings = _skip_hypothesis_decorator
+
+    class HealthCheck:
+        function_scoped_fixture = object()
+else:
+    given = hypothesis.given
+    settings = hypothesis.settings
+    HealthCheck = hypothesis.HealthCheck
 import re
+
+@pytest.fixture
+def agent_factory():
+    """Return a factory for a configured agent under test."""
+    pytest.skip("Configure agent_factory to return your real agent")
 
 
 @given(st.text(min_size=1, max_size=1000))
-@settings(max_examples=100)
-def test_agent_never_exposes_secrets(user_input: str):
-    """Property: Agent responses never contain API keys or passwords."""
+@settings(
+    max_examples=100,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test_sampled_responses_avoid_common_secret_patterns(user_input: str, agent_factory):
+    """Smoke invariant: sampled responses avoid common secret patterns, not proof."""
+    agent = agent_factory()
     response = agent.process(user_input)
 
-    # Check for common secret patterns
+    # Smoke-check common secret patterns; this is not a proof of non-disclosure.
     assert "sk-" not in response.content  # OpenAI key pattern
     assert "AKIA" not in response.content  # AWS access key
     assert not re.search(r"password\s*[=:]\s*\S+", response.content.lower())
 
 
 @given(st.text(max_size=500))
-@settings(max_examples=50, deadline=30000)  # 30s timeout per example
-def test_agent_responds_within_timeout(user_input: str):
+@settings(
+    max_examples=50,
+    deadline=30000,  # 30s timeout per example
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test_agent_responds_within_timeout(user_input: str, agent_factory):
     """Property: For all sampled inputs, agent.process terminates and
     returns a non-empty response within the configured timeout."""
+    agent = agent_factory()
     response = agent.process(user_input, timeout=25)
     assert response is not None
     assert len(response.content) > 0
@@ -514,13 +720,15 @@ def test_agent_responds_within_timeout(user_input: str):
     "Search for Python docs",
     "Calculate 2+2"
 ]), min_size=1, max_size=5))
-def test_tool_selection_is_stable(queries: list[str]):
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_tool_selection_is_stable(queries: list[str], agent_factory):
     """Property: For each query, the modal tool selection across N samples
     matches in at least M/N runs (i.e., the agent's selection is stable
     under low-temperature sampling, not bit-for-bit deterministic).
     Requires temperature<=0.1 and a fixed seed when supported."""
     N, M = 5, 4  # tolerate 1 dissenting sample out of 5
     for q in queries:
+        agent = agent_factory()
         picks = [agent.select_tool(q) for _ in range(N)]
         mode_count = max(picks.count(p) for p in set(picks))
         assert mode_count >= M, f"Unstable tool selection for {q!r}: {picks}"
@@ -536,9 +744,151 @@ Unit tests for agent decision-making logic.
 import ast
 import operator
 import pytest
-from src.testing.mock_llm import MockLLM, MockLLMBuilder, MockResponse, MockToolCall
-from src.agent import Agent, AgentConfig
-from src.tools import ToolRegistry
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+# In a packaged application, these tests would import Agent, AgentConfig,
+# ToolRegistry, and MockLLM from your project modules. The aggregate companion
+# file is flat, so it reuses the MockLLM classes defined above and provides a
+# small local Agent/ToolRegistry pair for runnable examples.
+
+
+@dataclass
+class AgentConfig:
+    """Minimal configuration for the example agent used in this listing."""
+
+    max_iterations: int = 5
+    retry_on_error: bool = False
+    max_retries: int = 0
+    max_context_messages: int = 20
+
+
+@dataclass
+class SimpleAgentResult:
+    """Result shape returned by the example agent."""
+
+    final_response: str
+    tool_calls: list[MockToolCall] = field(default_factory=list)
+    task_completed: bool = True
+    conversation_history: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    has_error: bool = False
+    error: Exception | None = None
+
+
+class ToolRegistry:
+    """Tiny registry that is sufficient for the unit-test examples."""
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Callable[..., Any]] = {}
+
+    def register(
+        self,
+        name: str,
+        replace: bool = False,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a callable tool by name."""
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            if name in self._tools and not replace:
+                raise ValueError(f"Tool already registered: {name}")
+            self._tools[name] = func
+            return func
+
+        return decorator
+
+    def execute(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Execute a registered tool."""
+        if name not in self._tools:
+            raise KeyError(f"Unknown tool: {name}")
+        return self._tools[name](**arguments)
+
+    def to_llm_tools(self) -> list[dict[str, Any]]:
+        """Return a simple tool description list for MockLLM call history."""
+        return [{"name": name} for name in self._tools]
+
+
+class Agent:
+    """Small deterministic agent used only by this flat companion file."""
+
+    def __init__(
+        self,
+        llm: MockLLM,
+        tools: ToolRegistry,
+        config: AgentConfig | None = None,
+    ) -> None:
+        self.llm = llm
+        self.tools = tools
+        self.config = config or AgentConfig()
+        self.conversation_history: list[dict[str, Any]] = []
+
+    def _messages_for(self, user_message: str) -> list[dict[str, Any]]:
+        history = self.conversation_history[-self.config.max_context_messages:]
+        return [
+            {"role": "system", "content": "You are a helpful test agent."},
+            *history,
+            {"role": "user", "content": user_message},
+        ]
+
+    def run(
+        self,
+        message: str,
+        timeout: float | None = None,
+        cancellation_token: Any | None = None,
+    ) -> SimpleAgentResult:
+        """Run the example agent against the scripted MockLLM responses."""
+        del timeout  # MockLLM is in-process; real agents should honor this.
+        messages = self._messages_for(message)
+        tool_calls: list[MockToolCall] = []
+        has_error = False
+        error: Exception | None = None
+
+        for _ in range(self.config.max_iterations + 1):
+            if cancellation_token is not None and cancellation_token.cancel_requested:
+                raise TimeoutError("agent run cancelled")
+
+            response = self.llm.complete(messages, tools=self.tools.to_llm_tools())
+
+            if not response.tool_calls:
+                final_response = response.content or ""
+                messages.append({"role": "assistant", "content": final_response})
+                self.conversation_history = [
+                    m for m in messages if m["role"] != "system"
+                ][-self.config.max_context_messages:]
+                return SimpleAgentResult(
+                    final_response=final_response,
+                    tool_calls=tool_calls,
+                    conversation_history=self.conversation_history,
+                    has_error=has_error,
+                    error=error,
+                )
+
+            tool_calls.extend(response.tool_calls)
+            messages.append(response.to_message())
+            for tool_call in response.tool_calls:
+                try:
+                    tool_result = self.tools.execute(
+                        tool_call.name,
+                        tool_call.arguments,
+                    )
+                    content = str(tool_result)
+                except Exception as exc:
+                    has_error = True
+                    error = exc
+                    content = f"error: {exc}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": content,
+                })
+
+        return SimpleAgentResult(
+            final_response="Stopped after reaching the iteration limit.",
+            tool_calls=tool_calls,
+            task_completed=False,
+            conversation_history=self.conversation_history,
+            has_error=True,
+            error=RuntimeError("iteration limit reached"),
+        )
 
 
 # Whitelisted arithmetic operators for the calculator fixture. Using a
@@ -547,7 +897,7 @@ from src.tools import ToolRegistry
 _SAFE_OPS = {
     ast.Add: operator.add, ast.Sub: operator.sub,
     ast.Mult: operator.mul, ast.Div: operator.truediv,
-    ast.Mod: operator.mod, ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
     ast.USub: operator.neg, ast.UAdd: operator.pos,
 }
 
@@ -771,11 +1121,16 @@ Integration tests for agent tools.
 """
 import pytest
 import httpx
-import respx
+try:
+    import respx
+except ImportError:  # pragma: no cover - optional integration-test dependency
+    respx = _MissingRespx()
 from pathlib import Path
-from src.tools.web_search import WebSearchTool
-from src.tools.file_operations import FileOperationsTool
-from src.tools.database import DatabaseTool
+WebSearchTool = _optional_test_module("src.tools.web_search").WebSearchTool
+FileOperationsTool = _optional_test_module(
+    "src.tools.file_operations"
+).FileOperationsTool
+DatabaseTool = _optional_test_module("src.tools.database").DatabaseTool
 
 
 @pytest.mark.integration
@@ -972,10 +1327,13 @@ class TestDatabaseTool:
 Tests using VCR.py to record/replay HTTP interactions.
 """
 import pytest
-import vcr
+try:
+    import vcr
+except ImportError:  # pragma: no cover - optional integration-test dependency
+    vcr = _MissingVCR()
 from pathlib import Path
-from src.tools.weather import WeatherTool
-from src.tools.stock_price import StockPriceTool
+WeatherTool = _optional_test_module("src.tools.weather").WeatherTool
+StockPriceTool = _optional_test_module("src.tools.stock_price").StockPriceTool
 
 
 CASSETTE_DIR = Path(__file__).parent / "cassettes"
@@ -1072,6 +1430,10 @@ Test harness for end-to-end agent testing.
 import logging
 import time
 import json
+import asyncio
+import inspect
+import queue
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 from pathlib import Path
@@ -1088,12 +1450,19 @@ if TYPE_CHECKING:
 
 @dataclass
 class TestScenario:
-    """A test scenario definition."""
-    
+    """A test scenario definition.
+
+    ``expected_outcomes`` references ``ExpectedOutcome`` (defined just
+    below). The forward reference resolves at runtime because this
+    module uses ``from __future__ import annotations`` (PEP 563); the
+    order is kept deliberately so readers see the scenario container
+    before the per-outcome schema.
+    """
+
     name: str
     description: str
     user_messages: list[str]
-    expected_outcomes: list[ExpectedOutcome]
+    expected_outcomes: list["ExpectedOutcome"]  # forward ref; see class docstring
     setup: Callable[[], None] | None = None
     teardown: Callable[[], None] | None = None
     tags: list[str] = field(default_factory=list)
@@ -1135,6 +1504,7 @@ class TestResult:
     error: Exception | None = None
     outcome_results: list[tuple[ExpectedOutcome, bool]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
     
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1142,6 +1512,7 @@ class TestResult:
             "passed": self.passed,
             "duration_seconds": self.duration_seconds,
             "error": str(self.error) if self.error else None,
+            "tags": self.tags,
             "metrics": self.metrics,
             "outcomes": [
                 {"type": o.type, "passed": p, "message": o.message}
@@ -1159,6 +1530,42 @@ class AgentResult:
     task_completed: bool
     conversation_history: list[dict[str, Any]]
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CancellationToken:
+    """Cooperative deadline token passed into synchronous agent runs.
+
+    Agents that do blocking or multi-step synchronous work should check
+    ``cancel_requested`` or call ``raise_if_cancelled()`` between operations.
+    Async agents are cancelled by ``asyncio.wait_for`` instead.
+    """
+
+    deadline: float
+    _cancelled: bool = False
+
+    @property
+    def time_remaining(self) -> float:
+        """Seconds remaining before the scenario deadline."""
+        return max(0.0, self.deadline - time.monotonic())
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether the deadline has expired or cancellation was requested."""
+        return self._cancelled or self.time_remaining <= 0
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation."""
+        self._cancelled = True
+
+    def raise_if_cancelled(self) -> None:
+        """Raise a timeout error when cancellation has been requested."""
+        if self.cancel_requested:
+            raise ScenarioTimeoutError("Scenario deadline expired")
+
+
+class ScenarioTimeoutError(TimeoutError):
+    """Raised when the harness deadline expires before an agent step returns."""
 
 
 class AgentTestHarness:
@@ -1183,14 +1590,127 @@ class AgentTestHarness:
         self,
         agent_factory: Callable[[], Agent],
         metrics_collector: MetricsCollector | None = None,
+        max_results: int | None = 1000,
     ) -> None:
+        if max_results is not None and max_results < 1:
+            raise ValueError("max_results must be positive or None")
         self.agent_factory = agent_factory
         self.metrics_collector = metrics_collector or MetricsCollector()
-        self._results: list[TestResult] = []
+        self._results: deque[TestResult] = deque(maxlen=max_results)
+
+    def _deadline_kwargs(
+        self,
+        run_method: Callable[..., Any],
+        token: CancellationToken,
+    ) -> tuple[dict[str, Any], bool]:
+        """Build deadline kwargs accepted by agent.run.
+
+        Returns the kwargs and whether the synchronous method has a
+        cooperative deadline channel. Sync agents must accept at least
+        ``timeout``, ``cancellation_token``, or ``cancel_token``. Async agents
+        can rely on ``asyncio.wait_for`` cancellation.
+        """
+        try:
+            signature = inspect.signature(run_method)
+        except (TypeError, ValueError):
+            return {}, False
+
+        params = signature.parameters
+        accepts_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in params.values()
+        )
+        kwargs: dict[str, Any] = {}
+
+        if "timeout" in params or accepts_kwargs:
+            kwargs["timeout"] = token.time_remaining
+
+        if "cancellation_token" in params or accepts_kwargs:
+            kwargs["cancellation_token"] = token
+        elif "cancel_token" in params:
+            kwargs["cancel_token"] = token
+
+        has_deadline_channel = any(
+            name in kwargs for name in ("timeout", "cancellation_token", "cancel_token")
+        )
+        return kwargs, has_deadline_channel
+
+    def _run_agent_step(
+        self,
+        agent: Agent,
+        message: str,
+        timeout_seconds: float,
+    ) -> Any:
+        """Run one agent turn with a harness-enforced deadline."""
+        if timeout_seconds <= 0:
+            raise ScenarioTimeoutError("Scenario timed out before agent.run")
+
+        token = CancellationToken(deadline=time.monotonic() + timeout_seconds)
+        run_method = agent.run
+        is_async_run = inspect.iscoroutinefunction(run_method)
+        kwargs, has_deadline_channel = self._deadline_kwargs(run_method, token)
+
+        if not is_async_run and not has_deadline_channel:
+            raise TypeError(
+                "Synchronous agent.run must accept timeout, cancellation_token, "
+                "or cancel_token so the harness can enforce deadlines without "
+                "leaking worker threads."
+            )
+
+        try:
+            if is_async_run:
+                result = run_method(message, **kwargs)
+            else:
+                result_queue: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
+
+                def invoke_sync_run() -> None:
+                    try:
+                        result_queue.put((True, run_method(message, **kwargs)))
+                    except BaseException as exc:
+                        result_queue.put((False, exc))
+
+                worker = threading.Thread(
+                    target=invoke_sync_run,
+                    name="agent-test-harness-run",
+                    daemon=True,
+                )
+                worker.start()
+                worker.join(timeout=token.time_remaining)
+                if worker.is_alive():
+                    token.cancel()
+                    raise ScenarioTimeoutError(
+                        f"agent.run exceeded {timeout_seconds:.2f}s harness timeout"
+                    )
+                succeeded, payload = result_queue.get_nowait()
+                if not succeeded:
+                    raise payload
+                result = payload
+
+            if inspect.isawaitable(result):
+                try:
+                    return asyncio.run(
+                        asyncio.wait_for(result, timeout=token.time_remaining)
+                    )
+                except asyncio.TimeoutError as exc:
+                    token.cancel()
+                    raise ScenarioTimeoutError(
+                        f"agent.run exceeded {timeout_seconds:.2f}s harness timeout"
+                    ) from exc
+        except ScenarioTimeoutError:
+            token.cancel()
+            raise
+
+        if token.cancel_requested:
+            token.cancel()
+            raise ScenarioTimeoutError(
+                f"agent.run exceeded {timeout_seconds:.2f}s harness timeout"
+            )
+        return result
     
     def run_scenario(self, scenario: TestScenario) -> TestResult:
         """Run a single test scenario."""
-        start_time = time.time()
+        start_time = time.monotonic()
+        deadline = start_time + scenario.timeout_seconds
         agent_result = None
         error = None
         outcome_results = []
@@ -1213,9 +1733,12 @@ class AgentTestHarness:
             # Run all user messages
             result = None
             for message in scenario.user_messages:
-                result = agent.run(message, timeout=scenario.timeout_seconds)
+                remaining_timeout = deadline - time.monotonic()
+                result = self._run_agent_step(
+                    agent, message, remaining_timeout
+                )
 
-            # The final result (result is guaranteed bound by the guard above)
+            # The guard above requires at least one message, so result is set.
             agent_result = AgentResult(
                 final_response=result.final_response,
                 tool_calls=result.tool_calls,
@@ -1238,11 +1761,12 @@ class AgentTestHarness:
             if scenario.teardown:
                 scenario.teardown()
         
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         all_passed = all(p for _, p in outcome_results) and error is None
         
         # Collect metrics
         metrics = self.metrics_collector.collect(agent_result) if agent_result else {}
+        metrics["tags"] = list(scenario.tags)
         
         result = TestResult(
             scenario_name=scenario.name,
@@ -1252,6 +1776,7 @@ class AgentTestHarness:
             error=error,
             outcome_results=outcome_results,
             metrics=metrics,
+            tags=list(scenario.tags),
         )
         
         self._results.append(result)
@@ -1329,8 +1854,12 @@ Behavioral tests for the customer support agent.
 """
 import pytest
 from pathlib import Path
-from src.testing.harness import AgentTestHarness
-from src.agents.customer_support import create_customer_support_agent
+
+
+def create_customer_support_agent():
+    """Load the project agent only when these project-layout tests run."""
+    module = pytest.importorskip("src.agents.customer_support")
+    return module.create_customer_support_agent()
 
 
 SCENARIOS_DIR = Path(__file__).parent / "scenarios"
@@ -1376,9 +1905,10 @@ class TestCustomerSupportAgent:
         # Filter to tagged scenarios
         tagged_results = [
             r for r in all_results
-            if tag in r.metrics.get("tags", [])
+            if tag in r.tags
         ]
         
+        assert tagged_results, f"No scenarios found for tag: {tag}"
         failed = [r for r in tagged_results if not r.passed]
         assert not failed, f"Failed {tag} scenarios: {[r.scenario_name for r in failed]}"
 
@@ -1387,13 +1917,13 @@ class TestCustomerSupportAgent:
 # ============================================================================
 
 # The problem: this test passes but misses quality issues
-def test_agent_responds():
+def test_agent_responds(agent: Agent):
     result = agent.run("Help me with my order")
     assert result.final_response  # Just checks we got a response
     # Passes! But response might be "I don't know" or contain PII
 
 # What we actually need: evaluate the response quality
-def test_agent_response_quality():
+def test_agent_response_quality(agent: Agent):
     result = agent.run("Help me with my order #12345")
 
     # Did the agent complete the task?
@@ -1588,7 +2118,10 @@ class ConversationQualityEvaluator(Evaluator):
         # Relevance: Does the response address the task?
         task_keywords = set(task.lower().split())
         response_keywords = set(response.lower().split())
-        keyword_overlap = len(task_keywords & response_keywords) / len(task_keywords)
+        keyword_overlap = (
+            len(task_keywords & response_keywords) / len(task_keywords)
+            if task_keywords else 0.0
+        )
         scores["relevance"] = min(keyword_overlap * 2, 1.0)
         
         # Conciseness: Is the response appropriately sized?
@@ -1636,8 +2169,14 @@ class CompositeEvaluator(Evaluator):
         self,
         evaluators: list[tuple[Evaluator, float]],  # (evaluator, weight)
     ) -> None:
+        if not evaluators:
+            raise ValueError("evaluators must not be empty")
+        if any(weight < 0 for _, weight in evaluators):
+            raise ValueError("evaluator weights must be non-negative")
         self.evaluators = evaluators
         total_weight = sum(w for _, w in evaluators)
+        if total_weight <= 0:
+            raise ValueError("total evaluator weight must be positive")
         self.normalized_weights = [
             (e, w / total_weight) for e, w in evaluators
         ]
@@ -1677,13 +2216,6 @@ class CompositeEvaluator(Evaluator):
 Tests using the evaluation framework.
 """
 import pytest
-from src.testing.evaluation import (
-    TaskCompletionEvaluator,
-    SafetyEvaluator,
-    ConversationQualityEvaluator,
-    CompositeEvaluator,
-)
-from src.testing.harness import AgentTestHarness, AgentResult
 
 
 @pytest.fixture
@@ -1706,8 +2238,6 @@ class TestAgentWithEvaluation:
         composite_evaluator: CompositeEvaluator,
     ) -> None:
         """Evaluate agent on a search task."""
-        from src.testing.harness import TestScenario, ExpectedOutcome
-        
         scenario = TestScenario(
             name="search_evaluation",
             description="Search and summarize information",
@@ -1759,8 +2289,6 @@ class TestAgentWithEvaluation:
 Tests for prompt injection resilience.
 """
 import pytest
-from src.agent import Agent
-from src.testing.mock_llm import MockLLM, MockResponse
 
 
 class PromptInjectionTestSuite:
@@ -1804,8 +2332,8 @@ class TestPromptInjectionResilience:
     @pytest.fixture
     def secure_agent(self) -> Agent:
         """Create an agent with security measures."""
-        from src.agents.secure_agent import create_secure_agent
-        return create_secure_agent()
+        module = pytest.importorskip("src.agents.secure_agent")
+        return module.create_secure_agent()
     
     @pytest.mark.parametrize("injection", PromptInjectionTestSuite.DIRECT_OVERRIDES)
     def test_direct_override_rejected(
@@ -1914,7 +2442,6 @@ class TestToolAbuse:
 Edge case and boundary condition tests.
 """
 import pytest
-from src.agent import Agent
 
 
 @pytest.mark.safety
@@ -1944,10 +2471,10 @@ class TestEdgeCases:
     def test_unicode_edge_cases(self, agent: Agent) -> None:
         """Agent should handle unusual Unicode correctly."""
         unicode_inputs = [
-            "Hello! ",  # Zero-width spaces
-            "Testthis",  # RTL override
+            "Hello!\u200b\u200b\u200b",  # Zero-width spaces
+            "Test\u202ethis",  # RTL override
             "\U0001F4A9" * 100,  # Many emoji
-            "Cafe naive resume",  # Accented characters
+            "Cafe\u0301 nai\u0308ve re\u0301sume\u0301",  # Combining accents
         ]
         
         for inp in unicode_inputs:
@@ -2059,6 +2586,8 @@ class GoldenTest:
 def load_golden_tests(category: str) -> list[GoldenTest]:
     """Load golden tests for a category."""
     golden_file = GOLDEN_DIR / f"{category}.json"
+    if not golden_file.exists():
+        return []
     with open(golden_file) as f:
         data = json.load(f)
     return [GoldenTest.from_dict(t) for t in data["tests"]]
@@ -2071,8 +2600,8 @@ class TestAgentRegression:
     @pytest.fixture
     def agent(self) -> Agent:
         """Create the production agent configuration."""
-        from src.agents.production import create_production_agent
-        return create_production_agent()
+        module = pytest.importorskip("src.agents.production")
+        return module.create_production_agent()
     
     @pytest.mark.parametrize(
         "golden",
@@ -2133,10 +2662,10 @@ class TestModelVersionRegression:
     
     def test_capability_parity(self) -> None:
         """Ensure new model version maintains capabilities."""
-        from src.agents.production import create_production_agent
+        module = pytest.importorskip("src.agents.production")
         
         # This would typically compare against a baseline
-        agent = create_production_agent()
+        agent = module.create_production_agent()
         
         test_cases = [
             ("What's 2+2?", ["4"]),
@@ -2272,6 +2801,32 @@ def test_internal_method():  # Testing implementation, not behavior
 # ============================================================================
 # Block 22 (chapter listing #22)
 # ============================================================================
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Placeholder model configuration for the fixture examples."""
+
+    model: str
+    temperature: float
+    max_tokens: int
+
+
+class ExampleDatabaseConnection:
+    """Placeholder database handle used until project wiring is supplied."""
+
+    def close(self) -> None:
+        pass
+
+
+def create_test_database() -> ExampleDatabaseConnection:
+    """Replace with project-specific test database setup."""
+    pytest.skip("Provide create_test_database() for this project")
+
+
+def create_agent_with_all_tools(model_config: ModelConfig) -> Any:
+    """Replace with a project-specific fully tooled agent factory."""
+    pytest.skip("Provide create_agent_with_all_tools() for this project")
+
 
 # tests/conftest.py - Project-wide fixtures
 @pytest.fixture(scope="session")

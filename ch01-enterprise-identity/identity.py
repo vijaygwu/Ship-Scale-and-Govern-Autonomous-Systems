@@ -13,12 +13,36 @@ docstrings so this file always remains valid Python.
 
 To use a particular class or function, copy it into your own project and
 provide the surrounding context (imports, dependencies) as needed.
+
+Production Setup Checklist
+--------------------------
+1. Replace ``INTERNAL_NETWORK`` (Block 3) with the network ACL or VPC
+   subnet list your environment treats as trusted. The block is a
+   pedagogical foil for what NOT to do under zero-trust; keep the
+   empty set in copy-paste deployments so the perimeter branch is
+   never taken.
+2. Wire ``audit_log`` (Block 3) to your SIEM sink (Splunk, Datadog,
+   CloudWatch Logs, etc.). The placeholder is a fail-loud
+   ``_RequiredDependency`` so a forgotten wiring raises rather than
+   silently dropping audit events.
+3. Replace ``database`` (Block 3) with your real DB driver. Same
+   fail-loud behavior; a misconfigured deployment will not silently
+   no-op queries.
+4. Provision real signing material for ``CertificateAuthority`` and
+   the JWT signer (Block 5+); the in-process key generation here is
+   for local examples only.
+
+The pedagogical examples in Block 3 illustrate what NOT to do under a
+perimeter-security mindset, then show the zero-trust replacement. They
+intentionally use fail-loud placeholders so a copy-paste deployment
+fails fast rather than silently no-oping.
 """
 
 # Module-level imports needed by listings that appear before Block 5's
 # import section (e.g., the @dataclass decorator on DelegationToken in
 # Block 4 evaluates its `datetime` annotations at class-creation time,
 # and CertificateAuthority calls `logger.warning` inside Block 5).
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -95,6 +119,41 @@ async def investigate_incident_with_identity(trade_id, identity_service):
 # Block 3 (chapter listing #3)
 # ============================================================================
 
+# Placeholder bindings for the pedagogical examples below. See the
+# Production Setup Checklist at the top of this module.
+#
+# - INTERNAL_NETWORK (checklist #1) intentionally stays a real empty
+#   set: the `in` operator must work for the perimeter-security
+#   counter-example, and an empty set makes the trust branch explicit
+#   instead of silently taking it in a copy-paste deployment.
+# - `database` (checklist #3) and `audit_log` (checklist #2) are
+#   replaced with fail-loud RequiredDependency placeholders; any call
+#   raises a clear error rather than silently no-oping.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _optional import _RequiredDependency  # noqa: E402
+
+INTERNAL_NETWORK: set[str] = set()  # TODO[1]: see checklist
+database = _RequiredDependency(  # TODO[3]: see checklist
+    "database",
+    "Replace with your real DB driver (psycopg, sqlalchemy, ...).",
+)
+audit_log = _RequiredDependency(  # TODO[2]: see checklist
+    "audit_log",
+    "Wire to your SIEM sink (Splunk, Datadog, CloudWatch Logs, ...).",
+)
+
+
+def _stable_query_hash(query: str | bytes) -> str:
+    """Return a deterministic SHA-256 fingerprint for audit query fields."""
+    if isinstance(query, bytes):
+        query_bytes = query
+    else:
+        query_bytes = query.encode("utf-8")
+    return hashlib.sha256(query_bytes).hexdigest()
+
+
 # Traditional perimeter security (what NOT to do)
 def handle_database_request_insecure(request):
     # Agent is "inside" our network, so trust it
@@ -106,13 +165,19 @@ def handle_database_request_insecure(request):
 async def handle_database_request_zero_trust(request, identity_service):
     # 1. VERIFY EXPLICITLY: Validate the agent's identity
     try:
-        identity = await identity_service.validate_token(
+        payload = await identity_service.validate_token(
             request.agent_token,
             required_scope=PermissionScope.DATA_READ
         )
+        identity = await identity_service.get_identity(payload["sub"])
+        if not identity:
+            raise ValueError("agent identity not found")
     except ValueError:
         audit_log.record("database_access_denied", reason="invalid_token")
         return "Access denied: invalid credentials"
+    except PermissionError:
+        audit_log.record("database_access_denied", reason="insufficient_data_scope")
+        return "Access denied: missing data:read permission"
 
     # 2. LEAST PRIVILEGE: Check specific permission for this resource
     if "customers" in request.query and not identity.has_permission("data:customers:read"):
@@ -123,7 +188,7 @@ async def handle_database_request_zero_trust(request, identity_service):
     audit_log.record(
         "database_query_executed",
         agent_id=identity.agent_id,
-        query_hash=hash(request.query),
+        query_hash=_stable_query_hash(request.query),
         tables_accessed=["customers"],
         certificate_serial=identity.certificate_serial
     )
@@ -148,7 +213,7 @@ class DelegationToken:
     constraints: dict           # Additional restrictions
     
     def to_jwt(self, signing_key: str) -> str:
-        """Encode as signed JWT."""
+        """Encode as an HS256-signed JWT for this reference implementation."""
         payload = {
             "type": "delegation",
             "del_id": self.delegation_id,
@@ -160,7 +225,7 @@ class DelegationToken:
             "exp": int(self.expires_at.timestamp()),
             "constraints": self.constraints
         }
-        return jwt.encode(payload, signing_key, algorithm="RS256")
+        return jwt.encode(payload, signing_key, algorithm="HS256")
 
 # ============================================================================
 # Block 5 (chapter listing #5)
@@ -194,16 +259,19 @@ Code Navigation (line numbers are approximate):
 
 import asyncio
 import hashlib
+import heapq
 import hmac
 import json
 import os
 import secrets
+import threading
 import uuid
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
 
 import jwt
@@ -246,6 +314,163 @@ class PermissionScope(str, Enum):
     ADMIN_FULL = "admin:*"
 
 
+Permission = PermissionScope | str
+
+
+def permission_value(permission: Permission) -> str:
+    """Return the wire-format string for standard and custom scopes."""
+    if isinstance(permission, PermissionScope):
+        return permission.value
+    return permission
+
+
+_DELEGATION_AUTHZ_CLAIMS = (
+    "delegable_scopes",
+    "permissions",
+    "scp",
+    "scope",
+)
+
+
+def _scope_claim_values(claim_value: Any) -> set[str]:
+    """Normalize common OIDC/OAuth scope claim shapes into a string set."""
+    if claim_value is None:
+        return set()
+    if isinstance(claim_value, str):
+        return {scope for scope in claim_value.split() if scope}
+    if isinstance(claim_value, (list, tuple, set)):
+        return {
+            permission_value(scope) if isinstance(scope, PermissionScope) else str(scope)
+            for scope in claim_value
+        }
+    return set()
+
+
+def _delegable_scope_claims(human_oidc_token: dict) -> set[str]:
+    """Collect scopes this human token is allowed to delegate."""
+    allowed: set[str] = set()
+    for claim_name in _DELEGATION_AUTHZ_CLAIMS:
+        allowed.update(_scope_claim_values(human_oidc_token.get(claim_name)))
+    return allowed
+
+
+def _scope_allowed_by_claims(scope: str, allowed_scopes: set[str]) -> bool:
+    """Return true if OIDC claims authorize delegating this exact scope."""
+    return (
+        permission_value(PermissionScope.ADMIN_FULL) in allowed_scopes
+        or scope in allowed_scopes
+    )
+
+
+def _datetime_utc(value: datetime) -> datetime:
+    """Normalize certificate datetimes to timezone-aware UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _certificate_validity_window_utc(
+    cert: x509.Certificate
+) -> tuple[datetime, datetime]:
+    """Return certificate validity bounds as timezone-aware UTC datetimes."""
+    not_before = getattr(cert, "not_valid_before_utc", None)
+    not_after = getattr(cert, "not_valid_after_utc", None)
+    if not_before is None:
+        not_before = cert.not_valid_before
+    if not_after is None:
+        not_after = cert.not_valid_after
+    return _datetime_utc(not_before), _datetime_utc(not_after)
+
+
+_MIN_HS256_SECRET_BYTES = 32
+_TEST_ENVIRONMENTS = {"test", "testing", "pytest"}
+_PRODUCTION_ENVIRONMENTS = {"production", "prod"}
+_LOCAL_KEY_VAULT_ENVIRONMENTS = {
+    "development",
+    "dev",
+    "demo",
+    "local",
+    *_TEST_ENVIRONMENTS,
+}
+_DISALLOWED_JWT_SECRET_MARKERS = (
+    "demo",
+    "test",
+    "example",
+    "sample",
+    "changeme",
+    "change_me",
+    "change-me",
+    "password",
+)
+
+
+def _current_environment() -> str:
+    return os.environ.get("ENVIRONMENT", "production").lower()
+
+
+def _is_test_environment(environment: str) -> bool:
+    return environment.lower() in _TEST_ENVIRONMENTS
+
+
+def _is_production_environment(environment: str) -> bool:
+    return environment.lower() in _PRODUCTION_ENVIRONMENTS
+
+
+def _is_local_key_vault_environment(environment: str) -> bool:
+    return environment.lower() in _LOCAL_KEY_VAULT_ENVIRONMENTS
+
+
+def _is_production_key_provider(key_provider: Any) -> bool:
+    return bool(getattr(key_provider, "is_production_key_provider", False))
+
+
+def _validate_key_provider_environment(
+    key_provider: Any,
+    environment: str
+) -> None:
+    """Fail closed when a demo key provider is wired into deployable envs."""
+    if _is_production_key_provider(key_provider):
+        return
+
+    if _is_local_key_vault_environment(environment):
+        return
+
+    if getattr(key_provider, "is_in_memory_demo_provider", False):
+        raise RuntimeError(
+            "In-memory KeyVault is for explicit development/demo/test use only. "
+            "Set ENVIRONMENT=development, demo, or test for local examples, "
+            "or provide a KMS/HSM-backed key provider marked "
+            "is_production_key_provider=True."
+        )
+
+    if _is_production_environment(environment):
+        raise RuntimeError(
+            "ENVIRONMENT=production/prod requires a KMS/HSM-backed key "
+            "provider marked is_production_key_provider=True."
+        )
+
+
+def _validate_hs256_jwt_secret(secret: str, environment: str) -> str:
+    """Reject HS256 secrets that are too short or obviously non-production."""
+    secret_bytes = secret.encode("utf-8")
+    if len(secret_bytes) < _MIN_HS256_SECRET_BYTES:
+        raise RuntimeError(
+            "JWT_SECRET must be at least 32 bytes (256 bits) for HS256."
+        )
+
+    lower_secret = secret.lower()
+    has_demo_marker = any(
+        marker in lower_secret for marker in _DISALLOWED_JWT_SECRET_MARKERS
+    )
+    if has_demo_marker and not _is_test_environment(environment):
+        raise RuntimeError(
+            "JWT_SECRET must not contain demo/test/example markers outside "
+            "test runs."
+        )
+
+    return secret
+
+
 class IdentityStatus(str, Enum):
     """Lifecycle status of an agent identity."""
     PENDING = "pending"      # Created but not yet activated
@@ -281,6 +506,7 @@ class AuditEventType(str, Enum):
     DELEGATION_CREATED = "delegation.created"
     DELEGATION_USED = "delegation.used"
     DELEGATION_REVOKED = "delegation.revoked"
+    DELEGATION_REJECTED = "delegation.rejected"
     
     # Key management
     KEY_ROTATED = "key.rotated"
@@ -305,7 +531,7 @@ class AgentIdentity:
     description: str
     owner_team: str
     owner_email: str
-    permissions: list[PermissionScope]
+    permissions: list[Permission]
     status: IdentityStatus
     certificate_pem: Optional[str]
     certificate_serial: Optional[str]
@@ -326,13 +552,14 @@ class AgentIdentity:
             return False
         return True
     
-    def has_permission(self, scope: PermissionScope) -> bool:
+    def has_permission(self, scope: Permission) -> bool:
         """Check if identity has a specific permission."""
-        if PermissionScope.ADMIN_FULL in self.permissions:
+        permission_values = {permission_value(p) for p in self.permissions}
+        if permission_value(PermissionScope.ADMIN_FULL) in permission_values:
             return True
-        return scope in self.permissions
+        return permission_value(scope) in permission_values
     
-    def has_any_permission(self, scopes: list[PermissionScope]) -> bool:
+    def has_any_permission(self, scopes: list[Permission]) -> bool:
         """Check if identity has any of the specified permissions."""
         return any(self.has_permission(s) for s in scopes)
     
@@ -344,7 +571,7 @@ class AgentIdentity:
             "description": self.description,
             "owner_team": self.owner_team,
             "owner_email": self.owner_email,
-            "permissions": [p.value for p in self.permissions],
+            "permissions": [permission_value(p) for p in self.permissions],
             "status": self.status.value,
             "certificate_pem": self.certificate_pem,
             "certificate_serial": self.certificate_serial,
@@ -451,20 +678,205 @@ class IdentityStore:
     - Elasticsearch for audit log queries
     """
     
-    def __init__(self, audit_log_capacity: int = 10_000):
-        # Naturally bounded by user/agent population (one entry per agent_id,
-        # credential_id, delegation_id). In production, back these with a
-        # database so memory does not scale with fleet size.
+    def __init__(
+        self,
+        audit_log_capacity: int = 10_000,
+        max_credential_records: int = 50_000,
+        revoked_credential_retention_hours: int = 24,
+        max_revoked_cert_records: int = 50_000,
+        revoked_cert_retention_hours: int = 24,
+        max_delegation_records: int = 50_000,
+        terminal_delegation_retention_hours: int = 24
+    ):
+        if max_revoked_cert_records < 1:
+            raise ValueError("max_revoked_cert_records must be positive")
+        if revoked_cert_retention_hours <= 0:
+            raise ValueError("revoked_cert_retention_hours must be positive")
+        # Identity records are bounded by agent population. Credential and
+        # delegation records are operational logs, so this teaching store
+        # prunes terminal records and caps live entries below.
         self._identities: dict[str, AgentIdentity] = {}
         self._credentials: dict[str, Credential] = {}
+        self._credentials_by_agent: dict[str, set[str]] = {}
+        self._credential_expiry_heap: list[tuple[datetime, str]] = []
+        self._max_credential_records = max_credential_records
+        self._revoked_credential_retention = timedelta(
+            hours=revoked_credential_retention_hours
+        )
         self._delegations: dict[str, DelegationRecord] = {}
+        self._delegation_expiry_heap: list[tuple[datetime, str]] = []
+        self._max_delegation_records = max_delegation_records
+        self._terminal_delegation_retention = timedelta(
+            hours=terminal_delegation_retention_hours
+        )
         # Audit log is *not* naturally bounded -- every action appends an event.
         # Use a bounded deque so the process cannot leak memory indefinitely.
         # For long-running production deployments, replace this in-memory ring
         # buffer with a durable sink (Kafka, Loki, CloudTrail, etc.) so that
         # events evicted from the deque are still retained for compliance.
         self._audit_log: deque[AuditEvent] = deque(maxlen=audit_log_capacity)
-        self._revoked_certs: set[str] = set()  # Certificate Revocation List
+        # Eviction counter: increments each time a full deque drops its oldest
+        # event on append. Exposed via the audit_events_dropped property so
+        # operators can spot silent compliance-log loss. A WARN is emitted the
+        # first time an eviction occurs to surface the condition immediately.
+        self._audit_events_dropped: int = 0
+        self._revoked_certs: dict[str, datetime] = {}  # serial -> retain-until
+        self._revoked_cert_expiry_heap: list[tuple[datetime, str]] = []
+        self._max_revoked_cert_records = max_revoked_cert_records
+        self._revoked_cert_retention = timedelta(hours=revoked_cert_retention_hours)
+        self._identity_activity_lock = asyncio.Lock()
+        self._delegation_lock = asyncio.Lock()
+
+    def _credential_removable_at(self, credential: Credential) -> datetime:
+        """Return when an in-memory credential record can be pruned."""
+        if credential.is_revoked:
+            revoked_at = credential.revoked_at or credential.expires_at
+            return min(
+                credential.expires_at,
+                revoked_at + self._revoked_credential_retention
+            )
+        return credential.expires_at
+
+    def _delete_credential(self, credential_id: str) -> None:
+        """Remove a credential and its secondary index entry."""
+        credential = self._credentials.pop(credential_id, None)
+        if not credential:
+            return
+
+        agent_credentials = self._credentials_by_agent.get(credential.agent_id)
+        if not agent_credentials:
+            return
+
+        agent_credentials.discard(credential_id)
+        if not agent_credentials:
+            del self._credentials_by_agent[credential.agent_id]
+
+    def _cleanup_revoked_certs(self, now: Optional[datetime] = None) -> None:
+        """Prune expired certificate revocations and enforce a hard cap."""
+        now = now or datetime.now(timezone.utc)
+
+        while self._revoked_cert_expiry_heap:
+            expires_at, cert_serial = self._revoked_cert_expiry_heap[0]
+            current_expiry = self._revoked_certs.get(cert_serial)
+            if current_expiry is None or current_expiry != expires_at:
+                heapq.heappop(self._revoked_cert_expiry_heap)
+                continue
+            if expires_at > now:
+                break
+
+            heapq.heappop(self._revoked_cert_expiry_heap)
+            del self._revoked_certs[cert_serial]
+
+        while len(self._revoked_certs) > self._max_revoked_cert_records:
+            if not self._revoked_cert_expiry_heap:
+                break
+            expires_at, cert_serial = heapq.heappop(
+                self._revoked_cert_expiry_heap
+            )
+            if self._revoked_certs.get(cert_serial) == expires_at:
+                del self._revoked_certs[cert_serial]
+
+    def _cleanup_credentials(self, now: Optional[datetime] = None) -> None:
+        """
+        Bound the teaching store by pruning expired/revoked credentials.
+
+        JWT expiry still protects expired tokens cryptographically. If the
+        record cap is reached, this store drops the soonest-removable records
+        and validation fails closed because missing credentials are rejected.
+        """
+        now = now or datetime.now(timezone.utc)
+
+        while self._credential_expiry_heap:
+            removable_at, credential_id = self._credential_expiry_heap[0]
+            credential = self._credentials.get(credential_id)
+            if credential is None:
+                heapq.heappop(self._credential_expiry_heap)
+                continue
+            if self._credential_removable_at(credential) != removable_at:
+                heapq.heappop(self._credential_expiry_heap)
+                continue
+            if removable_at > now:
+                break
+
+            heapq.heappop(self._credential_expiry_heap)
+            self._delete_credential(credential_id)
+
+        while len(self._credentials) > self._max_credential_records:
+            if not self._credential_expiry_heap:
+                break
+            removable_at, credential_id = heapq.heappop(
+                self._credential_expiry_heap
+            )
+            credential = self._credentials.get(credential_id)
+            if credential is None:
+                continue
+            if self._credential_removable_at(credential) != removable_at:
+                continue
+            self._delete_credential(credential_id)
+
+    def _delegation_used_up(self, delegation: DelegationRecord) -> bool:
+        """Return true when a delegation can never be consumed again."""
+        return (
+            delegation.max_uses is not None
+            and delegation.used_count >= delegation.max_uses
+        )
+
+    def _delegation_removable_at(
+        self,
+        delegation: DelegationRecord
+    ) -> datetime:
+        """Return when a terminal delegation can be pruned."""
+        if self._delegation_used_up(delegation):
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if delegation.is_revoked:
+            revoked_at = delegation.revoked_at or delegation.expires_at
+            return min(
+                delegation.expires_at,
+                revoked_at + self._terminal_delegation_retention
+            )
+        return delegation.expires_at
+
+    def _delete_delegation(self, delegation_id: str) -> None:
+        """Remove a delegation record from the teaching store."""
+        self._delegations.pop(delegation_id, None)
+
+    def _cleanup_delegations(self, now: Optional[datetime] = None) -> None:
+        """
+        Bound delegation memory by pruning expired, revoked, and used-up rows.
+
+        If the cap is still exceeded after terminal cleanup, this store drops
+        the nearest-removable delegation and validation fails closed because
+        missing delegation records are rejected.
+        """
+        now = now or datetime.now(timezone.utc)
+
+        while self._delegation_expiry_heap:
+            removable_at, delegation_id = self._delegation_expiry_heap[0]
+            delegation = self._delegations.get(delegation_id)
+            if delegation is None:
+                heapq.heappop(self._delegation_expiry_heap)
+                continue
+            if self._delegation_removable_at(delegation) != removable_at:
+                heapq.heappop(self._delegation_expiry_heap)
+                continue
+            if removable_at > now:
+                break
+
+            heapq.heappop(self._delegation_expiry_heap)
+            self._delete_delegation(delegation_id)
+
+        while len(self._delegations) > self._max_delegation_records:
+            if not self._delegation_expiry_heap:
+                break
+            removable_at, delegation_id = heapq.heappop(
+                self._delegation_expiry_heap
+            )
+            delegation = self._delegations.get(delegation_id)
+            if delegation is None:
+                continue
+            if self._delegation_removable_at(delegation) != removable_at:
+                continue
+            self._delete_delegation(delegation_id)
     
     async def create_identity(self, identity: AgentIdentity) -> None:
         """Store a new identity."""
@@ -481,6 +893,33 @@ class IdentityStore:
         if identity.agent_id not in self._identities:
             raise ValueError(f"Identity not found: {identity.agent_id}")
         self._identities[identity.agent_id] = identity
+
+    async def record_identity_activity(
+        self,
+        agent_id: str,
+        seen_at: datetime,
+        min_interval: timedelta
+    ) -> bool:
+        """
+        Persist last_used_at at most once per interval.
+
+        Production stores should implement this as an atomic conditional
+        UPDATE, for example:
+        WHERE agent_id = :agent_id
+          AND (last_used_at IS NULL OR last_used_at < :threshold)
+        """
+        async with self._identity_activity_lock:
+            identity = self._identities.get(agent_id)
+            if not identity:
+                return False
+
+            previous_seen_at = identity.last_used_at
+            if previous_seen_at and seen_at - previous_seen_at < min_interval:
+                return False
+
+            identity.last_used_at = seen_at
+            self._identities[agent_id] = identity
+            return True
     
     async def list_identities(
         self,
@@ -501,35 +940,149 @@ class IdentityStore:
     
     async def store_credential(self, credential: Credential) -> None:
         """Store a credential record."""
+        previous = self._credentials.get(credential.credential_id)
+        if previous and previous.agent_id != credential.agent_id:
+            previous_agent_credentials = self._credentials_by_agent.get(
+                previous.agent_id
+            )
+            if previous_agent_credentials:
+                previous_agent_credentials.discard(credential.credential_id)
+
         self._credentials[credential.credential_id] = credential
+        self._credentials_by_agent.setdefault(credential.agent_id, set()).add(
+            credential.credential_id
+        )
+        heapq.heappush(
+            self._credential_expiry_heap,
+            (self._credential_removable_at(credential), credential.credential_id)
+        )
+        self._cleanup_credentials()
     
     async def get_credential(self, credential_id: str) -> Optional[Credential]:
         """Retrieve a credential by ID."""
+        self._cleanup_credentials()
         return self._credentials.get(credential_id)
     
     async def get_credentials_for_agent(self, agent_id: str) -> list[Credential]:
         """Get all credentials for an agent."""
-        return [c for c in self._credentials.values() if c.agent_id == agent_id]
+        self._cleanup_credentials()
+        credential_ids = list(self._credentials_by_agent.get(agent_id, set()))
+        credentials: list[Credential] = []
+
+        for credential_id in credential_ids:
+            credential = self._credentials.get(credential_id)
+            if credential is None:
+                agent_credentials = self._credentials_by_agent.get(agent_id)
+                if agent_credentials:
+                    agent_credentials.discard(credential_id)
+                    if not agent_credentials:
+                        del self._credentials_by_agent[agent_id]
+                continue
+            credentials.append(credential)
+
+        return credentials
     
     async def store_delegation(self, delegation: DelegationRecord) -> None:
         """Store a delegation record."""
-        self._delegations[delegation.delegation_id] = delegation
+        async with self._delegation_lock:
+            self._cleanup_delegations()
+            self._delegations[delegation.delegation_id] = delegation
+            heapq.heappush(
+                self._delegation_expiry_heap,
+                (
+                    self._delegation_removable_at(delegation),
+                    delegation.delegation_id
+                )
+            )
+            self._cleanup_delegations()
     
     async def get_delegation(self, delegation_id: str) -> Optional[DelegationRecord]:
         """Retrieve a delegation by ID."""
-        return self._delegations.get(delegation_id)
+        async with self._delegation_lock:
+            self._cleanup_delegations()
+            return self._delegations.get(delegation_id)
+
+    async def consume_delegation_use(
+        self,
+        delegation_id: str
+    ) -> DelegationRecord:
+        """
+        Atomically consume one allowed delegation use.
+
+        Production stores should make this a single conditional update:
+        increment used_count only where used_count < max_uses, or where
+        max_uses is NULL.
+        """
+        async with self._delegation_lock:
+            self._cleanup_delegations()
+            delegation = self._delegations.get(delegation_id)
+            if not delegation:
+                raise ValueError("Delegation record not found")
+
+            if delegation.is_revoked:
+                raise ValueError("Delegation has been revoked")
+
+            if datetime.now(timezone.utc) > delegation.expires_at:
+                raise ValueError("Delegation has expired")
+
+            if (
+                delegation.max_uses is not None
+                and delegation.used_count >= delegation.max_uses
+            ):
+                raise ValueError("Delegation has exceeded maximum uses")
+
+            delegation.used_count += 1
+            if self._delegation_used_up(delegation):
+                self._delete_delegation(delegation_id)
+            else:
+                self._delegations[delegation_id] = delegation
+                heapq.heappush(
+                    self._delegation_expiry_heap,
+                    (
+                        self._delegation_removable_at(delegation),
+                        delegation_id
+                    )
+                )
+            return delegation
     
-    async def add_to_crl(self, cert_serial: str) -> None:
+    async def add_to_crl(
+        self,
+        cert_serial: str,
+        expires_at: Optional[datetime] = None
+    ) -> None:
         """Add certificate to revocation list."""
-        self._revoked_certs.add(cert_serial)
+        now = datetime.now(timezone.utc)
+        retain_until = expires_at or (now + self._revoked_cert_retention)
+        retain_until = max(retain_until, now + self._revoked_cert_retention)
+        self._revoked_certs[cert_serial] = retain_until
+        heapq.heappush(self._revoked_cert_expiry_heap, (retain_until, cert_serial))
+        self._cleanup_revoked_certs(now)
     
     async def is_cert_revoked(self, cert_serial: str) -> bool:
         """Check if certificate is revoked."""
+        self._cleanup_revoked_certs()
         return cert_serial in self._revoked_certs
     
     async def log_audit_event(self, event: AuditEvent) -> None:
         """Append to audit log (immutable)."""
+        if (
+            self._audit_log.maxlen is not None
+            and len(self._audit_log) == self._audit_log.maxlen
+        ):
+            if self._audit_events_dropped == 0:
+                logger.warning(
+                    "IdentityStore audit log full (maxlen=%d); evicting oldest "
+                    "event. Configure a durable sink to retain compliance "
+                    "history.",
+                    self._audit_log.maxlen,
+                )
+            self._audit_events_dropped += 1
         self._audit_log.append(event)
+
+    @property
+    def audit_events_dropped(self) -> int:
+        """Number of audit events silently evicted by deque overflow."""
+        return self._audit_events_dropped
     
     async def query_audit_log(
         self,
@@ -538,10 +1091,12 @@ class IdentityStore:
         actor_id: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
-        limit: int = 100
+        limit: int = 100,
+        offset: Optional[int] = None
     ) -> list[AuditEvent]:
         """Query audit log with filters."""
-        # Materialize the deque snapshot to a list so we can slice with [-limit:].
+        # Materialize the deque snapshot to a list so callers can either keep
+        # the historical tail-query behavior or page from the start.
         results: list[AuditEvent] = list(self._audit_log)
 
         if agent_id:
@@ -555,12 +1110,15 @@ class IdentityStore:
         if until:
             results = [e for e in results if e.timestamp <= until]
 
+        if offset is not None:
+            return results[offset:offset + limit]
+
         return results[-limit:]
 
 
 class KeyVault:
     """
-    Secure key storage.
+    Development/demo key storage.
     
     In production, replace with:
     - AWS KMS
@@ -568,10 +1126,16 @@ class KeyVault:
     - HashiCorp Vault
     - Hardware Security Module (HSM)
     """
+
+    is_in_memory_demo_provider = True
+    is_production_key_provider = False
     
     def __init__(self):
         self._keys: dict[str, bytes] = {}
         self._metadata: dict[str, dict] = {}
+
+    def _assert_environment_allowed(self) -> None:
+        _validate_key_provider_environment(self, _current_environment())
     
     async def generate_key_pair(
         self,
@@ -581,14 +1145,13 @@ class KeyVault:
     ) -> rsa.RSAPublicKey:
         """Generate and store a new RSA key pair, return the public key.
 
-        These keypairs serve two purposes in the wider identity service:
-          (a) signing X.509 agent certificates (the dominant use in this
-              chapter; see CertificateAuthority below), and
-          (b) signing higher-trust delegation tokens via
-              DelegationToken.to_jwt (RS256 path).
-        They are deliberately NOT used to sign regular agent JWTs, which
-        take the HS256 self-contained path explained in the chapter prose.
+        These keypairs sign X.509 agent certificates (the dominant use in this
+        chapter; see CertificateAuthority below). Agent and delegation JWTs use
+        the HS256 self-contained path explained in the chapter prose; production
+        multi-service deployments commonly replace that path with RS256/ES256
+        and JWKS distribution.
         """
+        self._assert_environment_allowed()
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=key_size,
@@ -612,6 +1175,7 @@ class KeyVault:
     
     async def get_private_key(self, key_id: str) -> Optional[rsa.RSAPrivateKey]:
         """Retrieve private key for signing."""
+        self._assert_environment_allowed()
         pem = self._keys.get(key_id)
         if not pem:
             return None
@@ -635,6 +1199,7 @@ class KeyVault:
     
     async def delete_key(self, key_id: str) -> None:
         """Securely delete a key."""
+        self._assert_environment_allowed()
         if key_id in self._keys:
             # In production, ensure secure deletion
             del self._keys[key_id]
@@ -811,7 +1376,7 @@ class CertificateAuthority:
         # Note: In production, use proper ASN.1 encoding for extensions
         agent_extensions = json.dumps({
             "agent_id": identity.agent_id,
-            "permissions": [p.value for p in identity.permissions],
+            "permissions": [permission_value(p) for p in identity.permissions],
             "owner_team": identity.owner_team,
             "owner_email": identity.owner_email
         }).encode()
@@ -846,7 +1411,8 @@ class CertificateAuthority:
             
             # Check expiration
             now = datetime.now(timezone.utc)
-            if now < cert.not_valid_before or now > cert.not_valid_after:
+            not_before, not_after = _certificate_validity_window_utc(cert)
+            if now < not_before or now > not_after:
                 return False, "Certificate expired or not yet valid", None
             
             # Check revocation
@@ -855,17 +1421,20 @@ class CertificateAuthority:
                 return False, "Certificate has been revoked", None
             
             # Verify signature (simplified - in production, verify full chain)
-            if self._ca_cert:
-                try:
-                    self._ca_cert.public_key().verify(
-                        cert.signature,
-                        cert.tbs_certificate_bytes,
-                        padding.PKCS1v15(),
-                        cert.signature_hash_algorithm
-                    )
-                except Exception as e:
-                    logger.warning(f"Cert signature verification failed: {e}")
-                    return False, "Certificate signature verification failed", None
+            if not self._ca_cert:
+                return False, "CA not initialized or trusted CA not loaded", None
+            if cert.issuer != self._ca_cert.subject:
+                return False, "Certificate issuer does not match trusted CA", None
+            try:
+                self._ca_cert.public_key().verify(
+                    cert.signature,
+                    cert.tbs_certificate_bytes,
+                    padding.PKCS1v15(),
+                    cert.signature_hash_algorithm
+                )
+            except Exception as e:
+                logger.warning(f"Cert signature verification failed: {e}")
+                return False, "Certificate signature verification failed", None
             
             # Extract agent data from extensions
             agent_data = None
@@ -879,9 +1448,13 @@ class CertificateAuthority:
         except Exception as e:
             return False, f"Certificate parsing failed: {str(e)}", None
     
-    async def revoke_certificate(self, cert_serial: str) -> None:
+    async def revoke_certificate(
+        self,
+        cert_serial: str,
+        expires_at: Optional[datetime] = None
+    ) -> None:
         """Add certificate to revocation list."""
-        await self.store.add_to_crl(cert_serial)
+        await self.store.add_to_crl(cert_serial, expires_at=expires_at)
 
 # ============================================================================
 # Block 6 (chapter listing #6)
@@ -906,7 +1479,8 @@ class AgentIdentityService:
         ca: CertificateAuthority,
         jwt_signing_key_id: str = "jwt_signing",
         token_ttl_hours: int = 24,
-        delegation_ttl_hours: int = 8
+        delegation_ttl_hours: int = 8,
+        last_used_update_interval: timedelta = timedelta(minutes=5)
     ):
         self.store = store
         self.key_vault = key_vault
@@ -914,38 +1488,40 @@ class AgentIdentityService:
         self.jwt_signing_key_id = jwt_signing_key_id
         self.token_ttl_hours = token_ttl_hours
         self.delegation_ttl_hours = delegation_ttl_hours
+        self.last_used_update_interval = last_used_update_interval
         self._jwt_secret: Optional[str] = None
     
     async def initialize(self) -> None:
         """Initialize the identity service."""
+        # For HS256, we need a symmetric secret shared by every replica that
+        # will verify tokens. Validate it before generating service keys so a
+        # weak JWT_SECRET fails fast.
+        environment = _current_environment()
+        secret = os.environ.get("JWT_SECRET")
+        if not secret:
+            if _is_production_environment(environment):
+                raise RuntimeError(
+                    "JWT_SECRET must be set in production; a per-process "
+                    "fallback would break token verification across replicas."
+                )
+            secret = secrets.token_urlsafe(32)
+            warnings.warn(
+                "Using generated local JWT secret (ENVIRONMENT="
+                + environment
+                + "). Set JWT_SECRET before going to production."
+            )
+        validated_secret = _validate_hs256_jwt_secret(secret, environment)
+        _validate_key_provider_environment(self.key_vault, environment)
+        self._jwt_secret = validated_secret
+
         # Initialize CA
         await self.ca.initialize()
-        
+
         # Generate JWT signing key
         await self.key_vault.generate_key_pair(
             self.jwt_signing_key_id,
             metadata={"purpose": "jwt_signing"}
         )
-        
-        # For HS256, we need a symmetric secret shared by every replica that
-        # will verify tokens. A per-process random fallback would silently
-        # break verification across restarts and across replicas, so refuse to
-        # start without an explicit secret in production. Local development
-        # may opt in to a generated secret via ENVIRONMENT=development.
-        secret = os.environ.get("JWT_SECRET")
-        if not secret:
-            env = os.environ.get("ENVIRONMENT", "production").lower()
-            if env == "production":
-                raise RuntimeError(
-                    "JWT_SECRET must be set in production; a per-process "
-                    "fallback would break token verification across replicas."
-                )
-            secret = "DEMO_ONLY_" + secrets.token_urlsafe(32)
-            warnings.warn(
-                "Using generated demo JWT secret (ENVIRONMENT=" + env + "). "
-                "Set JWT_SECRET before going to production."
-            )
-        self._jwt_secret = secret
     
     # -------------------------------------------------------
     # Identity Lifecycle
@@ -956,7 +1532,7 @@ class AgentIdentityService:
         description: str,
         owner_team: str,
         owner_email: str,
-        permissions: list[PermissionScope],
+        permissions: list[Permission],
         validity_days: int = 90,
         metadata: Optional[dict] = None,
         actor: str = "system",
@@ -1027,7 +1603,7 @@ class AgentIdentityService:
             details={
                 "name": name,
                 "owner_team": owner_team,
-                "permissions": [p.value for p in permissions],
+                "permissions": [permission_value(p) for p in permissions],
                 "validity_days": validity_days
             },
             correlation_id=correlation_id
@@ -1132,7 +1708,10 @@ class AgentIdentityService:
         
         # Revoke certificate
         if identity.certificate_serial:
-            await self.ca.revoke_certificate(identity.certificate_serial)
+            await self.ca.revoke_certificate(
+                identity.certificate_serial,
+                expires_at=identity.expires_at
+            )
         
         # Revoke all credentials
         await self._revoke_all_credentials(agent_id, actor)
@@ -1161,7 +1740,7 @@ class AgentIdentityService:
     async def issue_token(
         self,
         agent_id: str,
-        scopes: Optional[list[PermissionScope]] = None,
+        scopes: Optional[list[Permission]] = None,
         ttl_hours: Optional[int] = None,
         actor: str = "system",
         correlation_id: Optional[str] = None
@@ -1179,7 +1758,7 @@ class AgentIdentityService:
         for scope in effective_scopes:
             if not identity.has_permission(scope):
                 raise PermissionError(
-                    f"Agent does not have permission: {scope.value}"
+                    f"Agent does not have permission: {permission_value(scope)}"
                 )
         
         token = await self._issue_token(
@@ -1195,7 +1774,7 @@ class AgentIdentityService:
         self,
         identity: AgentIdentity,
         actor: str,
-        scopes: Optional[list[PermissionScope]] = None,
+        scopes: Optional[list[Permission]] = None,
         ttl_hours: Optional[int] = None
     ) -> str:
         """Internal token issuance."""
@@ -1209,7 +1788,7 @@ class AgentIdentityService:
             "sub": identity.agent_id,
             "name": identity.name,
             "owner": identity.owner_team,
-            "scopes": [s.value for s in (scopes or identity.permissions)],
+            "scopes": [permission_value(s) for s in (scopes or identity.permissions)],
             "iat": int(now.timestamp()),
             "exp": int(expires_at.timestamp()),
             "jti": token_id,
@@ -1219,11 +1798,10 @@ class AgentIdentityService:
         
         # Agent-issued JWTs use HS256 here (shared secret, single-issuer
         # path) to keep the example self-contained, as the chapter prose
-        # on HS256 vs RS256 explains. The separate higher-trust delegation
-        # tokens (DelegationToken.to_jwt above) sign with RS256 using a
-        # KeyVault keypair. The RSA generation in KeyVault.generate_key_pair
-        # supports both X.509 certificate issuance and delegation-token
-        # signing; it is intentionally not wired into this regular JWT path.
+        # on HS256 vs RS256 explains. Human delegation tokens in this
+        # reference implementation use the same _jwt_secret; production
+        # multi-service deployments commonly replace both paths with
+        # RS256/ES256 and JWKS distribution.
         token = jwt.encode(payload, self._jwt_secret, algorithm="HS256")
         
         # Store credential record. Use HMAC keyed on _jwt_secret instead of a
@@ -1239,7 +1817,7 @@ class AgentIdentityService:
                 token.encode(),
                 hashlib.sha256,
             ).hexdigest(),
-            scopes=[s.value for s in (scopes or identity.permissions)],
+            scopes=[permission_value(s) for s in (scopes or identity.permissions)],
             issued_at=now,
             expires_at=expires_at,
             issued_by=actor
@@ -1256,7 +1834,7 @@ class AgentIdentityService:
             action="issue",
             outcome="success",
             details={
-                "scopes": [s.value for s in (scopes or identity.permissions)],
+                "scopes": [permission_value(s) for s in (scopes or identity.permissions)],
                 "ttl_hours": ttl
             }
         )
@@ -1266,7 +1844,7 @@ class AgentIdentityService:
     async def validate_token(
         self,
         token: str,
-        required_scope: Optional[PermissionScope] = None
+        required_scope: Optional[Permission] = None
     ) -> dict:
         """
         Validate an authentication token.
@@ -1342,9 +1920,10 @@ class AgentIdentityService:
         
         # Check required scope
         if required_scope:
-            token_scopes = [PermissionScope(s) for s in payload["scopes"]]
-            if required_scope not in token_scopes:
-                if PermissionScope.ADMIN_FULL not in token_scopes:
+            token_scopes = set(payload["scopes"])
+            required_scope_value = permission_value(required_scope)
+            if required_scope_value not in token_scopes:
+                if permission_value(PermissionScope.ADMIN_FULL) not in token_scopes:
                     await self._audit(
                         event_type=AuditEventType.TOKEN_REJECTED,
                         agent_id=payload["sub"],
@@ -1356,17 +1935,21 @@ class AgentIdentityService:
                         outcome="denied",
                         details={
                             "reason": "insufficient_scope",
-                            "required": required_scope.value,
+                            "required": required_scope_value,
                             "available": payload["scopes"]
                         }
                     )
                     raise PermissionError(
-                        f"Token does not have required scope: {required_scope.value}"
+                        f"Token does not have required scope: {required_scope_value}"
                     )
         
-        # Update last used
-        identity.last_used_at = datetime.now(timezone.utc)
-        await self.store.update_identity(identity)
+        # Record coarse activity without turning every token validation into
+        # a persisted identity-row write.
+        last_used_persisted = await self.store.record_identity_activity(
+            payload["sub"],
+            datetime.now(timezone.utc),
+            self.last_used_update_interval
+        )
         
         await self._audit(
             event_type=AuditEventType.TOKEN_VALIDATED,
@@ -1377,7 +1960,7 @@ class AgentIdentityService:
             resource_id=payload["jti"],
             action="validate",
             outcome="success",
-            details={}
+            details={"last_used_at_persisted": last_used_persisted}
         )
         
         return payload
@@ -1438,7 +2021,8 @@ class AgentIdentityService:
         self,
         agent_id: str,
         actor: str,
-        correlation_id: Optional[str] = None
+        correlation_id: Optional[str] = None,
+        allow_suspended: bool = False
     ) -> str:
         """
         Rotate all credentials for an agent.
@@ -1447,6 +2031,11 @@ class AgentIdentityService:
         1. Revokes all existing tokens
         2. Issues a new certificate
         3. Issues a new token
+
+        Emergency workflows may set allow_suspended=True after suspending the
+        identity. The new credential is issued but remains unusable until the
+        identity is manually reactivated because validate_token still checks
+        the identity lifecycle state.
         
         Returns the new token.
         """
@@ -1455,7 +2044,13 @@ class AgentIdentityService:
             raise ValueError(f"Identity not found: {agent_id}")
         
         if not identity.is_valid():
-            raise ValueError(f"Identity is not valid: {identity.status.value}")
+            suspended_emergency = (
+                allow_suspended
+                and identity.status == IdentityStatus.SUSPENDED
+                and datetime.now(timezone.utc) <= identity.expires_at
+            )
+            if not suspended_emergency:
+                raise ValueError(f"Identity is not valid: {identity.status.value}")
         
         # Revoke existing credentials
         revoked_count = await self._revoke_all_credentials(agent_id, actor)
@@ -1473,7 +2068,10 @@ class AgentIdentityService:
         
         # Revoke old certificate
         if old_serial:
-            await self.ca.revoke_certificate(old_serial)
+            await self.ca.revoke_certificate(
+                old_serial,
+                expires_at=identity.expires_at
+            )
         
         # Issue new token
         new_token = await self._issue_token(identity, actor)
@@ -1490,7 +2088,8 @@ class AgentIdentityService:
             details={
                 "credentials_revoked": revoked_count,
                 "old_cert_serial": old_serial,
-                "new_cert_serial": identity.certificate_serial
+                "new_cert_serial": identity.certificate_serial,
+                "allow_suspended": allow_suspended
             },
             correlation_id=correlation_id
         )
@@ -1500,11 +2099,56 @@ class AgentIdentityService:
     # -------------------------------------------------------
     # Human-Agent Delegation
     # -------------------------------------------------------
+    async def _audit_delegation_rejection(
+        self,
+        *,
+        agent_id: Optional[str],
+        actor_id: str,
+        actor_type: str,
+        resource_id: str,
+        action: str,
+        reason: str,
+        details: Optional[dict] = None,
+        correlation_id: Optional[str] = None
+    ) -> None:
+        """Audit a denied delegation create or validate request."""
+        await self._audit(
+            event_type=AuditEventType.DELEGATION_REJECTED,
+            agent_id=agent_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            resource_type="delegation",
+            resource_id=resource_id,
+            action=action,
+            outcome="denied",
+            details={
+                "reason": reason,
+                **(details or {})
+            },
+            correlation_id=correlation_id
+        )
+
+    def _decode_delegation_without_expiry(
+        self,
+        delegation_token: str
+    ) -> dict:
+        """Best-effort decode of an otherwise valid expired delegation JWT."""
+        try:
+            return jwt.decode(
+                delegation_token,
+                self._jwt_secret,
+                algorithms=["HS256"],
+                audience="agent-platform",
+                options={"verify_exp": False}
+            )
+        except jwt.InvalidTokenError:
+            return {}
+
     async def create_delegation(
         self,
         human_oidc_token: dict,  # Decoded OIDC token
         agent_id: str,
-        scopes: list[PermissionScope],
+        scopes: list[Permission],
         constraints: Optional[dict] = None,
         ttl_hours: Optional[int] = None,
         max_uses: Optional[int] = None,
@@ -1520,13 +2164,111 @@ class AgentIdentityService:
         
         Returns a delegation token the agent can use.
         """
+        human_subject = human_oidc_token.get("sub")
+        human_email = human_oidc_token.get("email", "unknown")
+        requested_scopes = [permission_value(scope) for scope in scopes]
+
+        if not human_subject:
+            await self._audit_delegation_rejection(
+                agent_id=agent_id,
+                actor_id="unknown",
+                actor_type="human",
+                resource_id="pending",
+                action="create",
+                reason="missing_human_subject",
+                details={
+                    "human_email": human_email,
+                    "requested_scopes": requested_scopes
+                },
+                correlation_id=correlation_id
+            )
+            raise ValueError("Human OIDC token missing required sub claim")
+
+        if not requested_scopes:
+            await self._audit_delegation_rejection(
+                agent_id=agent_id,
+                actor_id=human_subject,
+                actor_type="human",
+                resource_id="pending",
+                action="create",
+                reason="empty_scope_request",
+                details={"human_email": human_email},
+                correlation_id=correlation_id
+            )
+            raise ValueError("Delegation must include at least one scope")
+
         # Validate agent exists and is active
         identity = await self.store.get_identity(agent_id)
         if not identity or not identity.is_valid():
+            await self._audit_delegation_rejection(
+                agent_id=agent_id,
+                actor_id=human_subject,
+                actor_type="human",
+                resource_id="pending",
+                action="create",
+                reason="agent_invalid",
+                details={
+                    "human_email": human_email,
+                    "requested_scopes": requested_scopes
+                },
+                correlation_id=correlation_id
+            )
             raise ValueError(f"Agent not valid for delegation: {agent_id}")
-        
-        # Validate human can delegate these scopes
-        # (In production, check against human's permissions from OIDC claims)
+
+        allowed_scopes = _delegable_scope_claims(human_oidc_token)
+        unauthorized_scopes = [
+            scope for scope in requested_scopes
+            if not _scope_allowed_by_claims(scope, allowed_scopes)
+        ]
+        if unauthorized_scopes:
+            await self._audit_delegation_rejection(
+                agent_id=agent_id,
+                actor_id=human_subject,
+                actor_type="human",
+                resource_id="pending",
+                action="create",
+                reason="human_scope_not_delegable",
+                details={
+                    "human_email": human_email,
+                    "requested_scopes": requested_scopes,
+                    "allowed_scopes": sorted(allowed_scopes),
+                    "missing_scopes": unauthorized_scopes,
+                    "policy": "requested scopes must appear in delegable OIDC claims"
+                },
+                correlation_id=correlation_id
+            )
+            raise PermissionError(
+                "Human is not authorized to delegate scope(s): "
+                + ", ".join(unauthorized_scopes)
+            )
+
+        agent_missing_scopes = [
+            scope for scope in requested_scopes
+            if not identity.has_permission(scope)
+        ]
+        if agent_missing_scopes:
+            await self._audit_delegation_rejection(
+                agent_id=agent_id,
+                actor_id=human_subject,
+                actor_type="human",
+                resource_id="pending",
+                action="create",
+                reason="agent_scope_not_permitted",
+                details={
+                    "human_email": human_email,
+                    "requested_scopes": requested_scopes,
+                    "missing_scopes": agent_missing_scopes,
+                    "agent_permissions": [
+                        permission_value(permission)
+                        for permission in identity.permissions
+                    ]
+                },
+                correlation_id=correlation_id
+            )
+            raise PermissionError(
+                "Agent identity does not permit delegated scope(s): "
+                + ", ".join(agent_missing_scopes)
+            )
         
         now = datetime.now(timezone.utc)
         ttl = ttl_hours or self.delegation_ttl_hours
@@ -1537,11 +2279,11 @@ class AgentIdentityService:
         # Create delegation record
         delegation = DelegationRecord(
             delegation_id=delegation_id,
-            human_subject=human_oidc_token["sub"],
-            human_email=human_oidc_token.get("email", "unknown"),
+            human_subject=human_subject,
+            human_email=human_email,
             human_name=human_oidc_token.get("name", "Unknown"),
             agent_id=agent_id,
-            delegated_scopes=[s.value for s in scopes],
+            delegated_scopes=requested_scopes,
             constraints=constraints or {},
             created_at=now,
             expires_at=expires_at,
@@ -1550,14 +2292,16 @@ class AgentIdentityService:
         
         await self.store.store_delegation(delegation)
         
-        # Create delegation token
+        # Create delegation token. This reference implementation signs
+        # delegations with HS256 via _jwt_secret; use RS256/ES256 plus JWKS
+        # when independent services need public-key verification.
         payload = {
             "type": "delegation",
             "del_id": delegation_id,
-            "human_sub": human_oidc_token["sub"],
-            "human_email": human_oidc_token.get("email"),
+            "human_sub": human_subject,
+            "human_email": human_email,
             "agent_id": agent_id,
-            "scopes": [s.value for s in scopes],
+            "scopes": requested_scopes,
             "constraints": constraints or {},
             "iat": int(now.timestamp()),
             "exp": int(expires_at.timestamp()),
@@ -1570,15 +2314,15 @@ class AgentIdentityService:
         await self._audit(
             event_type=AuditEventType.DELEGATION_CREATED,
             agent_id=agent_id,
-            actor_id=human_oidc_token["sub"],
+            actor_id=human_subject,
             actor_type="human",
             resource_type="delegation",
             resource_id=delegation_id,
             action="create",
             outcome="success",
             details={
-                "human_email": human_oidc_token.get("email"),
-                "scopes": [s.value for s in scopes],
+                "human_email": human_email,
+                "scopes": requested_scopes,
                 "ttl_hours": ttl,
                 "max_uses": max_uses
             },
@@ -1590,9 +2334,10 @@ class AgentIdentityService:
     async def validate_delegation(
         self,
         delegation_token: str,
-        required_scope: Optional[PermissionScope] = None
+        required_scope: Optional[Permission] = None
     ) -> dict:
         """Validate a delegation token."""
+        payload: dict = {}
         try:
             payload = jwt.decode(
                 delegation_token,
@@ -1601,33 +2346,156 @@ class AgentIdentityService:
                 audience="agent-platform"
             )
         except jwt.ExpiredSignatureError as e:
+            payload = self._decode_delegation_without_expiry(delegation_token)
+            await self._audit_delegation_rejection(
+                agent_id=payload.get("agent_id"),
+                actor_id=payload.get("agent_id", "unknown"),
+                actor_type="agent",
+                resource_id=payload.get("del_id", "unknown"),
+                action="validate",
+                reason="expired",
+                details={
+                    "human_sub": payload.get("human_sub"),
+                    "required_scope": (
+                        permission_value(required_scope)
+                        if required_scope else None
+                    )
+                }
+            )
             raise ValueError("Delegation has expired") from e
         except jwt.InvalidTokenError as e:
+            await self._audit_delegation_rejection(
+                agent_id=None,
+                actor_id="unknown",
+                actor_type="agent",
+                resource_id="unknown",
+                action="validate",
+                reason="invalid",
+                details={"error": str(e)}
+            )
             raise ValueError(f"Invalid delegation: {e}") from e
         
         if payload.get("type") != "delegation":
+            await self._audit_delegation_rejection(
+                agent_id=payload.get("agent_id"),
+                actor_id=payload.get("agent_id", "unknown"),
+                actor_type="agent",
+                resource_id=payload.get("del_id", "unknown"),
+                action="validate",
+                reason="invalid",
+                details={"token_type": payload.get("type")}
+            )
             raise ValueError("Not a delegation token")
+
+        delegation_id = payload.get("del_id")
+        if not delegation_id:
+            await self._audit_delegation_rejection(
+                agent_id=payload.get("agent_id"),
+                actor_id=payload.get("agent_id", "unknown"),
+                actor_type="agent",
+                resource_id="unknown",
+                action="validate",
+                reason="invalid",
+                details={"missing_claim": "del_id"}
+            )
+            raise ValueError("Delegation token missing delegation id")
         
         # Check delegation record
-        delegation = await self.store.get_delegation(payload["del_id"])
+        delegation = await self.store.get_delegation(delegation_id)
         if not delegation:
+            await self._audit_delegation_rejection(
+                agent_id=payload.get("agent_id"),
+                actor_id=payload.get("agent_id", "unknown"),
+                actor_type="agent",
+                resource_id=delegation_id,
+                action="validate",
+                reason="missing",
+                details={"human_sub": payload.get("human_sub")}
+            )
             raise ValueError("Delegation record not found")
         
         if delegation.is_revoked:
+            await self._audit_delegation_rejection(
+                agent_id=delegation.agent_id,
+                actor_id=payload.get("agent_id", delegation.agent_id),
+                actor_type="agent",
+                resource_id=delegation_id,
+                action="validate",
+                reason="revoked",
+                details={"human_sub": delegation.human_subject}
+            )
             raise ValueError("Delegation has been revoked")
-        
-        if delegation.max_uses and delegation.used_count >= delegation.max_uses:
-            raise ValueError("Delegation has exceeded maximum uses")
+
+        if datetime.now(timezone.utc) > delegation.expires_at:
+            await self._audit_delegation_rejection(
+                agent_id=delegation.agent_id,
+                actor_id=payload.get("agent_id", delegation.agent_id),
+                actor_type="agent",
+                resource_id=delegation_id,
+                action="validate",
+                reason="expired",
+                details={"human_sub": delegation.human_subject}
+            )
+            raise ValueError("Delegation has expired")
         
         # Check required scope
-        if required_scope and required_scope.value not in payload["scopes"]:
+        if required_scope:
+            required_scope_value = permission_value(required_scope)
+            token_scopes = set(payload.get("scopes") or [])
+            record_scopes = set(delegation.delegated_scopes)
+            effective_scopes = token_scopes.intersection(record_scopes)
+            has_required_scope = (
+                required_scope_value in effective_scopes
+                or permission_value(PermissionScope.ADMIN_FULL) in effective_scopes
+            )
+        else:
+            required_scope_value = None
+            effective_scopes = set(payload.get("scopes") or []).intersection(
+                delegation.delegated_scopes
+            )
+            has_required_scope = True
+
+        if not has_required_scope:
+            await self._audit_delegation_rejection(
+                agent_id=delegation.agent_id,
+                actor_id=payload.get("agent_id", delegation.agent_id),
+                actor_type="agent",
+                resource_id=delegation_id,
+                action="validate",
+                reason="insufficient_scope",
+                details={
+                    "human_sub": delegation.human_subject,
+                    "required": required_scope_value,
+                    "available": sorted(effective_scopes)
+                }
+            )
             raise PermissionError(
-                f"Delegation does not include scope: {required_scope.value}"
+                f"Delegation does not include scope: {required_scope_value}"
             )
         
-        # Increment use count
-        delegation.used_count += 1
-        await self.store.store_delegation(delegation)
+        # Atomically increment use count only after scope validation passes.
+        try:
+            delegation = await self.store.consume_delegation_use(delegation_id)
+        except ValueError as e:
+            message = str(e)
+            if "revoked" in message:
+                reason = "revoked"
+            elif "expired" in message:
+                reason = "expired"
+            elif "maximum uses" in message:
+                reason = "max_uses_exceeded"
+            else:
+                reason = "missing"
+            await self._audit_delegation_rejection(
+                agent_id=payload.get("agent_id"),
+                actor_id=payload.get("agent_id", "unknown"),
+                actor_type="agent",
+                resource_id=delegation_id,
+                action="validate",
+                reason=reason,
+                details={"human_sub": payload.get("human_sub")}
+            )
+            raise
         
         await self._audit(
             event_type=AuditEventType.DELEGATION_USED,
@@ -1652,7 +2520,7 @@ class AgentIdentityService:
     async def grant_permission(
         self,
         agent_id: str,
-        permission: PermissionScope,
+        permission: Permission,
         actor: str,
         correlation_id: Optional[str] = None
     ) -> AgentIdentity:
@@ -1661,7 +2529,7 @@ class AgentIdentityService:
         if not identity:
             raise ValueError(f"Identity not found: {agent_id}")
         
-        if permission not in identity.permissions:
+        if not identity.has_permission(permission):
             identity.permissions.append(permission)
             await self.store.update_identity(identity)
             
@@ -1671,10 +2539,10 @@ class AgentIdentityService:
                 actor_id=actor,
                 actor_type="human",
                 resource_type="permission",
-                resource_id=permission.value,
+                resource_id=permission_value(permission),
                 action="grant",
                 outcome="success",
-                details={"permission": permission.value},
+                details={"permission": permission_value(permission)},
                 correlation_id=correlation_id
             )
         
@@ -1683,7 +2551,7 @@ class AgentIdentityService:
     async def revoke_permission(
         self,
         agent_id: str,
-        permission: PermissionScope,
+        permission: Permission,
         actor: str,
         correlation_id: Optional[str] = None
     ) -> AgentIdentity:
@@ -1692,8 +2560,15 @@ class AgentIdentityService:
         if not identity:
             raise ValueError(f"Identity not found: {agent_id}")
         
-        if permission in identity.permissions:
-            identity.permissions.remove(permission)
+        permission_to_remove = next(
+            (
+                existing for existing in identity.permissions
+                if permission_value(existing) == permission_value(permission)
+            ),
+            None
+        )
+        if permission_to_remove is not None:
+            identity.permissions.remove(permission_to_remove)
             await self.store.update_identity(identity)
             
             await self._audit(
@@ -1702,10 +2577,10 @@ class AgentIdentityService:
                 actor_id=actor,
                 actor_type="human",
                 resource_type="permission",
-                resource_id=permission.value,
+                resource_id=permission_value(permission),
                 action="revoke",
                 outcome="success",
-                details={"permission": permission.value},
+                details={"permission": permission_value(permission)},
                 correlation_id=correlation_id
             )
         
@@ -1755,7 +2630,8 @@ class AgentIdentityService:
         actor_id: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
-        limit: int = 100
+        limit: int = 100,
+        offset: Optional[int] = None
     ) -> list[AuditEvent]:
         """Query the audit log."""
         return await self.store.query_audit_log(
@@ -1764,7 +2640,8 @@ class AgentIdentityService:
             actor_id=actor_id,
             since=since,
             until=until,
-            limit=limit
+            limit=limit,
+            offset=offset
         )
 
 
@@ -1795,7 +2672,7 @@ class AgentAuthenticator:
     async def authorize(
         self,
         token: str,
-        required_scope: PermissionScope
+        required_scope: Permission
     ) -> AgentIdentity:
         """
         Authenticate and authorize for a specific scope.
@@ -1816,7 +2693,7 @@ class AgentAuthenticator:
         self,
         agent_token: str,
         delegation_token: str,
-        required_scope: Optional[PermissionScope] = None
+        required_scope: Optional[Permission] = None
     ) -> tuple[AgentIdentity, dict]:
         """
         Authenticate agent and validate human delegation.
@@ -1901,14 +2778,15 @@ async def main():
         PermissionScope.SECRETS_READ,
         actor="admin@example.com"
     )
-    print(f"   Permissions: {[p.value for p in identity.permissions]}")
+    print(f"   Permissions: {[permission_value(p) for p in identity.permissions]}")
     
     # 5. Create human delegation
     print("\n5. Creating human-to-agent delegation...")
     mock_oidc_token = {
         "sub": "user_12345",
         "email": "alice@example.com",
-        "name": "Alice Smith"
+        "name": "Alice Smith",
+        "delegable_scopes": [PermissionScope.DATA_WRITE.value]
     }
     delegation_token = await service.create_delegation(
         human_oidc_token=mock_oidc_token,
@@ -1994,23 +2872,33 @@ class ScheduledRotation:
     async def check_and_rotate(self) -> list[str]:
         """Check all identities and rotate those due."""
         rotated = []
-        
-        identities = await self.identity_service.store.list_identities(
-            status=IdentityStatus.ACTIVE
-        )
-        
+        page_size = 100
+        offset = 0
         now = datetime.now(timezone.utc)
-        
-        for identity in identities:
-            # Check certificate age
-            if identity.activated_at:
-                cert_age = now - identity.activated_at
-                if cert_age > self.rotation_interval:
-                    await self.identity_service.rotate_agent_credentials(
-                        identity.agent_id,
-                        actor="scheduled-rotation"
-                    )
-                    rotated.append(identity.agent_id)
+
+        while True:
+            identities = await self.identity_service.store.list_identities(
+                status=IdentityStatus.ACTIVE,
+                limit=page_size,
+                offset=offset
+            )
+            if not identities:
+                break
+
+            for identity in identities:
+                # Check certificate age
+                if identity.activated_at:
+                    cert_age = now - identity.activated_at
+                    if cert_age > self.rotation_interval:
+                        await self.identity_service.rotate_agent_credentials(
+                            identity.agent_id,
+                            actor="scheduled-rotation"
+                        )
+                        rotated.append(identity.agent_id)
+
+            if len(identities) < page_size:
+                break
+            offset += page_size
         
         return rotated
 
@@ -2034,9 +2922,9 @@ class EmergencyRotation:
         Emergency rotation for potentially compromised agent.
         
         This:
-        1. Immediately suspends the agent
-        2. Rotates all credentials
-        3. Requires manual reactivation after review
+        1. Immediately suspends the agent and revokes current credentials
+        2. Rotates credentials through an explicit emergency path
+        3. Keeps the new credential unusable until manual reactivation
         """
         # Suspend immediately
         await self.identity_service.suspend_identity(
@@ -2050,7 +2938,8 @@ class EmergencyRotation:
         new_token = await self.identity_service.rotate_agent_credentials(
             agent_id,
             actor=actor,
-            correlation_id=incident_id
+            correlation_id=incident_id,
+            allow_suspended=True
         )
         
         # Log for incident response
@@ -2171,6 +3060,19 @@ class IdentityAuditEvent:
     previous_state: dict | None  # State before change
     new_state: dict | None       # State after change
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for JSON storage; convert datetime to ISO 8601.
+
+        ComplianceAuditStore.append() and verify_integrity() hash the
+        JSON form of each event, so this method must produce a stable,
+        json-serializable dict (no raw datetime objects).
+        """
+        from dataclasses import asdict
+        d = asdict(self)
+        if isinstance(self.timestamp, datetime):
+            d["timestamp"] = self.timestamp.isoformat()
+        return d
+
 # ============================================================================
 # Block 11 (chapter listing #11)
 # ============================================================================
@@ -2178,18 +3080,144 @@ class IdentityAuditEvent:
 class ComplianceAuditStore:
     """
     Audit store with compliance features.
-    
-    In production, implement with:
-    - Append-only database (or append-only mode)
-    - Write-ahead log with checksums
-    - Separate storage from main database
-    - Replication across regions
+
+    Events are written to an append-only JSONL file and only the most recent
+    events are cached in memory. In production, put this sink on append-only
+    storage or an immutable log service, replicate it, and configure retention
+    to match your control obligations.
     """
+    _process_append_lock = threading.Lock()
     
-    def __init__(self):
-        self._events: list[tuple[str, IdentityAuditEvent]] = []  # (hash, event)
-        self._last_hash: str = "genesis"
+    def __init__(
+        self,
+        log_path: str | os.PathLike[str] = "compliance-audit.jsonl",
+        recent_cache_size: int = 1000
+    ):
+        self.log_path = Path(log_path)
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._recent_events: deque[tuple[str, IdentityAuditEvent]] = deque(
+            maxlen=recent_cache_size
+        )
+        self._lock_path = self.log_path.with_name(f"{self.log_path.name}.lock")
+        self._last_hash: str = self._load_last_hash()
+
+    def _read_last_record(self) -> Optional[dict]:
+        """Read the last non-empty JSONL record without scanning the file."""
+        if not self.log_path.exists():
+            return None
+
+        file_size = self.log_path.stat().st_size
+        if file_size == 0:
+            return None
+
+        buffer = b""
+        position = file_size
+        chunk_size = 4096
+
+        with self.log_path.open("rb") as f:
+            while position > 0:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                f.seek(position)
+                buffer = f.read(read_size) + buffer
+                lines = buffer.split(b"\n")
+
+                if position > 0 and len(lines) == 1:
+                    continue
+
+                candidates = lines if position == 0 else lines[1:]
+                for line in reversed(candidates):
+                    if line.strip():
+                        return json.loads(line.decode("utf-8"))
+
+        return None
+
+    def _load_last_hash(self) -> str:
+        """Resume the hash chain from the durable JSONL tail record."""
+        last_record = self._read_last_record()
+        if not last_record:
+            return "genesis"
+        return last_record["hash"]
+
+    def _iter_records(self):
+        """Stream persisted records instead of loading the full log."""
+        if not self.log_path.exists():
+            return
+
+        with self.log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    yield json.loads(line)
+
+    def _event_from_record(self, record: dict) -> IdentityAuditEvent:
+        data = dict(record["event"])
+        data["timestamp"] = datetime.fromisoformat(data["timestamp"])
+        return IdentityAuditEvent(**data)
+
+    def _prepare_lock_file(self, lock_file) -> None:
+        """Ensure Windows byte-range locking has a byte to lock."""
+        lock_file.seek(0)
+        if lock_file.read(1) == "":
+            lock_file.write("0")
+            lock_file.flush()
+        lock_file.seek(0)
+
+    def _acquire_file_lock(self, lock_file) -> None:
+        """Take an exclusive interprocess lock on the audit sink."""
+        self._prepare_lock_file(lock_file)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+    def _release_file_lock(self, lock_file) -> None:
+        """Release the audit sink interprocess lock."""
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     
+    def _append_sync(
+        self,
+        event_dict: dict[str, Any],
+        event: IdentityAuditEvent
+    ) -> str:
+        # Serialize appends across threads and service-worker processes.
+        with ComplianceAuditStore._process_append_lock:
+            with self._lock_path.open("a+", encoding="utf-8") as lock_file:
+                self._acquire_file_lock(lock_file)
+                try:
+                    previous_hash = self._load_last_hash()
+                    event_data = json.dumps(event_dict, sort_keys=True)
+                    chain_data = f"{previous_hash}:{event_data}"
+                    event_hash = hashlib.sha256(
+                        chain_data.encode()
+                    ).hexdigest()
+
+                    record = {
+                        "hash": event_hash,
+                        "previous_hash": previous_hash,
+                        "event": event_dict
+                    }
+
+                    # Persist first; keep only a bounded operational cache.
+                    with self.log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(record, sort_keys=True) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                    self._recent_events.append((event_hash, event))
+                    self._last_hash = event_hash
+                finally:
+                    self._release_file_lock(lock_file)
+
+        return event_hash
+
     async def append(self, event: IdentityAuditEvent) -> str:
         """
         Append event with chain integrity.
@@ -2197,16 +3225,8 @@ class ComplianceAuditStore:
         Each event's hash includes the previous hash,
         creating a tamper-evident chain.
         """
-        # Create chain hash
-        event_data = json.dumps(event.to_dict(), sort_keys=True)
-        chain_data = f"{self._last_hash}:{event_data}"
-        event_hash = hashlib.sha256(chain_data.encode()).hexdigest()
-        
-        # Store with hash
-        self._events.append((event_hash, event))
-        self._last_hash = event_hash
-        
-        return event_hash
+        event_dict = event.to_dict()
+        return await asyncio.to_thread(self._append_sync, event_dict, event)
     
     async def verify_integrity(self) -> tuple[bool, list[str]]:
         """
@@ -2217,7 +3237,12 @@ class ComplianceAuditStore:
         issues = []
         prev_hash = "genesis"
         
-        for i, (stored_hash, event) in enumerate(self._events):
+        for i, record in enumerate(self._iter_records()):
+            stored_hash = record["hash"]
+            if record.get("previous_hash") != prev_hash:
+                issues.append(f"Event {i}: previous_hash mismatch")
+
+            event = self._event_from_record(record)
             event_data = json.dumps(event.to_dict(), sort_keys=True)
             chain_data = f"{prev_hash}:{event_data}"
             computed_hash = hashlib.sha256(chain_data.encode()).hexdigest()
@@ -2235,17 +3260,44 @@ class ComplianceAuditStore:
         self,
         since: datetime,
         until: datetime,
-        format: str = "json"
+        format: str = "json",
+        page_size: int = 1000,
+        cursor: int = 0
     ) -> str:
-        """Export audit log for compliance reporting."""
-        events = [
-            event for _, event in self._events
-            if since <= event.timestamp <= until
-        ]
+        """
+        Export one page of audit events for compliance reporting.
+
+        Keep source logs for the full retention period in the durable sink.
+        Callers page through exports with cursor/next_cursor instead of
+        materializing years of events in process memory.
+        """
+        events = []
+        matched = 0
+        next_cursor = None
+
+        for record in self._iter_records():
+            event = self._event_from_record(record)
+            if not since <= event.timestamp <= until:
+                continue
+
+            if matched < cursor:
+                matched += 1
+                continue
+
+            if len(events) >= page_size:
+                next_cursor = matched
+                break
+
+            events.append(event)
+            matched += 1
         
         if format == "json":
             return json.dumps(
-                [e.to_dict() for e in events],
+                {
+                    "events": [e.to_dict() for e in events],
+                    "next_cursor": next_cursor,
+                    "retention_source": str(self.log_path)
+                },
                 indent=2
             )
         elif format == "csv":
@@ -2276,10 +3328,21 @@ class AuditQueries:
         threshold: int = 5
     ) -> list[dict]:
         """Find agents with multiple failed auth attempts."""
-        events = await self.store.query_audit_log(
-            event_type=AuditEventType.TOKEN_REJECTED,
-            since=since
-        )
+        events: list[AuditEvent] = []
+        page_size = 100
+        offset = 0
+
+        while True:
+            page = await self.store.query_audit_log(
+                event_type=AuditEventType.TOKEN_REJECTED,
+                since=since,
+                limit=page_size,
+                offset=offset
+            )
+            events.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
         
         # Count by agent
         counts: dict[str, int] = {}
@@ -2409,8 +3472,7 @@ class ApexAgentProvisioner:
             description=f"Trading agent for {desk} desk",
             owner_team=desk,
             owner_email=manager_email,
-            permissions=[PermissionScope(p) if isinstance(p, str) and ':' in p 
-                        else p for p in permissions],
+            permissions=permissions,
             metadata={
                 "role": role,
                 "desk": desk,
@@ -2473,7 +3535,7 @@ class TradeExecutor:
             raise
         
         # 2. Verify agent has trading permission
-        if not identity.has_permission(PermissionScope("orders:execute")):
+        if not identity.has_permission("orders:execute"):
             await self._audit_trade_failure(
                 request, "permission_denied", "Missing orders:execute", correlation_id
             )
@@ -2495,7 +3557,8 @@ class TradeExecutor:
         if request.delegation_token:
             _, delegation = await self.auth.authenticate_with_delegation(
                 request.agent_token,
-                request.delegation_token
+                request.delegation_token,
+                required_scope="orders:execute"
             )
             human_context = {
                 "delegator_sub": delegation["human_sub"],
@@ -2545,7 +3608,9 @@ class TradeExecutor:
                 "price": request.price,
                 "order_type": request.order_type,
                 "execution_result": result,
-                "agent_permissions": [p.value for p in identity.permissions],
+                "agent_permissions": [
+                    permission_value(p) for p in identity.permissions
+                ],
                 "agent_limits": identity.metadata.get("limits"),
                 "human_delegation": human_context,
                 "agent_certificate_serial": identity.certificate_serial
@@ -2597,6 +3662,50 @@ class ComplianceReporter:
     
     def __init__(self, identity_service: AgentIdentityService):
         self.identity_service = identity_service
+
+    async def _list_all_identities(
+        self,
+        page_size: int = 500
+    ) -> list[AgentIdentity]:
+        """Collect all identity pages instead of relying on the default limit."""
+        identities: list[AgentIdentity] = []
+        offset = 0
+
+        while True:
+            page = await self.identity_service.store.list_identities(
+                limit=page_size,
+                offset=offset
+            )
+            identities.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+
+        return identities
+
+    async def _list_all_audit_events(
+        self,
+        period_start: datetime,
+        period_end: datetime,
+        page_size: int = 500
+    ) -> list[AuditEvent]:
+        """Collect every audit event in the review period page by page."""
+        events: list[AuditEvent] = []
+        offset = 0
+
+        while True:
+            page = await self.identity_service.get_audit_log(
+                since=period_start,
+                until=period_end,
+                limit=page_size,
+                offset=offset
+            )
+            events.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+
+        return events
     
     async def generate_access_review(
         self,
@@ -2609,15 +3718,12 @@ class ComplianceReporter:
         Required for SOC 2 CC6.1, CC6.2.
         """
         # Get all identities
-        identities = await self.identity_service.store.list_identities()
+        identities = await self._list_all_identities()
         
-        # Get all permission changes
-        permission_events = await self.identity_service.get_audit_log(
-            since=period_start,
-            until=period_end
-        )
+        # Get all relevant audit events without truncating at the default limit.
+        audit_events = await self._list_all_audit_events(period_start, period_end)
         permission_events = [
-            e for e in permission_events 
+            e for e in audit_events
             if e.event_type in [
                 AuditEventType.PERMISSION_GRANTED,
                 AuditEventType.PERMISSION_REVOKED
@@ -2625,12 +3731,8 @@ class ComplianceReporter:
         ]
         
         # Get all identity lifecycle events
-        lifecycle_events = await self.identity_service.get_audit_log(
-            since=period_start,
-            until=period_end
-        )
         lifecycle_events = [
-            e for e in lifecycle_events
+            e for e in audit_events
             if e.event_type in [
                 AuditEventType.IDENTITY_CREATED,
                 AuditEventType.IDENTITY_SUSPENDED,
@@ -2659,7 +3761,7 @@ class ComplianceReporter:
                     "name": i.name,
                     "owner_team": i.owner_team,
                     "status": i.status.value,
-                    "permissions": [p.value for p in i.permissions],
+                    "permissions": [permission_value(p) for p in i.permissions],
                     "created_at": i.created_at.isoformat(),
                     "last_used_at": i.last_used_at.isoformat() if i.last_used_at else None
                 }
