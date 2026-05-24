@@ -154,10 +154,10 @@ def identity(import_chapter):
     return import_chapter("ch01-enterprise-identity", "identity")
 
 
-STRONG_TEST_JWT_SECRET = (
-    "unit-test-hs256-secret-0123456789abcdef0123456789abcdef"
+STRONG_TEST_TOKEN_HASH_SECRET = (
+    "unit-test-token-hash-secret-0123456789abcdef0123456789abcdef"
 )
-STRONG_PRODUCTION_JWT_SECRET = "0123456789abcdef0123456789abcdef"
+STRONG_PRODUCTION_TOKEN_HASH_SECRET = "0123456789abcdef0123456789abcdef"
 
 
 def _identity_record(module, **overrides):
@@ -305,6 +305,33 @@ async def _initialized_service_with_agent(
     return service, store
 
 
+async def _decode_service_token(module, service, token: str, **overrides):
+    public_key = await service.key_vault.get_public_key(
+        service.jwt_signing_key_id
+    )
+    assert public_key is not None
+    kwargs = {
+        "algorithms": ["RS256"],
+        "audience": "agent-platform",
+        "issuer": "agent-identity-service",
+    }
+    kwargs.update(overrides)
+    return module.jwt.decode(token, public_key, **kwargs)
+
+
+async def _encode_service_token(module, service, payload: dict) -> str:
+    private_key = await service.key_vault.get_private_key(
+        service.jwt_signing_key_id
+    )
+    assert private_key is not None
+    return module.jwt.encode(
+        payload,
+        private_key,
+        algorithm="RS256",
+        headers={"kid": service.jwt_signing_key_id},
+    )
+
+
 def test_agent_identity_validity_and_admin_scope(identity):
     record = _identity_record(identity, permissions=[identity.PermissionScope.ADMIN_FULL])
 
@@ -328,7 +355,7 @@ def test_identity_service_issues_validates_and_audits_scoped_tokens(
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "test")
-    monkeypatch.setenv("JWT_SECRET", STRONG_TEST_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_TEST_TOKEN_HASH_SECRET)
 
     async def scenario():
         store = identity.IdentityStore(audit_log_capacity=20)
@@ -356,6 +383,10 @@ def test_identity_service_issues_validates_and_audits_scoped_tokens(
             actor="unit-test",
             correlation_id="corr-test",
         )
+
+        header = identity.jwt.get_unverified_header(token)
+        assert header["alg"] == "RS256"
+        assert header["kid"] == service.jwt_signing_key_id
 
         payload = await service.validate_token(
             token,
@@ -391,35 +422,25 @@ def test_validate_token_rejects_wrong_or_missing_issuer(
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "test")
-    monkeypatch.setenv("JWT_SECRET", STRONG_TEST_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_TEST_TOKEN_HASH_SECRET)
 
     async def scenario():
         service, _store = await _initialized_service_with_agent(identity)
         token = await service.issue_token("agent_test")
-        payload = identity.jwt.decode(
-            token,
-            STRONG_TEST_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="agent-platform",
-            issuer="agent-identity-service",
-        )
+        payload = await _decode_service_token(identity, service, token)
 
         bad_issuer = dict(payload)
         bad_issuer["iss"] = "other-issuer"
-        bad_token = identity.jwt.encode(
-            bad_issuer,
-            STRONG_TEST_JWT_SECRET,
-            algorithm="HS256",
-        )
+        bad_token = await _encode_service_token(identity, service, bad_issuer)
         with pytest.raises(ValueError, match="Invalid token"):
             await service.validate_token(bad_token)
 
         missing_issuer = dict(payload)
         missing_issuer.pop("iss")
-        missing_token = identity.jwt.encode(
+        missing_token = await _encode_service_token(
+            identity,
+            service,
             missing_issuer,
-            STRONG_TEST_JWT_SECRET,
-            algorithm="HS256",
         )
         with pytest.raises(ValueError, match="Invalid token"):
             await service.validate_token(missing_token)
@@ -435,7 +456,7 @@ def test_identity_service_rejects_in_memory_key_vault_in_production(
     environment,
 ):
     monkeypatch.setenv("ENVIRONMENT", environment)
-    monkeypatch.setenv("JWT_SECRET", STRONG_PRODUCTION_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_PRODUCTION_TOKEN_HASH_SECRET)
 
     async def scenario():
         store = identity.IdentityStore()
@@ -457,7 +478,7 @@ def test_identity_service_allows_in_memory_key_vault_for_demo_and_tests(
     environment,
 ):
     monkeypatch.setenv("ENVIRONMENT", environment)
-    monkeypatch.setenv("JWT_SECRET", STRONG_PRODUCTION_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_PRODUCTION_TOKEN_HASH_SECRET)
 
     async def scenario():
         store = identity.IdentityStore()
@@ -478,7 +499,7 @@ def test_identity_service_allows_marked_key_provider_in_production(
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv("JWT_SECRET", STRONG_PRODUCTION_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_PRODUCTION_TOKEN_HASH_SECRET)
 
     class MarkedKeyVault(identity.KeyVault):
         is_production_key_provider = True
@@ -505,7 +526,7 @@ def test_identity_service_rejects_in_memory_store_in_production(
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv("JWT_SECRET", STRONG_PRODUCTION_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_PRODUCTION_TOKEN_HASH_SECRET)
 
     class MarkedKeyVault(identity.KeyVault):
         is_production_key_provider = True
@@ -522,13 +543,13 @@ def test_identity_service_rejects_in_memory_store_in_production(
     run_async(scenario())
 
 
-def test_identity_service_rejects_weak_hs256_secret(
+def test_identity_service_rejects_weak_token_hash_secret(
     identity,
     monkeypatch,
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv("JWT_SECRET", "short-secret")
+    monkeypatch.setenv("TOKEN_HASH_SECRET", "short-secret")
 
     async def scenario():
         store = identity.IdentityStore()
@@ -549,8 +570,8 @@ def test_identity_service_rejects_demo_secret_outside_tests(
 ):
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setenv(
-        "JWT_SECRET",
-        "demo-secret-0123456789abcdef0123456789abcdef",
+        "TOKEN_HASH_SECRET",
+        "demo-token-hash-secret-0123456789abcdef0123456789abcdef",
     )
 
     async def scenario():
@@ -651,7 +672,7 @@ def test_create_delegation_requires_delegable_scope_claim_and_audits_denial(
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "test")
-    monkeypatch.setenv("JWT_SECRET", STRONG_TEST_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_TEST_TOKEN_HASH_SECRET)
 
     async def scenario():
         service, store = await _initialized_service_with_agent(identity)
@@ -675,12 +696,7 @@ def test_create_delegation_requires_delegable_scope_claim_and_audits_denial(
             "agent_test",
             [identity.PermissionScope.DATA_READ],
         )
-        payload = identity.jwt.decode(
-            token,
-            STRONG_TEST_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="agent-platform",
-        )
+        payload = await _decode_service_token(identity, service, token)
         assert payload["scopes"] == [identity.PermissionScope.DATA_READ.value]
 
         denials = await store.query_audit_log(
@@ -705,7 +721,7 @@ def test_validate_delegation_rejections_are_audited(
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "test")
-    monkeypatch.setenv("JWT_SECRET", STRONG_TEST_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_TEST_TOKEN_HASH_SECRET)
 
     async def scenario():
         service, store = await _initialized_service_with_agent(identity)
@@ -735,11 +751,10 @@ def test_validate_delegation_rejections_are_audited(
             "agent_test",
             [identity.PermissionScope.DATA_READ],
         )
-        missing_payload = identity.jwt.decode(
+        missing_payload = await _decode_service_token(
+            identity,
+            service,
             missing_token,
-            STRONG_TEST_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="agent-platform",
         )
         store._delegations.pop(missing_payload["del_id"])
         with pytest.raises(ValueError, match="not found"):
@@ -750,11 +765,10 @@ def test_validate_delegation_rejections_are_audited(
             "agent_test",
             [identity.PermissionScope.DATA_READ],
         )
-        revoked_payload = identity.jwt.decode(
+        revoked_payload = await _decode_service_token(
+            identity,
+            service,
             revoked_token,
-            STRONG_TEST_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="agent-platform",
         )
         revoked = await store.get_delegation(revoked_payload["del_id"])
         assert revoked is not None
@@ -765,7 +779,9 @@ def test_validate_delegation_rejections_are_audited(
             await service.validate_delegation(revoked_token)
 
         now = datetime.now(timezone.utc)
-        expired_token = identity.jwt.encode(
+        expired_token = await _encode_service_token(
+            identity,
+            service,
             {
                 "type": "delegation",
                 "del_id": "expired-delegation",
@@ -778,8 +794,6 @@ def test_validate_delegation_rejections_are_audited(
                 "iss": "agent-identity-service",
                 "aud": "agent-platform",
             },
-            STRONG_TEST_JWT_SECRET,
-            algorithm="HS256",
         )
         with pytest.raises(ValueError, match="expired"):
             await service.validate_delegation(expired_token)
@@ -792,17 +806,16 @@ def test_validate_delegation_rejections_are_audited(
             "agent_test",
             [identity.PermissionScope.DATA_READ],
         )
-        wrong_issuer_payload = identity.jwt.decode(
+        wrong_issuer_payload = await _decode_service_token(
+            identity,
+            service,
             wrong_issuer_token,
-            STRONG_TEST_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="agent-platform",
         )
         wrong_issuer_payload["iss"] = "other-issuer"
-        wrong_issuer_token = identity.jwt.encode(
+        wrong_issuer_token = await _encode_service_token(
+            identity,
+            service,
             wrong_issuer_payload,
-            STRONG_TEST_JWT_SECRET,
-            algorithm="HS256",
         )
         with pytest.raises(ValueError, match="Invalid delegation"):
             await service.validate_delegation(wrong_issuer_token)
@@ -830,7 +843,7 @@ def test_trade_executor_requires_trading_scope_on_delegation(
     run_async,
 ):
     monkeypatch.setenv("ENVIRONMENT", "test")
-    monkeypatch.setenv("JWT_SECRET", STRONG_TEST_JWT_SECRET)
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_TEST_TOKEN_HASH_SECRET)
 
     async def scenario():
         service, store = await _initialized_service_with_agent(

@@ -229,8 +229,8 @@ class DelegationToken:
     expires_at: datetime
     constraints: dict           # Additional restrictions
     
-    def to_jwt(self, signing_key: str) -> str:
-        """Encode as an HS256-signed JWT for this reference implementation."""
+    def to_jwt(self, signing_key, key_id: str = "delegation_signing") -> str:
+        """Encode as an RS256-signed JWT using the issuer's private key."""
         payload = {
             "type": "delegation",
             "del_id": self.delegation_id,
@@ -242,7 +242,12 @@ class DelegationToken:
             "exp": int(self.expires_at.timestamp()),
             "constraints": self.constraints
         }
-        return jwt.encode(payload, signing_key, algorithm="HS256")
+        return jwt.encode(
+            payload,
+            signing_key,
+            algorithm="RS256",
+            headers={"kid": key_id}
+        )
 
 # ============================================================================
 # Block 5 (chapter listing #5)
@@ -402,7 +407,7 @@ def _certificate_validity_window_utc(
     return _datetime_utc(not_before), _datetime_utc(not_after)
 
 
-_MIN_HS256_SECRET_BYTES = 32
+_MIN_TOKEN_HASH_SECRET_BYTES = 32
 _TEST_ENVIRONMENTS = {"test", "testing", "pytest"}
 _PRODUCTION_ENVIRONMENTS = {"production", "prod"}
 _LOCAL_KEY_VAULT_ENVIRONMENTS = {
@@ -412,7 +417,7 @@ _LOCAL_KEY_VAULT_ENVIRONMENTS = {
     "local",
     *_TEST_ENVIRONMENTS,
 }
-_DISALLOWED_JWT_SECRET_MARKERS = (
+_DISALLOWED_SECRET_MARKERS = (
     "demo",
     "test",
     "example",
@@ -470,21 +475,21 @@ def _validate_key_provider_environment(
         )
 
 
-def _validate_hs256_jwt_secret(secret: str, environment: str) -> str:
-    """Reject HS256 secrets that are too short or obviously non-production."""
+def _validate_token_hash_secret(secret: str, environment: str) -> str:
+    """Reject credential-hash HMAC secrets that are too weak."""
     secret_bytes = secret.encode("utf-8")
-    if len(secret_bytes) < _MIN_HS256_SECRET_BYTES:
+    if len(secret_bytes) < _MIN_TOKEN_HASH_SECRET_BYTES:
         raise RuntimeError(
-            "JWT_SECRET must be at least 32 bytes (256 bits) for HS256."
+            "TOKEN_HASH_SECRET must be at least 32 bytes (256 bits)."
         )
 
     lower_secret = secret.lower()
     has_demo_marker = any(
-        marker in lower_secret for marker in _DISALLOWED_JWT_SECRET_MARKERS
+        marker in lower_secret for marker in _DISALLOWED_SECRET_MARKERS
     )
     if has_demo_marker and not _is_test_environment(environment):
         raise RuntimeError(
-            "JWT_SECRET must not contain demo/test/example markers outside "
+            "TOKEN_HASH_SECRET must not contain demo/test/example markers outside "
             "test runs."
         )
 
@@ -1192,11 +1197,9 @@ class KeyVault:
     ) -> rsa.RSAPublicKey:
         """Generate and store a new RSA key pair, return the public key.
 
-        These keypairs sign X.509 agent certificates (the dominant use in this
-        chapter; see CertificateAuthority below). Agent and delegation JWTs use
-        the HS256 self-contained path explained in the chapter prose; production
-        multi-service deployments commonly replace that path with RS256/ES256
-        and JWKS distribution.
+        These keypairs sign X.509 agent certificates and service-issued JWTs.
+        Production multi-service deployments commonly expose the JWT public
+        key through JWKS while keeping the private key in KMS/HSM custody.
         """
         self._assert_environment_allowed()
         private_key = rsa.generate_private_key(
@@ -1227,6 +1230,13 @@ class KeyVault:
         if not pem:
             return None
         return serialization.load_pem_private_key(pem, password=None)
+
+    async def get_public_key(self, key_id: str) -> Optional[rsa.RSAPublicKey]:
+        """Retrieve public key for verification."""
+        private_key = await self.get_private_key(key_id)
+        if not private_key:
+            return None
+        return private_key.public_key()
     
     async def sign(
         self,
@@ -1536,7 +1546,8 @@ class AgentIdentityService:
         self.token_ttl_hours = token_ttl_hours
         self.delegation_ttl_hours = delegation_ttl_hours
         self.last_used_update_interval = last_used_update_interval
-        self._jwt_secret: Optional[str] = None
+        self._credential_hash_secret: Optional[bytes] = None
+        self._jwt_public_key: Optional[rsa.RSAPublicKey] = None
         # Audit reliability: bounded retry plus in-memory DLQ so a transient
         # store failure cannot abort the identity operation that triggered it.
         self._audit_max_retries: int = 3
@@ -1551,24 +1562,28 @@ class AgentIdentityService:
     
     async def initialize(self) -> None:
         """Initialize the identity service."""
-        # For HS256, we need a symmetric secret shared by every replica that
-        # will verify tokens. Validate it before generating service keys so a
-        # weak JWT_SECRET fails fast.
+        # JWTs are signed with the vault-backed RSA key below. This separate
+        # secret only keys the credential-table HMAC so the table never stores
+        # raw bearer tokens or bare SHA-256 hashes of them.
         environment = _current_environment()
-        secret = os.environ.get("JWT_SECRET")
-        if not secret:
+        hash_secret = os.environ.get("TOKEN_HASH_SECRET")
+        if not hash_secret:
             if _is_production_environment(environment):
                 raise RuntimeError(
-                    "JWT_SECRET must be set in production; a per-process "
-                    "fallback would break token verification across replicas."
+                    "TOKEN_HASH_SECRET must be set in production; a "
+                    "per-process fallback would break credential hash "
+                    "comparison across replicas."
                 )
-            secret = secrets.token_urlsafe(32)
+            hash_secret = secrets.token_urlsafe(32)
             warnings.warn(
-                "Using generated local JWT secret (ENVIRONMENT="
+                "Using generated local token hash secret (ENVIRONMENT="
                 + environment
-                + "). Set JWT_SECRET before going to production."
+                + "). Set TOKEN_HASH_SECRET before going to production."
             )
-        validated_secret = _validate_hs256_jwt_secret(secret, environment)
+        validated_hash_secret = _validate_token_hash_secret(
+            hash_secret,
+            environment
+        )
         _validate_key_provider_environment(self.key_vault, environment)
         if (
             _is_production_environment(environment)
@@ -1578,15 +1593,71 @@ class AgentIdentityService:
                 "Production identity service requires a durable identity store; "
                 "the in-memory IdentityStore is for development and tests only."
             )
-        self._jwt_secret = validated_secret
+        self._credential_hash_secret = validated_hash_secret.encode("utf-8")
 
         # Initialize CA
         await self.ca.initialize()
 
-        # Generate JWT signing key
-        await self.key_vault.generate_key_pair(
+        # Generate JWT signing key. The private key stays behind KeyVault;
+        # services verify tokens with this public key (or a JWKS wrapper around
+        # it in a multi-service deployment).
+        self._jwt_public_key = await self.key_vault.generate_key_pair(
             self.jwt_signing_key_id,
-            metadata={"purpose": "jwt_signing"}
+            metadata={"purpose": "jwt_signing", "algorithm": "RS256"}
+        )
+
+    def _require_credential_hash_secret(self) -> bytes:
+        """Return the HMAC key used for credential-table token hashes."""
+        if self._credential_hash_secret is None:
+            raise RuntimeError("AgentIdentityService.initialize() was not called")
+        return self._credential_hash_secret
+
+    async def _jwt_private_key(self) -> rsa.RSAPrivateKey:
+        """Load the vault-held JWT signing key."""
+        private_key = await self.key_vault.get_private_key(
+            self.jwt_signing_key_id
+        )
+        if private_key is None:
+            raise RuntimeError(
+                f"JWT signing key not found: {self.jwt_signing_key_id}"
+            )
+        return private_key
+
+    async def _jwt_verification_key(self) -> rsa.RSAPublicKey:
+        """Return the public key used to verify service-issued JWTs."""
+        if self._jwt_public_key is None:
+            self._jwt_public_key = await self.key_vault.get_public_key(
+                self.jwt_signing_key_id
+            )
+        if self._jwt_public_key is None:
+            raise RuntimeError(
+                f"JWT verification key not found: {self.jwt_signing_key_id}"
+            )
+        return self._jwt_public_key
+
+    async def _encode_service_jwt(self, payload: dict) -> str:
+        """Sign a service JWT with the vault-backed RS256 key."""
+        return jwt.encode(
+            payload,
+            await self._jwt_private_key(),
+            algorithm="RS256",
+            headers={"kid": self.jwt_signing_key_id}
+        )
+
+    async def _decode_service_jwt(
+        self,
+        token: str,
+        *,
+        verify_exp: bool = True
+    ) -> dict:
+        """Decode a service JWT with the RS256 verification key."""
+        return jwt.decode(
+            token,
+            await self._jwt_verification_key(),
+            algorithms=["RS256"],
+            audience="agent-platform",
+            issuer="agent-identity-service",
+            options={"verify_exp": verify_exp}
         )
     
     # -------------------------------------------------------
@@ -1862,24 +1933,20 @@ class AgentIdentityService:
             "aud": "agent-platform"
         }
         
-        # Agent-issued JWTs use HS256 here (shared secret, single-issuer
-        # path) to keep the example self-contained, as the chapter prose
-        # on HS256 vs RS256 explains. Human delegation tokens in this
-        # reference implementation use the same _jwt_secret; production
-        # multi-service deployments commonly replace both paths with
-        # RS256/ES256 and JWKS distribution.
-        token = jwt.encode(payload, self._jwt_secret, algorithm="HS256")
-        
-        # Store credential record. Use HMAC keyed on _jwt_secret instead of a
-        # bare SHA-256 so that a leak of the credential table alone does not
-        # let an attacker precompute hashes of stolen tokens; the verifier
-        # uses hmac.compare_digest to avoid timing leaks during lookup.
+        # Agent-issued JWTs are signed with the vault-backed RS256 key.
+        # Verifiers need only the public key, which can be distributed through
+        # JWKS in a multi-service deployment.
+        token = await self._encode_service_jwt(payload)
+
+        # Store credential record. Use HMAC instead of a bare SHA-256 so that a
+        # leak of the credential table alone does not let an attacker
+        # precompute hashes of stolen tokens.
         credential = Credential(
             credential_id=token_id,
             agent_id=identity.agent_id,
             credential_type="jwt",
             token_hash=hmac.new(
-                self._jwt_secret.encode(),
+                self._require_credential_hash_secret(),
                 token.encode(),
                 hashlib.sha256,
             ).hexdigest(),
@@ -1919,13 +1986,7 @@ class AgentIdentityService:
         Raises ValueError if invalid.
         """
         try:
-            payload = jwt.decode(
-                token,
-                self._jwt_secret,
-                algorithms=["HS256"],
-                audience="agent-platform",
-                issuer="agent-identity-service"
-            )
+            payload = await self._decode_service_jwt(token)
         except jwt.ExpiredSignatureError:
             await self._audit(
                 event_type=AuditEventType.TOKEN_REJECTED,
@@ -2195,19 +2256,15 @@ class AgentIdentityService:
             correlation_id=correlation_id
         )
 
-    def _decode_delegation_without_expiry(
+    async def _decode_delegation_without_expiry(
         self,
         delegation_token: str
     ) -> dict:
         """Best-effort decode of an otherwise valid expired delegation JWT."""
         try:
-            return jwt.decode(
+            return await self._decode_service_jwt(
                 delegation_token,
-                self._jwt_secret,
-                algorithms=["HS256"],
-                audience="agent-platform",
-                issuer="agent-identity-service",
-                options={"verify_exp": False}
+                verify_exp=False
             )
         except jwt.InvalidTokenError:
             return {}
@@ -2360,9 +2417,8 @@ class AgentIdentityService:
         
         await self.store.store_delegation(delegation)
         
-        # Create delegation token. This reference implementation signs
-        # delegations with HS256 via _jwt_secret; use RS256/ES256 plus JWKS
-        # when independent services need public-key verification.
+        # Create delegation token with the same vault-backed RS256 signer used
+        # for agent tokens.
         payload = {
             "type": "delegation",
             "del_id": delegation_id,
@@ -2377,7 +2433,7 @@ class AgentIdentityService:
             "aud": "agent-platform"
         }
         
-        delegation_token = jwt.encode(payload, self._jwt_secret, algorithm="HS256")
+        delegation_token = await self._encode_service_jwt(payload)
         
         await self._audit(
             event_type=AuditEventType.DELEGATION_CREATED,
@@ -2407,15 +2463,11 @@ class AgentIdentityService:
         """Validate a delegation token."""
         payload: dict = {}
         try:
-            payload = jwt.decode(
-                delegation_token,
-                self._jwt_secret,
-                algorithms=["HS256"],
-                audience="agent-platform",
-                issuer="agent-identity-service"
-            )
+            payload = await self._decode_service_jwt(delegation_token)
         except jwt.ExpiredSignatureError as e:
-            payload = self._decode_delegation_without_expiry(delegation_token)
+            payload = await self._decode_delegation_without_expiry(
+                delegation_token
+            )
             await self._audit_delegation_rejection(
                 agent_id=payload.get("agent_id"),
                 actor_id=payload.get("agent_id", "unknown"),
