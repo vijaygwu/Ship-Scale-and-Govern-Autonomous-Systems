@@ -1489,6 +1489,7 @@ import asyncio
 import inspect
 import queue
 import threading
+from collections import deque
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,

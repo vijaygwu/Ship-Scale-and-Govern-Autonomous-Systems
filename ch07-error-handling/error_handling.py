@@ -2393,7 +2393,10 @@ class DeadLetterQueue:
         self.durable_sink = durable_sink
         
         self._entries: Dict[str, DLQEntry] = {}
-        self._entry_order: deque[str] = deque()
+        # Bound the deque explicitly. The while-loop in add() still drives
+        # eviction (so we can fire callbacks and persist evicted entries),
+        # but maxlen acts as a defensive backstop against unbounded growth.
+        self._entry_order: deque[str] = deque(maxlen=self.max_size)
         self._lock = threading.Lock()
         
         # Metrics
