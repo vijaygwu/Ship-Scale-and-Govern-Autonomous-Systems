@@ -20,13 +20,15 @@ If you are looking for the design-pattern foundations (Orchestrator, Council, Sw
 
 ## Status
 
-This repository corresponds to *Agentic AI in Production* round 17 of `/book-eval6` (the parent manuscript's multi-reviewer publication-readiness gauntlet). The manuscript was declared `PUBLICATION_READY` at round 14 and has held that status for three subsequent rounds. The code in this repository carries the matching tag `book-2-r14-publication-ready`.
+This repository corresponds to *Agentic AI in Production* round 23 of `/book-eval6` (the parent manuscript's multi-reviewer publication-readiness gauntlet). The manuscript was declared `PUBLICATION_READY` at round 14 and has held that status across most subsequent rounds, with the score average hovering in a stable 4.55–4.69 band (rounds 13–23). The code in this repository carries the matching tag `book-2-r14-publication-ready`.
 
 **Test suite: 156 passing.** This includes:
 
 - Per-chapter regression tests (`tests/test_ch01_identity.py` through `tests/test_ch08_testing.py`)
 - **Production trip-wire regression tests** (`tests/test_production_guards.py`): subprocess-isolated verification that `identity._check_internal_network()` raises under `AGENT_ENV=production` with empty `INTERNAL_NETWORK`, and that `KeyVault` refuses the in-memory demo provider in production
 - **LaTeX-leak regression tests** (`tests/test_no_latex_leaks.py`): scans every `.py` file in this repository for 21 forbidden LaTeX commands (`\cite{}`, `\textbf{}`, `\ref{}`, stray `\\` escapes, etc.) that would leak through into the chapter listing PDF
+
+Across 23 evaluation rounds, ~370 fixes have landed across the manuscript and this companion code. Recent rounds added: deterministic HMAC-SHA256 tokens in `PIITokenizer` (replaces the prior LRU-evicting random tokens so audit consistency survives long observation windows), bounded `Agent.conversation_history` (was unbounded across `run()` invocations), separate unbounded `MockLLM._total_call_count` for trigger comparisons, audit DLQ eviction Prometheus hooks, per-sink chain auto-recovery with operator-callable reset, rate-limited fall-through warnings, full-jitter audit retry backoff with proper scaling, and tracked uncancelable `RetryPolicy` futures with `ExecutorSaturatedError` backpressure.
 
 ## Book Overview
 
