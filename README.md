@@ -18,6 +18,16 @@ The code in this repository is a **faithful extraction** of the in-book listings
 
 If you are looking for the design-pattern foundations (Orchestrator, Council, Swarm, Guardian, Hybrid) used by these production examples, see the companion repository for Book 1: [github.com/vijaygwu/Agent-Architectures](https://github.com/vijaygwu/Agent-Architectures).
 
+## Status
+
+This repository corresponds to *Agentic AI in Production* round 17 of `/book-eval6` (the parent manuscript's multi-reviewer publication-readiness gauntlet). The manuscript was declared `PUBLICATION_READY` at round 14 and has held that status for three subsequent rounds. The code in this repository carries the matching tag `book-2-r14-publication-ready`.
+
+**Test suite: 156 passing.** This includes:
+
+- Per-chapter regression tests (`tests/test_ch01_identity.py` through `tests/test_ch08_testing.py`)
+- **Production trip-wire regression tests** (`tests/test_production_guards.py`): subprocess-isolated verification that `identity._check_internal_network()` raises under `AGENT_ENV=production` with empty `INTERNAL_NETWORK`, and that `KeyVault` refuses the in-memory demo provider in production
+- **LaTeX-leak regression tests** (`tests/test_no_latex_leaks.py`): scans every `.py` file in this repository for 21 forbidden LaTeX commands (`\cite{}`, `\textbf{}`, `\ref{}`, stray `\\` escapes, etc.) that would leak through into the chapter listing PDF
+
 ## Book Overview
 
 *Agentic AI in Production* covers the governance and operations work required to run autonomous AI systems where mistakes have consequences. Part I establishes enterprise-grade control (identity, secrets, rate limits, audit). Part II makes systems observable and reliable (deployment, monitoring, error handling, testing).
