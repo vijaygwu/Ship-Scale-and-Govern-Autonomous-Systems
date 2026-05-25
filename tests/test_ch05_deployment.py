@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import logging
 import sys
+import threading
 import time
 import types
 from datetime import datetime, timezone
@@ -207,6 +208,33 @@ def test_feature_flag_manager_passes_targeting_context_to_backend(
     ]
 
 
+def test_feature_flag_cache_operations_are_thread_safe(
+    deployment,
+) -> None:
+    manager = deployment.FeatureFlagManager(
+        [StaticBackend("true")],
+        cache_ttl_seconds=60,
+    )
+
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            for _ in range(100):
+                assert manager.get("advanced_reasoning") is True
+                manager.clear_cache()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+
+
 def test_canary_analyzer_retries_transient_prometheus_request_error(
     deployment,
     monkeypatch,
@@ -326,6 +354,53 @@ def test_blue_green_deployer_uses_configured_desired_replicas(
     assert ("blue", 0) in scale_calls
 
 
+def test_blue_green_wait_for_ready_uses_monotonic_deadline(
+    deployment,
+    monkeypatch,
+) -> None:
+    class FakeTime:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.sleeps = []
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+        def time(self) -> float:
+            raise AssertionError("wait_for_ready must not use wall-clock time")
+
+    config = deployment.DeploymentConfig(
+        namespace="agents",
+        service_name="agent-service",
+        blue_deployment="agent-blue",
+        green_deployment="agent-green",
+        health_endpoint="http://health",
+        validation_endpoint="http://{version}/validate",
+        health_check_interval=1,
+        stabilization_seconds=1,
+    )
+    deployer = deployment.BlueGreenDeployer(config)
+    fake_time = FakeTime()
+    rollout_calls = []
+
+    def fake_run(*args, **kwargs):
+        rollout_calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(deployment.time, "monotonic", fake_time.monotonic)
+    monkeypatch.setattr(deployment.time, "sleep", fake_time.sleep)
+    monkeypatch.setattr(deployment.time, "time", fake_time.time)
+    monkeypatch.setattr(deployment.subprocess, "run", fake_run)
+
+    assert deployer.wait_for_ready("green", timeout=2) is False
+    assert len(rollout_calls) == 2
+    assert fake_time.sleeps == [1, 1]
+
+
 def test_blue_green_deployer_waits_for_old_color_to_drain(
     deployment,
     monkeypatch,
@@ -375,6 +450,56 @@ def test_blue_green_deployer_waits_for_old_color_to_drain(
     old_scaled_down = events.index(("scale", "blue", 0))
     assert zero_seen < old_scaled_down
     assert ("switch", "green") in events
+
+
+def test_blue_green_rollback_waits_for_failed_active_color_to_drain(
+    deployment,
+    monkeypatch,
+) -> None:
+    config = deployment.DeploymentConfig(
+        namespace="agents",
+        service_name="agent-service",
+        blue_deployment="agent-blue",
+        green_deployment="agent-green",
+        health_endpoint="http://health",
+        validation_endpoint="http://{version}/validate",
+        health_check_interval=1,
+        stabilization_seconds=3,
+        desired_replicas=2,
+    )
+    deployer = deployment.BlueGreenDeployer(config)
+    events = []
+    inflight_counts = iter([2, 1, 0])
+
+    monkeypatch.setattr(deployer, "get_inactive_version", lambda: "blue")
+    monkeypatch.setattr(deployer, "get_active_version", lambda: "green")
+    monkeypatch.setattr(
+        deployer,
+        "scale_deployment",
+        lambda version, replicas: events.append(("scale", version, replicas)),
+    )
+    monkeypatch.setattr(deployer, "wait_for_ready", lambda version: True)
+    monkeypatch.setattr(
+        deployer,
+        "switch_traffic",
+        lambda version: events.append(("switch", version)),
+    )
+
+    def get_inflight(version: str) -> int:
+        count = next(inflight_counts)
+        events.append(("inflight", version, count))
+        return count
+
+    monkeypatch.setattr(deployer, "get_inflight_requests", get_inflight)
+    monkeypatch.setattr(deployment.time, "sleep", lambda seconds: None)
+
+    deployer.rollback()
+
+    switch_seen = events.index(("switch", "blue"))
+    zero_seen = events.index(("inflight", "green", 0))
+    failed_scaled_down = events.index(("scale", "green", 0))
+    assert ("scale", "blue", 2) in events
+    assert switch_seen < zero_seen < failed_scaled_down
 
 
 def test_canary_zero_duration_stage_runs_post_shift_analysis(deployment) -> None:

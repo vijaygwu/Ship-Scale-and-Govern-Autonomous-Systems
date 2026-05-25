@@ -478,12 +478,21 @@ class TokenUsage:
 
     @property
     def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
+        return (
+            self.prompt_tokens
+            + self.completion_tokens
+            + self.reasoning_tokens
+        )
 
     @property
     def billable_tokens(self) -> int:
         """Tokens that count toward billing (excludes cached)."""
-        return self.prompt_tokens - self.cached_tokens + self.completion_tokens
+        return (
+            self.prompt_tokens
+            - self.cached_tokens
+            + self.completion_tokens
+            + self.reasoning_tokens
+        )
 
     def cost_estimate(
         self,
@@ -493,10 +502,11 @@ class TokenUsage:
     ) -> float:
         """Estimate cost in USD from explicitly supplied per-million-token rates."""
         billable_input = self.prompt_tokens - self.cached_tokens
+        billable_output = self.completion_tokens + self.reasoning_tokens
         return (
             (billable_input / 1_000_000) * input_price_per_million +
             (self.cached_tokens / 1_000_000) * cached_price_per_million +
-            (self.completion_tokens / 1_000_000) * output_price_per_million
+            (billable_output / 1_000_000) * output_price_per_million
         )
 
 
@@ -650,6 +660,10 @@ _current_span: ContextVar[Optional[SpanContext]] = ContextVar(
 MAX_SPAN_EVENTS = 1_000
 
 
+def _monotonic_now() -> float:
+    return time.monotonic()
+
+
 @dataclass
 class Span:
     """A single span in a distributed trace."""
@@ -660,6 +674,8 @@ class Span:
     status: str = "OK"
     attributes: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
+    _start_monotonic: float = field(default_factory=_monotonic_now, repr=False)
+    _end_monotonic: Optional[float] = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_attribute(self, key: str, value: Any) -> None:
@@ -691,15 +707,16 @@ class Span:
         """End the span."""
         with self._lock:
             self.end_time = time.time()
+            self._end_monotonic = time.monotonic()
 
     @property
     def duration_ms(self) -> float:
         with self._lock:
-            end_time = self.end_time
-            start_time = self.start_time
-        if end_time is None:
-            return (time.time() - start_time) * 1000
-        return (end_time - start_time) * 1000
+            end_monotonic = self._end_monotonic
+            start_monotonic = self._start_monotonic
+        if end_monotonic is None:
+            return max(0.0, (time.monotonic() - start_monotonic) * 1000)
+        return max(0.0, (end_monotonic - start_monotonic) * 1000)
 
 # ============================================================================
 # Block 6 (chapter listing #6)

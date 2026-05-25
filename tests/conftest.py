@@ -115,6 +115,12 @@ class _SimpleTTLCache(_SimpleLRUCache):
             dict.__delitem__(self, key)
         return True
 
+    def _prune_expiry_index(self) -> None:
+        live_keys = set(dict.keys(self))
+        for key in list(self._expires_at):
+            if key not in live_keys:
+                self._expires_at.pop(key, None)
+
     def __contains__(self, key) -> bool:
         return dict.__contains__(self, key) and not self._expired(key)
 
@@ -126,6 +132,7 @@ class _SimpleTTLCache(_SimpleLRUCache):
     def __setitem__(self, key, value) -> None:
         super().__setitem__(key, value)
         self._expires_at[key] = time.monotonic() + self.ttl
+        self._prune_expiry_index()
 
     def __delitem__(self, key) -> None:
         self._expires_at.pop(key, None)

@@ -44,7 +44,7 @@ fails fast rather than silently no-oping.
 # and CertificateAuthority calls `logger.warning` inside Block 5).
 import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -283,17 +283,19 @@ evolves, so we anchor to class names instead):
 """
 
 import asyncio
+import contextlib
 import hashlib
 import heapq
 import hmac
 import json
 import os
+import random
 import secrets
 import threading
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -1720,48 +1722,73 @@ class AgentIdentityService:
             metadata=metadata or {}
         )
         
-        # Store identity
-        await self.store.create_identity(identity)
-        
-        # Issue certificate
-        cert, private_key = await self.ca.issue_agent_certificate(
-            identity,
-            validity_days=validity_days
-        )
-        
-        # Update identity with certificate
-        identity.certificate_pem = cert.public_bytes(
-            serialization.Encoding.PEM
-        ).decode()
-        identity.certificate_serial = format(cert.serial_number, 'x')
-        identity.status = IdentityStatus.ACTIVE
-        identity.activated_at = now
-        
-        await self.store.update_identity(identity)
-        
-        # Issue initial token
-        token = await self._issue_token(identity, actor)
-        
-        # Audit
-        await self._audit(
-            event_type=AuditEventType.IDENTITY_CREATED,
-            agent_id=agent_id,
-            actor_id=actor,
-            actor_type="system" if actor == "system" else "human",
-            resource_type="identity",
-            resource_id=agent_id,
-            action="create",
-            outcome="success",
-            details={
-                "name": name,
-                "owner_team": owner_team,
-                "permissions": [permission_value(p) for p in permissions],
-                "validity_days": validity_days
-            },
-            correlation_id=correlation_id
-        )
-        
-        return identity, token
+        stored_identity = False
+        cert_serial: Optional[str] = None
+        try:
+            # Stage the certificate before persisting the identity so a
+            # certificate/key-generation failure cannot leave an unusable
+            # PENDING row behind.
+            cert, _ = await self.ca.issue_agent_certificate(
+                identity,
+                validity_days=validity_days
+            )
+            cert_serial = format(cert.serial_number, 'x')
+
+            identity.certificate_pem = cert.public_bytes(
+                serialization.Encoding.PEM
+            ).decode()
+            identity.certificate_serial = cert_serial
+            identity.status = IdentityStatus.ACTIVE
+            identity.activated_at = now
+
+            await self.store.create_identity(identity)
+            stored_identity = True
+
+            # Issue initial token only after the active identity is durable.
+            token = await self._issue_token(identity, actor)
+
+            await self._audit(
+                event_type=AuditEventType.IDENTITY_CREATED,
+                agent_id=agent_id,
+                actor_id=actor,
+                actor_type="system" if actor == "system" else "human",
+                resource_type="identity",
+                resource_id=agent_id,
+                action="create",
+                outcome="success",
+                details={
+                    "name": name,
+                    "owner_team": owner_team,
+                    "permissions": [permission_value(p) for p in permissions],
+                    "validity_days": validity_days
+                },
+                correlation_id=correlation_id
+            )
+
+            return identity, token
+        except Exception:
+            # Compensate any local signing material created before the failure.
+            if cert_serial:
+                with contextlib.suppress(Exception):
+                    await self.ca.revoke_certificate(
+                        cert_serial,
+                        expires_at=identity.expires_at
+                    )
+            with contextlib.suppress(Exception):
+                await self.key_vault.delete_key(f"{agent_id}/cert_key")
+
+            if stored_identity:
+                identity.status = IdentityStatus.SUSPENDED
+                identity.suspended_at = datetime.now(timezone.utc)
+                identity.revocation_reason = (
+                    "identity provisioning failed before initial credential "
+                    "activation completed"
+                )
+                identity.certificate_pem = None
+                identity.certificate_serial = None
+                with contextlib.suppress(Exception):
+                    await self.store.update_identity(identity)
+            raise
     
     async def get_identity(self, agent_id: str) -> Optional[AgentIdentity]:
         """Retrieve an agent identity."""
@@ -2141,13 +2168,17 @@ class AgentIdentityService:
     async def _revoke_all_credentials(
         self,
         agent_id: str,
-        actor: str
+        actor: str,
+        exclude_credential_ids: Optional[set[str]] = None
     ) -> int:
         """Revoke all credentials for an agent."""
+        exclude_credential_ids = exclude_credential_ids or set()
         credentials = await self.store.get_credentials_for_agent(agent_id)
         count = 0
         
         for cred in credentials:
+            if cred.credential_id in exclude_credential_ids:
+                continue
             if not cred.is_revoked:
                 cred.is_revoked = True
                 cred.revoked_at = datetime.now(timezone.utc)
@@ -2195,29 +2226,53 @@ class AgentIdentityService:
             if not suspended_emergency:
                 raise ValueError(f"Identity is not valid: {identity.status.value}")
         
-        # Revoke existing credentials
-        revoked_count = await self._revoke_all_credentials(agent_id, actor)
-        
-        # Issue new certificate
         old_serial = identity.certificate_serial
-        cert, _ = await self.ca.issue_agent_certificate(identity)
-        
-        identity.certificate_pem = cert.public_bytes(
-            serialization.Encoding.PEM
-        ).decode()
-        identity.certificate_serial = format(cert.serial_number, 'x')
-        
-        await self.store.update_identity(identity)
-        
+        new_identity = replace(identity)
+        new_cert_serial: Optional[str] = None
+
+        try:
+            # Stage and persist replacement certificate before touching old
+            # credentials. If anything fails before the new token is durable,
+            # existing tokens remain valid and the agent is not stranded.
+            cert, _ = await self.ca.issue_agent_certificate(new_identity)
+            new_cert_serial = format(cert.serial_number, 'x')
+
+            new_identity.certificate_pem = cert.public_bytes(
+                serialization.Encoding.PEM
+            ).decode()
+            new_identity.certificate_serial = new_cert_serial
+
+            await self.store.update_identity(new_identity)
+
+            new_token = await self._issue_token(new_identity, actor)
+            new_payload = await self._decode_service_jwt(new_token)
+            new_credential_id = new_payload["jti"]
+        except Exception:
+            if new_cert_serial:
+                with contextlib.suppress(Exception):
+                    await self.ca.revoke_certificate(
+                        new_cert_serial,
+                        expires_at=identity.expires_at
+                    )
+            with contextlib.suppress(Exception):
+                await self.key_vault.delete_key(f"{agent_id}/cert_key")
+            with contextlib.suppress(Exception):
+                await self.store.update_identity(identity)
+            raise
+
+        # Revoke old credentials only after the replacement token exists.
+        revoked_count = await self._revoke_all_credentials(
+            agent_id,
+            actor,
+            exclude_credential_ids={new_credential_id}
+        )
+
         # Revoke old certificate
         if old_serial:
             await self.ca.revoke_certificate(
                 old_serial,
-                expires_at=identity.expires_at
+                expires_at=new_identity.expires_at
             )
-        
-        # Issue new token
-        new_token = await self._issue_token(identity, actor)
         
         await self._audit(
             event_type=AuditEventType.KEY_ROTATED,
@@ -2231,7 +2286,7 @@ class AgentIdentityService:
             details={
                 "credentials_revoked": revoked_count,
                 "old_cert_serial": old_serial,
-                "new_cert_serial": identity.certificate_serial,
+                "new_cert_serial": new_identity.certificate_serial,
                 "allow_suspended": allow_suspended
             },
             correlation_id=correlation_id
@@ -2784,7 +2839,11 @@ class AgentIdentityService:
                         exc_info=exc,
                     )
                 else:
-                    await asyncio.sleep(0.01 * (2 ** attempt))
+                    # Full jitter on exponential backoff: synchronized
+                    # transient failures (e.g., audit store outage) would
+                    # otherwise produce a thundering-herd retry storm.
+                    backoff = 0.01 * (2 ** attempt)
+                    await asyncio.sleep(random.uniform(0, backoff))
 
     async def get_audit_log(
         self,

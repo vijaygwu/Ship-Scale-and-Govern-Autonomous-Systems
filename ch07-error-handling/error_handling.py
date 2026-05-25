@@ -463,6 +463,10 @@ class RetryPolicy:
                 wait=False,
                 cancel_futures=True,
             )
+        # Race tolerance: under highly concurrent first-use, two threads may
+        # both observe _default_executor_warned == False and emit the
+        # deprecation log. The duplicate warning is acceptable; serializing
+        # the check would add a hot-path lock to every call.
         if not cls._default_executor_warned:
             logger.warning(
                 "RetryPolicy.execute_sync called with attempt_timeout set "
@@ -567,10 +571,13 @@ class RetryPolicy:
         # All retries exhausted
         if last_error:
             if last_error.original_exception is not None:
-                raise last_error.original_exception
+                # `raise ... from last_error` preserves the retry-chain
+                # context (the classified AgentError) as __cause__ while
+                # surfacing the underlying exception to the caller.
+                raise last_error.original_exception from last_error
             raise RuntimeError(f"Retries exhausted: {last_error.message}")
         raise RuntimeError("Unexpected retry loop termination")
-    
+
     def execute_sync(
         self,
         operation: Callable[[], T],
@@ -620,7 +627,10 @@ class RetryPolicy:
         
         if last_error:
             if last_error.original_exception is not None:
-                raise last_error.original_exception
+                # `raise ... from last_error` preserves the retry-chain
+                # context (the classified AgentError) as __cause__ while
+                # surfacing the underlying exception to the caller.
+                raise last_error.original_exception from last_error
             raise RuntimeError(f"Retries exhausted: {last_error.message}")
         raise RuntimeError("Unexpected retry loop termination")
 

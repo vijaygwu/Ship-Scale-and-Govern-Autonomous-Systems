@@ -216,6 +216,73 @@ class AuditLogger(ABC):
         pass
 
 
+AUDIT_REDACTED = "[REDACTED]"
+MAX_AUDIT_CONTEXT_DEPTH = 4
+MAX_AUDIT_CONTEXT_ITEMS = 50
+MAX_AUDIT_CONTEXT_STRING_CHARS = 500
+SENSITIVE_AUDIT_CONTEXT_MARKERS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "private_key",
+    "prompt",
+    "completion",
+    "raw",
+    "payload",
+    "body",
+    "content",
+    "document",
+    "cookie",
+)
+
+
+def _is_sensitive_audit_context_key(key: Any) -> bool:
+    key_text = str(key).lower()
+    return any(marker in key_text for marker in SENSITIVE_AUDIT_CONTEXT_MARKERS)
+
+
+def _sanitize_audit_context(value: Any, depth: int = 0) -> Any:
+    """Redact sensitive audit context while preserving useful metadata."""
+    if depth >= MAX_AUDIT_CONTEXT_DEPTH:
+        return "[TRUNCATED]"
+
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= MAX_AUDIT_CONTEXT_ITEMS:
+                sanitized["__truncated__"] = (
+                    f"{len(value) - MAX_AUDIT_CONTEXT_ITEMS} omitted"
+                )
+                break
+            key_text = str(key)
+            if _is_sensitive_audit_context_key(key_text):
+                sanitized[key_text] = AUDIT_REDACTED
+            else:
+                sanitized[key_text] = _sanitize_audit_context(item, depth + 1)
+        return sanitized
+
+    if isinstance(value, (list, tuple)):
+        sanitized_items = [
+            _sanitize_audit_context(item, depth + 1)
+            for item in value[:MAX_AUDIT_CONTEXT_ITEMS]
+        ]
+        if len(value) > MAX_AUDIT_CONTEXT_ITEMS:
+            sanitized_items.append(
+                f"[{len(value) - MAX_AUDIT_CONTEXT_ITEMS} omitted]"
+            )
+        return sanitized_items
+
+    if isinstance(value, str) and len(value) > MAX_AUDIT_CONTEXT_STRING_CHARS:
+        return value[:MAX_AUDIT_CONTEXT_STRING_CHARS] + "...[TRUNCATED]"
+
+    return value
+
+
 class StructuredAuditLogger(AuditLogger):
     """
     Structured audit logger that outputs JSON-formatted events.
@@ -252,7 +319,7 @@ class StructuredAuditLogger(AuditLogger):
             },
             "operation": event.operation,
             "result": event.result,
-            "context": event.context,
+            "context": _sanitize_audit_context(event.context),
         }
         
         if event.error_message:
@@ -1055,8 +1122,19 @@ class SecretManager:
         try:
             value, metadata = self._provider.get_secret(secret_id, version)
             
-            # Cache only normal reads. JIT and explicit fresh-fetch callers
-            # should not leave a manager-held cached reference behind.
+            audit_result = self._audit(
+                "secret_access",
+                secret_id,
+                "read",
+                "success",
+                version=metadata.version,
+                context={**(context or {}), "cache_hit": False}
+            )
+            self._require_successful_audit(audit_result)
+
+            # Cache only after required audit delivery succeeds. JIT and
+            # explicit fresh-fetch callers should not leave a manager-held
+            # cached reference behind.
             if not bypass_cache:
                 ttl = cache_ttl or self._default_cache_ttl
                 cached_secret = CachedSecret(
@@ -1068,16 +1146,6 @@ class SecretManager:
 
                 with self._cache_lock:
                     self._cache[cache_key] = cached_secret
-            
-            audit_result = self._audit(
-                "secret_access",
-                secret_id,
-                "read",
-                "success",
-                version=metadata.version,
-                context={**(context or {}), "cache_hit": False}
-            )
-            self._require_successful_audit(audit_result)
 
             return value
 

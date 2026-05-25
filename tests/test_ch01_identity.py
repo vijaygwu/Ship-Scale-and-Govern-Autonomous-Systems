@@ -416,6 +416,46 @@ def test_identity_service_issues_validates_and_audits_scoped_tokens(
     run_async(scenario())
 
 
+def test_create_identity_cleans_up_staged_key_when_certificate_issue_fails(
+    identity,
+    monkeypatch,
+    run_async,
+):
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_TEST_TOKEN_HASH_SECRET)
+
+    async def scenario():
+        store = identity.IdentityStore()
+        vault = identity.KeyVault()
+        ca = identity.CertificateAuthority(vault, store)
+        service = identity.AgentIdentityService(store, vault, ca)
+        await service.initialize()
+        baseline_keys = set(vault._keys)
+
+        async def fail_after_key_generation(identity_record, validity_days=90):
+            await vault.generate_key_pair(
+                f"{identity_record.agent_id}/cert_key",
+                metadata={"agent_id": identity_record.agent_id},
+            )
+            raise RuntimeError("certificate signer unavailable")
+
+        ca.issue_agent_certificate = fail_after_key_generation
+
+        with pytest.raises(RuntimeError, match="certificate signer"):
+            await service.create_identity(
+                name="broken-agent",
+                description="should not leave residue",
+                owner_team="platform",
+                owner_email="platform@example.com",
+                permissions=[identity.PermissionScope.DATA_READ],
+            )
+
+        assert await store.list_identities() == []
+        assert set(vault._keys) == baseline_keys
+
+    run_async(scenario())
+
+
 def test_validate_token_rejects_wrong_or_missing_issuer(
     identity,
     monkeypatch,
@@ -444,6 +484,38 @@ def test_validate_token_rejects_wrong_or_missing_issuer(
         )
         with pytest.raises(ValueError, match="Invalid token"):
             await service.validate_token(missing_token)
+
+    run_async(scenario())
+
+
+def test_rotate_agent_credentials_preserves_old_token_on_certificate_failure(
+    identity,
+    monkeypatch,
+    run_async,
+):
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("TOKEN_HASH_SECRET", STRONG_TEST_TOKEN_HASH_SECRET)
+
+    async def scenario():
+        service, store = await _initialized_service_with_agent(identity)
+        old_token = await service.issue_token("agent_test")
+        old_payload = await service.validate_token(old_token)
+
+        async def fail_certificate_issue(identity_record, validity_days=90):
+            raise RuntimeError("replacement certificate failed")
+
+        service.ca.issue_agent_certificate = fail_certificate_issue
+
+        with pytest.raises(RuntimeError, match="replacement certificate"):
+            await service.rotate_agent_credentials(
+                "agent_test",
+                actor="unit-test",
+            )
+
+        credential = await store.get_credential(old_payload["jti"])
+        assert credential is not None
+        assert credential.is_revoked is False
+        assert await service.validate_token(old_token)
 
     run_async(scenario())
 

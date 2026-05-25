@@ -70,6 +70,14 @@ def _token_bucket_tokens(limiter):
     )
 
 
+def test_request_rate_limiter_rejects_invalid_limits():
+    with pytest.raises(ValueError, match="max_requests"):
+        rate_limits.RequestRateLimiter(max_requests=0, window_seconds=60.0)
+
+    with pytest.raises(ValueError, match="window_seconds"):
+        rate_limits.RequestRateLimiter(max_requests=1, window_seconds=0.0)
+
+
 def test_wait_for_capacity_default_timeout_is_bounded(monkeypatch):
     class FakeTime:
         def __init__(self):

@@ -643,11 +643,11 @@ class BlueGreenDeployer:
             else self.config.green_deployment
         )
         
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             # Each `kubectl rollout status` invocation uses --timeout=10s
             # server-side, but we also wrap the subprocess in a hard 30s
-            # wall-clock timeout so a hung client cannot wedge the loop. A
+            # client timeout so a hung process cannot wedge the loop. A
             # TimeoutExpired here is treated like any other non-zero exit:
             # log, back off, and retry on the next loop iteration.
             try:
@@ -668,7 +668,10 @@ class BlueGreenDeployer:
                     f"kubectl rollout status hung; retrying after "
                     f"{self.config.health_check_interval}s"
                 )
-            time.sleep(self.config.health_check_interval)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(self.config.health_check_interval, remaining))
 
         return False
     
@@ -877,7 +880,13 @@ class BlueGreenDeployer:
         # Switch traffic back
         self.switch_traffic(inactive)
         
-        # Scale down failed deployment
+        # Scale down failed deployment only after observed drain or deadline.
+        drained = self.wait_for_inflight_drain(active)
+        if not drained:
+            print(
+                f"WARNING: drain deadline expired for {active}; "
+                "scaling down according to deployment policy"
+            )
         self.scale_deployment(active, 0)
         
         print(f"Rolled back to {inactive}")
@@ -1270,6 +1279,7 @@ import hashlib
 import inspect
 import json
 import os
+import threading
 import time
 
 httpx = optional_import(
@@ -1521,35 +1531,38 @@ class FeatureFlagManager:
         # LaunchDarkly kill-switch changes are observed promptly.
         self._cache: dict[str, tuple[Any, float]] = {}
         self._cache_max_size = 100_000
+        self._cache_lock = threading.RLock()
 
     def _get_cached(self, cache_key: str) -> tuple[bool, Any]:
         """Return a cached value only while its TTL is still valid."""
-        cached = self._cache.get(cache_key)
-        if cached is None:
-            return False, None
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+            if cached is None:
+                return False, None
 
-        value, expires_at = cached
-        if expires_at <= time.monotonic():
-            self._cache.pop(cache_key, None)
-            return False, None
-        return True, value
+            value, expires_at = cached
+            if expires_at <= time.monotonic():
+                self._cache.pop(cache_key, None)
+                return False, None
+            return True, value
 
     def _set_cached(self, cache_key: str, value: Any) -> None:
         """Store a cache value unless caching has been disabled."""
         if self.cache_ttl_seconds <= 0:
             return
 
-        # Evict an arbitrary entry once over the bound (simple FIFO via
-        # iteration order; use a dedicated cache if eviction policy matters).
-        if len(self._cache) >= self._cache_max_size:
-            try:
-                self._cache.pop(next(iter(self._cache)))
-            except StopIteration:
-                pass
-        self._cache[cache_key] = (
-            value,
-            time.monotonic() + self.cache_ttl_seconds,
-        )
+        with self._cache_lock:
+            # Evict an arbitrary entry once over the bound (simple FIFO via
+            # iteration order; use a dedicated cache if eviction policy matters).
+            if len(self._cache) >= self._cache_max_size:
+                try:
+                    self._cache.pop(next(iter(self._cache)))
+                except StopIteration:
+                    pass
+            self._cache[cache_key] = (
+                value,
+                time.monotonic() + self.cache_ttl_seconds,
+            )
 
     @staticmethod
     def _backend_identity(backend: FlagBackend) -> str:
@@ -1748,7 +1761,8 @@ class FeatureFlagManager:
     
     def clear_cache(self) -> None:
         """Clear the flag cache to pick up changes."""
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
 
     def close(self) -> None:
         """Close any backends that hold network/thread resources."""

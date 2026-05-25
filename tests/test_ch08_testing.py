@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib
 import sys
 import time
@@ -200,6 +201,73 @@ def test_agent_test_harness_enforces_sync_agent_deadline(testing_module):
 
     assert result.passed is False
     assert isinstance(result.error, testing_module.ScenarioTimeoutError)
+
+
+def test_custom_expected_outcome_timeout_returns_promptly(
+    testing_module,
+    monkeypatch,
+):
+    result = testing_module.AgentResult(
+        final_response="done",
+        tool_calls=[],
+        task_completed=True,
+        conversation_history=[],
+    )
+
+    def stuck_evaluator(_result):
+        time.sleep(0.2)
+        return True
+
+    monkeypatch.setattr(
+        testing_module.ExpectedOutcome,
+        "custom_eval_timeout",
+        0.01,
+    )
+    outcome = testing_module.ExpectedOutcome(
+        type="custom",
+        value=stuck_evaluator,
+    )
+
+    started = time.monotonic()
+    assert outcome.check(result) is False
+    assert time.monotonic() - started < 0.1
+
+
+def test_sync_harness_rejects_awaitable_result_inside_running_loop(
+    testing_module,
+):
+    class AwaitableResultAgent:
+        conversation_history = []
+
+        def run(self, message, timeout=None, cancellation_token=None):
+            async def build_result():
+                return testing_module.AgentResult(
+                    final_response=f"async {message}",
+                    tool_calls=[],
+                    task_completed=True,
+                    conversation_history=[],
+                )
+
+            return build_result()
+
+    async def run_inside_loop():
+        harness = testing_module.AgentTestHarness(
+            agent_factory=AwaitableResultAgent,
+        )
+        scenario = testing_module.TestScenario(
+            name="awaitable-result",
+            description="sync harness called from an event loop",
+            user_messages=["run"],
+            expected_outcomes=[],
+            timeout_seconds=0.5,
+        )
+        return harness.run_scenario(scenario)
+
+    result = asyncio.run(run_inside_loop())
+
+    assert result.passed is False
+    assert isinstance(result.error, RuntimeError)
+    assert "event loop is already running" in str(result.error)
 
 
 def test_customer_support_scenario_file_is_packaged(testing_module):

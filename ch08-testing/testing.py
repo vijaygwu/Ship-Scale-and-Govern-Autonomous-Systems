@@ -1562,13 +1562,18 @@ class ExpectedOutcome:
                 return False
             # Run the user-supplied evaluator behind a wall-clock bound so a
             # wedged callable cannot stall the whole harness.
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="agent-test-custom-eval",
+            )
+            timed_out = False
             try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self.value, result)
-                    return bool(
-                        future.result(timeout=self.custom_eval_timeout)
-                    )
+                future = executor.submit(self.value, result)
+                return bool(future.result(timeout=self.custom_eval_timeout))
             except FutureTimeoutError:
+                timed_out = True
+                future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
                 logger.error(
                     "custom evaluator exceeded %.3fs",
                     self.custom_eval_timeout,
@@ -1577,6 +1582,9 @@ class ExpectedOutcome:
             except Exception as exc:
                 logger.error("custom evaluator raised: %r", exc)
                 return False
+            finally:
+                if not timed_out:
+                    executor.shutdown(wait=True, cancel_futures=True)
         return False
 
 
@@ -1837,9 +1845,10 @@ class AgentTestHarness:
             if inspect.isawaitable(result):
                 # asyncio.run creates a new event loop and fails if one is
                 # already running in this thread (e.g., the harness is being
-                # driven from inside a Jupyter cell or an existing event
-                # loop). Detect that case and schedule onto the running
-                # loop instead.
+                # driven from inside a Jupyter cell or an existing event loop).
+                # The synchronous harness cannot block that same thread waiting
+                # for the loop to make progress, so fail loud and close the
+                # coroutine to avoid an unawaited-coroutine warning.
                 try:
                     running_loop = asyncio.get_running_loop()
                 except RuntimeError:
@@ -1852,16 +1861,12 @@ class AgentTestHarness:
                                 result, timeout=token.time_remaining
                             )
                         )
-                    # A loop is already running in this thread; submit the
-                    # coroutine to it and block this thread on the result.
-                    awaited_future = asyncio.run_coroutine_threadsafe(
-                        asyncio.wait_for(
-                            result, timeout=token.time_remaining
-                        ),
-                        running_loop,
-                    )
-                    return awaited_future.result(
-                        timeout=token.time_remaining
+                    if hasattr(result, "close"):
+                        result.close()
+                    raise RuntimeError(
+                        "Synchronous AgentTestHarness cannot wait for an "
+                        "awaitable agent.run result while an event loop is "
+                        "already running in this thread."
                     )
                 except asyncio.TimeoutError as exc:
                     token.cancel()

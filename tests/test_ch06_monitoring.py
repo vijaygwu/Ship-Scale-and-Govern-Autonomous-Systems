@@ -82,6 +82,29 @@ def test_anomaly_and_drift_detectors_reject_non_positive_caps(monitoring_mod):
         monitoring_mod.BehaviorDriftDetector(max_metrics=0)
 
 
+def test_token_usage_includes_reasoning_tokens_in_totals_and_output_cost(
+    monitoring_mod,
+):
+    usage = monitoring_mod.TokenUsage(
+        prompt_tokens=100,
+        completion_tokens=20,
+        cached_tokens=10,
+        reasoning_tokens=30,
+    )
+
+    assert usage.total_tokens == 150
+    assert usage.billable_tokens == 140
+    assert usage.cost_estimate(
+        input_price_per_million=1.0,
+        output_price_per_million=10.0,
+        cached_price_per_million=0.1,
+    ) == pytest.approx(
+        (90 / 1_000_000) * 1.0
+        + (10 / 1_000_000) * 0.1
+        + (50 / 1_000_000) * 10.0
+    )
+
+
 @pytest.fixture
 def monitoring(import_chapter):
     return import_chapter("ch06-monitoring", "monitoring")
@@ -219,6 +242,40 @@ def test_agent_logger_redacts_sensitive_tool_arguments(monitoring):
     }
     assert "sensitive body" not in stream.getvalue()
     assert "sk-secret" not in stream.getvalue()
+
+
+def test_span_duration_uses_monotonic_clock(monitoring, monkeypatch):
+    class FakeClock:
+        def __init__(self) -> None:
+            self.wall = 1_000.0
+            self.monotonic_now = 50.0
+
+        def time(self) -> float:
+            return self.wall
+
+        def monotonic(self) -> float:
+            return self.monotonic_now
+
+    fake_clock = FakeClock()
+    exported = []
+    monkeypatch.setattr(monitoring.time, "time", fake_clock.time)
+    monkeypatch.setattr(monitoring.time, "monotonic", fake_clock.monotonic)
+
+    tracer = monitoring.AgentTracer(
+        service_name="unit-test",
+        exporter=exported.append,
+    )
+    span = tracer.start_span("work")
+
+    fake_clock.wall = 900.0
+    fake_clock.monotonic_now = 50.025
+    assert span.duration_ms == pytest.approx(25.0)
+
+    tracer.end_span(span)
+
+    assert exported == [span]
+    assert span.end_time < span.start_time
+    assert span.duration_ms == pytest.approx(25.0)
 
 
 def test_metrics_server_uses_bounded_loopback_server(monitoring):

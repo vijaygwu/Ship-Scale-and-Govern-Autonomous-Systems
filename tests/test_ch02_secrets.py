@@ -413,6 +413,7 @@ def test_secret_manager_can_require_successful_audit_before_returning_secret(
             match="audit delivery failed",
         ):
             manager.get_secret("research/openai-api-key")
+        assert manager._cache == {}
     finally:
         manager.shutdown()
 
@@ -460,6 +461,46 @@ def test_environment_backend_rejected_in_production_without_override(
         "Denied environment secret backend" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_structured_audit_logger_redacts_sensitive_context(secrets_module):
+    emitted = []
+    logger = secrets_module.StructuredAuditLogger(output_handler=emitted.append)
+    original_context = {
+        "correlation_id": "corr-1",
+        "api_key": "sk-live",
+        "nested": {
+            "authorization": "Bearer token",
+            "ticket_id": "T-123",
+            "messages": [
+                {"prompt": "include raw customer payload"},
+                {"safe": "metadata"},
+            ],
+        },
+        "raw_payload": {"customer_email": "alice@example.com"},
+    }
+    event = secrets_module.AuditEvent(
+        timestamp=datetime.now(timezone.utc),
+        event_type="secret_access",
+        secret_id="prod/openai/api-key",
+        secret_version="v1",
+        agent_id="agent-7",
+        agent_role="research",
+        operation="read",
+        result="success",
+        context=original_context,
+    )
+
+    logger.log(event)
+
+    context = emitted[0]["context"]
+    assert context["correlation_id"] == "corr-1"
+    assert context["api_key"] == secrets_module.AUDIT_REDACTED
+    assert context["nested"]["authorization"] == secrets_module.AUDIT_REDACTED
+    assert context["nested"]["ticket_id"] == "T-123"
+    assert context["nested"]["messages"][0]["prompt"] == secrets_module.AUDIT_REDACTED
+    assert context["raw_payload"] == secrets_module.AUDIT_REDACTED
+    assert original_context["api_key"] == "sk-live"
 
 
 def test_environment_backend_production_override_is_explicit(

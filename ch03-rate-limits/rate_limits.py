@@ -45,6 +45,11 @@ class RequestRateLimiter:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
+        if self.max_requests < 1:
+            raise ValueError("max_requests must be positive")
+        if self.window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+
         # Bound the deque so direct manipulation can't grow unbounded; the
         # sliding-window logic in try_acquire already keeps len <= max_requests,
         # so 2x max_requests is a safe upper bound for transient additions.
@@ -3203,16 +3208,17 @@ def slack_notification_channel(webhook_url: str) -> Callable[[Alert], None]:
             }]
         }
         
-        req = urllib.request.Request(
-            webhook_url,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}
-        )
-        # The alerting path must never crash the caller, so a broken or slow
-        # webhook is logged and swallowed rather than re-raised.
+        # Best-effort delivery: common serialization, request-construction,
+        # and webhook I/O failures are logged and dropped so they do not mask
+        # the monitored request.
         try:
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}
+            )
             urllib.request.urlopen(req, timeout=5.0)
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (TypeError, ValueError, OSError, urllib.error.URLError, TimeoutError) as exc:
             logger.warning("Slack webhook delivery failed: %s", exc)
     
     return send
@@ -3254,16 +3260,17 @@ def pagerduty_notification_channel(
             }
         }
         
-        req = urllib.request.Request(
-            "https://events.pagerduty.com/v2/enqueue",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}
-        )
-        # The alerting path must never crash the caller, so a broken or slow
-        # webhook is logged and swallowed rather than re-raised.
+        # Best-effort delivery: common serialization, request-construction,
+        # and webhook I/O failures are logged and dropped so they do not mask
+        # the monitored request.
         try:
+            req = urllib.request.Request(
+                "https://events.pagerduty.com/v2/enqueue",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}
+            )
             urllib.request.urlopen(req, timeout=5.0)
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (TypeError, ValueError, OSError, urllib.error.URLError, TimeoutError) as exc:
             logger.warning("PagerDuty webhook delivery failed: %s", exc)
     
     return send
