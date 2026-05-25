@@ -2061,9 +2061,11 @@ class GracefulDegradationManager:
         """
         Calculate recommended retry delay using decorrelated jitter.
 
-        The decorrelated jitter approach~\\cite{aws-backoff}, building on exponential
-        backoff principles~\\cite{metcalfe-backoff}, reduces correlation between retry
-        attempts from multiple clients, preventing thundering herd problems.
+        The decorrelated jitter approach (AWS backoff guidance, Brooker),
+        building on exponential backoff and multiple-access contention
+        analysis (Metcalfe & Boggs; Hastad et al.), reduces correlation
+        between retry attempts from multiple clients, preventing
+        thundering herd problems.
 
         Formula: sleep = min(cap, random(base, sleep * 3))
 
