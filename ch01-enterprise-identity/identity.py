@@ -301,6 +301,7 @@ from typing import Any, Optional
 
 import jwt
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
@@ -1489,21 +1490,28 @@ class CertificateAuthority:
                     padding.PKCS1v15(),
                     cert.signature_hash_algorithm
                 )
-            except Exception as e:
-                logger.warning(f"Cert signature verification failed: {e}")
+            except InvalidSignature:
+                logger.exception("Certificate signature invalid")
                 return False, "Certificate signature verification failed", None
-            
+            except (ValueError, TypeError) as e:
+                logger.exception("Certificate signature check failed: %s", e)
+                return False, "Certificate signature verification failed", None
+
             # Extract agent data from extensions
             agent_data = None
             for ext in cert.extensions:
                 if ext.oid == self.AGENT_ID_OID:
                     agent_data = json.loads(ext.value.value.decode())
                     break
-            
+
             return True, None, agent_data
-            
-        except Exception as e:
-            return False, f"Certificate parsing failed: {str(e)}", None
+
+        except (ValueError, TypeError) as e:
+            logger.exception("Certificate parsing failed: %s", e)
+            return False, f"Parsing failed: {e!r}", None
+        except Exception as e:  # noqa: BLE001 -- fail-safe boundary
+            logger.exception("Unexpected certificate verification error")
+            return False, f"Unexpected error: {e!r}", None
     
     async def revoke_certificate(
         self,

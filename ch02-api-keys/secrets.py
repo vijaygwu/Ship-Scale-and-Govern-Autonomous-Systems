@@ -112,6 +112,21 @@ hvac = optional_import(
 )
 
 
+def _real_exceptions(*candidates: Any) -> tuple:
+    """Filter ``candidates`` to those that are genuine exception classes.
+
+    Test environments may stub provider SDKs with ``MagicMock`` rather than
+    real modules, in which case attribute lookups (e.g.
+    ``hvac.exceptions.VaultError``) yield mock instances that cannot appear
+    in an ``except`` tuple. Filtering through this helper keeps the narrowed
+    handlers safe under both real and stubbed imports.
+    """
+    return tuple(
+        c for c in candidates
+        if isinstance(c, type) and issubclass(c, BaseException)
+    )
+
+
 def _load_stdlib_secrets():
     """Load stdlib secrets without resolving to this chapter's secrets.py."""
 
@@ -1063,10 +1078,27 @@ class SecretManager:
                 context={**(context or {}), "cache_hit": False}
             )
             self._require_successful_audit(audit_result)
-            
+
             return value
-            
-        except Exception as e:
+
+        except _real_exceptions(
+            SecretNotFoundError,
+            SecretAccessDeniedError,
+            SecretRetryExhaustedError,
+            hvac.exceptions.VaultError,
+            botocore_exceptions.ClientError,
+        ) as e:
+            self._audit(
+                "secret_access",
+                secret_id,
+                "read",
+                "failure",
+                context=context,
+                error=str(e)
+            )
+            raise
+        except Exception as e:  # noqa: BLE001 -- fail-safe boundary
+            logger.exception("Unexpected secret access error")
             self._audit(
                 "secret_access",
                 secret_id,
@@ -1190,8 +1222,25 @@ class SecretManager:
             )
             
             return new_value
-            
-        except Exception as e:
+
+        except _real_exceptions(
+            SecretRotationError,
+            SecretNotFoundError,
+            SecretAccessDeniedError,
+            hvac.exceptions.VaultError,
+            botocore_exceptions.ClientError,
+        ) as e:
+            self._audit(
+                "secret_rotation",
+                secret_id,
+                "rotate",
+                "failure",
+                context=context,
+                error=str(e)
+            )
+            raise
+        except Exception as e:  # noqa: BLE001 -- fail-safe boundary
+            logger.exception("Unexpected secret rotation error")
             self._audit(
                 "secret_rotation",
                 secret_id,
@@ -1245,8 +1294,25 @@ class SecretManager:
                 version=version,
                 context=context
             )
-            
-        except Exception as e:
+
+        except _real_exceptions(
+            SecretNotFoundError,
+            SecretAccessDeniedError,
+            hvac.exceptions.VaultError,
+            botocore_exceptions.ClientError,
+        ) as e:
+            self._audit(
+                "secret_revocation",
+                secret_id,
+                "revoke",
+                "failure",
+                version=version,
+                context=context,
+                error=str(e)
+            )
+            raise
+        except Exception as e:  # noqa: BLE001 -- fail-safe boundary
+            logger.exception("Unexpected secret revocation error")
             self._audit(
                 "secret_revocation",
                 secret_id,
@@ -1288,8 +1354,8 @@ class SecretManager:
         while not self._shutdown_event.is_set():
             try:
                 self._check_rotation_due()
-            except Exception as e:
-                logger.error(f"Rotation monitor error: {e}")
+            except Exception as e:  # noqa: BLE001 -- monitor loop must not die
+                logger.exception("Rotation monitor error: %s", e)
             
             self._shutdown_event.wait(self._rotation_check_interval)
             
