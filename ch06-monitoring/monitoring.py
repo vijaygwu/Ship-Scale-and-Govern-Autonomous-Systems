@@ -3079,9 +3079,9 @@ def create_standard_agent_slos(metrics: AgentMetrics) -> list[SLO]:
     )
 
     task_latency_sli = SLI(
-        name="task_latency_p95",
-        description="95th percentile task latency under 30 seconds",
-        unit="seconds",
+        name="task_threshold_pass_rate",
+        description="Fraction of tasks completing under 30 seconds",
+        unit="percent",
         good_event_query=task_latency_good,
         total_event_query=task_latency_total
     )
@@ -3096,7 +3096,7 @@ def create_standard_agent_slos(metrics: AgentMetrics) -> list[SLO]:
         ),
         SLO(
             name="task_latency",
-            description="95% of tasks should complete within 30 seconds",
+            description="At least 95% of tasks should complete under 30 seconds",
             sli=task_latency_sli,
             target_percentage=95.0,
             window_days=7
