@@ -32,7 +32,7 @@ class ResearchAgent:
 # Block 2 (chapter listing #2)
 # ============================================================================
 
-{
+_block_2_listing_example = {
     "timestamp": "2026-04-28T14:32:17.892Z",
     "event_type": "secret_access",
     "secret_id": "prod/openai/api-key",
@@ -51,6 +51,8 @@ class ResearchAgent:
         "purpose": "external_api_call"
     }
 }
+"""Illustrative audit-event shape; not used at runtime, retained as
+documentation alongside the listing."""
 
 # ============================================================================
 # Block 3 (chapter listing #3)
@@ -2032,6 +2034,21 @@ def send_to_siem(
                     delivered=True,
                     attempts=attempt,
                     status_code=status_code,
+                )
+            # 4xx client errors (other than 408 Request Timeout and 429
+            # Too Many Requests) will fail every retry attempt the same
+            # way, so we short-circuit and surface the failure without
+            # burning the retry budget.
+            if 400 <= status_code < 500 and status_code not in (408, 429):
+                last_error = (
+                    f"SIEM endpoint returned HTTP {status_code} "
+                    "(non-retryable client error)"
+                )
+                return SIEMDeliveryResult(
+                    delivered=False,
+                    attempts=attempt,
+                    status_code=status_code,
+                    error=last_error,
                 )
             last_error = f"SIEM endpoint returned HTTP {status_code}"
         except Exception as exc:

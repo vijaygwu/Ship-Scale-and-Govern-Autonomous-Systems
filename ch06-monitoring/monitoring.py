@@ -3356,16 +3356,39 @@ def create_standard_agent_alerts(
             name="high_token_usage",
             description="Token usage anomalously high",
             severity=AlertSeverity.WARNING,
-            condition=lambda: (
-                len(metrics._task_tokens) > 100 and
-                sum(list(metrics._task_tokens)[-10:]) / 10 >
-                sum(metrics._task_tokens) / len(metrics._task_tokens) * 2
-            ),
+            # Rolling-window comparison: the most recent 10 samples vs
+            # the 100 samples *before* that (samples[-110:-10]). Using
+            # a recent baseline rather than an all-time mean keeps the
+            # comparison fresh; a sustained moderate rise pulls the
+            # all-time mean toward the alert level and effectively
+            # silences the rule, whereas a 100-sample baseline only
+            # tracks the last few hundred tasks.
+            condition=lambda: _check_high_token_usage(metrics),
             for_duration=timedelta(minutes=5),
             labels={"component": "agent", "type": "cost"},
             cooldown=timedelta(hours=1)
         )
     ]
+
+
+def _check_high_token_usage(metrics) -> bool:
+    """Return True when recent token usage exceeds 2x a recent baseline.
+
+    Compares the mean of the last 10 samples in ``metrics._task_tokens``
+    against the mean of the 100 samples immediately preceding them.
+    Requires at least 110 samples; otherwise returns False so the rule
+    does not fire on cold-start data.
+    """
+    history = list(metrics._task_tokens)
+    if len(history) < 110:
+        return False
+    recent_window = history[-10:]
+    baseline_window = history[-110:-10]
+    recent_avg = sum(recent_window) / len(recent_window)
+    baseline_avg = sum(baseline_window) / len(baseline_window)
+    if baseline_avg <= 0:
+        return False
+    return recent_avg > 2.0 * baseline_avg
 
 # ============================================================================
 # Block 13 (chapter block #13) — non-python listing (log output)

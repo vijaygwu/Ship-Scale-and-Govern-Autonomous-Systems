@@ -23,8 +23,12 @@ provide the surrounding context (imports, dependencies) as needed.
 # ============================================================================
 
 # What they actually logged
-{"timestamp": "2024-03-15T14:22:31Z", "level": "INFO",
- "message": "Account action completed", "account_id": "12345"}
+_block_1_listing_example = {
+    "timestamp": "2024-03-15T14:22:31Z", "level": "INFO",
+    "message": "Account action completed", "account_id": "12345",
+}
+"""Illustrative log-line shape; not used at runtime, retained as
+documentation alongside the listing."""
 
 # ============================================================================
 # Block 2 (chapter block #2) — Python fragment (incomplete, depends on surrounding context)
@@ -2051,6 +2055,17 @@ MAX_QUERY_REGEX_TARGET_CHARS = 4096
 _UNSAFE_REPEATED_GROUP = re.compile(
     r"\((?:[^()\\]|\\.)*(?:[+*{]|\|)(?:[^()\\]|\\.)*\)(?:[+*{])"
 )
+# Additional ReDoS pre-screen: nested unbounded quantifiers such as
+# ``(.+)+`` and ``(.*)*`` are classic catastrophic-backtracking shapes
+# that the narrower ``_UNSAFE_REPEATED_GROUP`` heuristic does not catch.
+_UNSAFE_NESTED_QUANTIFIER = re.compile(
+    r"\([^()]*[.\w][+*][^()]*\)[+*]"
+)
+# Operator-facing safety switch: when True, every REGEX-operator query
+# is rejected with PermissionError. Deployments that cannot guarantee
+# the heuristics above (for example, untrusted user-supplied patterns)
+# should set this and only flip it back on for admin-only contexts.
+RESTRICT_REGEX_TO_ADMIN = False
 
 
 @lru_cache(maxsize=512)
@@ -2102,13 +2117,44 @@ class QueryCondition:
         return False
 
     def _safe_regex_match(self, pattern: Any, text: str) -> bool:
-        """Run a bounded regex search for operator-controlled audit queries."""
+        """Run a bounded regex search for operator-controlled audit queries.
+
+        Layered defenses, in order:
+
+        1. ``RESTRICT_REGEX_TO_ADMIN`` short-circuits with
+           ``PermissionError`` when the deployment policy forbids
+           REGEX operator queries from the current caller.
+        2. Pattern length is capped at
+           ``MAX_QUERY_REGEX_PATTERN_CHARS``.
+        3. Two heuristic pre-screens reject catastrophic-backtracking
+           shapes: ``_UNSAFE_REPEATED_GROUP`` (an outer
+           quantifier wrapping a group that already contains a
+           quantifier or alternation) and ``_UNSAFE_NESTED_QUANTIFIER``
+           (``(.+)+`` and ``(.*)*`` style nesting).
+        4. The target string is truncated to
+           ``MAX_QUERY_REGEX_TARGET_CHARS`` so worst-case work is
+           bounded by both pattern and input size.
+
+        The heuristics are necessarily conservative; the stdlib ``re``
+        module has no timeout, so deployments that accept fully
+        untrusted patterns should flip ``RESTRICT_REGEX_TO_ADMIN`` on
+        and route REGEX queries through an authenticated admin path.
+        """
+        if RESTRICT_REGEX_TO_ADMIN:
+            raise PermissionError(
+                "REGEX operator queries are restricted to admin contexts"
+            )
         if not isinstance(pattern, str):
             return False
         if len(pattern) > MAX_QUERY_REGEX_PATTERN_CHARS:
             raise ValueError("regex pattern is too long for audit query")
         if _UNSAFE_REPEATED_GROUP.search(pattern):
             raise ValueError("nested or repeated regex groups are not allowed")
+        if _UNSAFE_NESTED_QUANTIFIER.search(pattern):
+            raise ValueError(
+                "nested unbounded quantifiers (e.g. (.+)+ / (.*)*) "
+                "are not allowed"
+            )
 
         target = text[:MAX_QUERY_REGEX_TARGET_CHARS]
         try:
