@@ -1468,7 +1468,15 @@ class TestStockPriceToolWithRecording:
 # Block 9 (chapter listing #9)
 # ============================================================================
 
-if __name__ == "__main__":
+def _block_9_demo() -> None:
+    """Block 9 + Block 10 demo: requires AgentTestHarness, TestScenario, and
+    ExpectedOutcome which are defined later in Block 11.
+
+    Wrapped in a function (rather than executed at import time) so the file
+    parses and imports cleanly despite the forward reference. The end-of-file
+    ``if __name__ == "__main__":`` block calls this after Block 11 has been
+    defined.
+    """
     # Placeholder for the user-supplied agent factory. Replace with your
     # actual agent constructor (e.g., a function returning a configured
     # Agent instance) when running this example.
@@ -1500,6 +1508,9 @@ if __name__ == "__main__":
     results = harness.run_from_yaml(Path("scenarios/customer_support.yaml"))
     summary = harness.get_summary()
     print(f"Pass rate: {summary['pass_rate']:.1%}")
+
+# Note: _block_9_demo() is not called at parse time; the end-of-file
+# ``if __name__ == "__main__":`` entry point invokes it after Block 11.
 
 # ============================================================================
 # Block 11 (chapter listing #11)
@@ -3102,3 +3113,9 @@ def database_connection():
 def agent_with_tools(model_config: ModelConfig) -> Agent:
     """Agent with full tool access for behavioral tests."""
     return create_agent_with_all_tools(model_config)
+
+
+if __name__ == "__main__":  # pragma: no cover -- demo entry point
+    # Block 9/10 demo invoked here so AgentTestHarness, TestScenario, and
+    # ExpectedOutcome (defined in Block 11 above) are in scope at call time.
+    _block_9_demo()

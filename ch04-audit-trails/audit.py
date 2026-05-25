@@ -86,6 +86,7 @@ Code Navigation (line numbers are approximate):
 """
 
 
+import copy
 import hashlib
 import hmac
 import json
@@ -105,6 +106,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, TypeVar
 from uuid import UUID, uuid4
+
+
+logger = logging.getLogger(__name__)
 
 
 class EventType(Enum):
@@ -638,7 +642,7 @@ class AuditLogger:
         # just in the log stream.
         self._failure_counter_hook: Optional[Callable[[dict], None]] = None
         if not sinks:
-            logging.warning(
+            logger.warning(
                 "AuditLogger initialized without sinks; audit events will be "
                 "dropped and counted. Use only for explicit no-op/test usage."
             )
@@ -676,7 +680,7 @@ class AuditLogger:
         with state.condition:
             state.disabled_reason = None
             state.disabled_at = None
-        logging.info(
+        logger.info(
             "Sink %s manually reset; will retry on next write", sink_name,
         )
 
@@ -868,7 +872,7 @@ class AuditLogger:
                     datetime.now(timezone.utc) - state.disabled_at
                 ).total_seconds()
                 if elapsed >= state.cooldown_seconds:
-                    logging.info(
+                    logger.info(
                         "Sink %s cooldown expired (%.0fs); attempting recovery",
                         type(sink).__name__, elapsed,
                     )
@@ -1017,7 +1021,7 @@ class AuditLogger:
                         if remaining <= 0:
                             break
                         backoff = min(backoff, remaining)
-                    logging.warning(
+                    logger.warning(
                         "Audit %s attempt %d/%d failed: %s; retrying in %.2fs",
                         op_name, attempt + 1, self._max_retries, e, backoff,
                     )
@@ -1040,7 +1044,7 @@ class AuditLogger:
                 self._dead_letter_queue.append(
                     (op_name, event, repr(last_error))
                 )
-        logging.critical(
+        logger.critical(
             "Audit %s failed after %d retries; event diverted to DLQ. "
             "audit_write_failures_total{op=%s}=%d. Last error: %s",
             op_name, self._max_retries, op_name,
@@ -1057,7 +1061,7 @@ class AuditLogger:
                     "last_error": repr(last_error),
                 })
             except Exception as hook_exc:
-                logging.error(
+                logger.error(
                     "Audit failure-counter hook raised %r; metric not "
                     "recorded.",
                     hook_exc,
@@ -1068,7 +1072,7 @@ class AuditLogger:
         with self._dlq_lock:
             self._dropped_event_count += 1
             dropped_count = self._dropped_event_count
-        logging.warning(
+        logger.warning(
             "Audit event %s dropped because no audit sinks are configured; "
             "audit_dropped_events_total=%d",
             event.event_id,
@@ -1947,7 +1951,11 @@ class IntegrityVerifier:
         # Match the writer's canonical serialization exactly: sorted keys and
         # the same compact separators used by AuditLogger._create_event.
         # Any drift here makes verification produce false-positive mismatches.
-        event_copy = json.loads(json.dumps(event))
+        # We use copy.deepcopy rather than json.loads(json.dumps(...)) because
+        # deepcopy avoids the double-serialization on this hot path and
+        # tolerates non-JSON-native types (datetime, bytes); the subsequent
+        # json.dumps(default=str) handles their serialization once at the end.
+        event_copy = copy.deepcopy(event)
         event_copy.get("integrity", {}).pop("event_hash", None)
         event_json = json.dumps(
             event_copy, sort_keys=True, separators=(",", ":"), default=str

@@ -2616,7 +2616,10 @@ except ImportError:  # pragma: no cover - optional structured logging package
         def get_logger() -> _FallbackStructLogger:
             return _FallbackStructLogger()
 
-logger = structlog.get_logger()
+# Use a distinct name so this structlog logger does not shadow the stdlib
+# logger defined at module top (line 60). Code that emits structured events
+# uses `structured_logger`; plain stdlib logging continues to use `logger`.
+structured_logger = structlog.get_logger()
 
 
 class GracefulShutdown:

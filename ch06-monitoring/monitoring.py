@@ -1708,9 +1708,16 @@ class PrometheusAgentMetrics:
 
         # Suppress repeated warnings about the same unrecognized agent_id.
         # A legacy ID shape would otherwise flood logs on every request.
+        # The bounded set caps memory for fleets with many distinct legacy
+        # IDs; the rate limiter below ensures that even fleets that exceed
+        # the set cap (so every new request sees an "unknown" ID) emit at
+        # most one warning per warning_interval seconds, instead of one per
+        # request.
         self._warned_agent_ids: set[str] = set()
         self._warned_agent_ids_max: int = 10000
         self._agent_pool_fallthrough_count: int = 0
+        self._last_agent_pool_warning_at: float = 0.0
+        self._agent_pool_warning_interval: float = 300.0  # 5 minutes
 
     def record_task_start(self, task_type: str, agent_id: str) -> None:
         """Record that a task has started."""
@@ -1877,18 +1884,28 @@ class PrometheusAgentMetrics:
             return "nonprod"
         # Falling through to "primary" silently collapses cardinality; warn so
         # operators can audit unexpected agent_id shapes that route to default.
-        # We warn at most once per ID (bounded set) so a fleet with legacy IDs
-        # does not flood logs on every request.
+        # We dedupe by ID via a bounded set, and additionally rate-limit the
+        # log emission. Without the rate limit a fleet with more than
+        # _warned_agent_ids_max distinct legacy IDs would flood logs once the
+        # set saturates (every new ID would still re-warn on every request).
         self._agent_pool_fallthrough_count += 1
         key = agent_id or ""
         if key not in self._warned_agent_ids:
             if len(self._warned_agent_ids) < self._warned_agent_ids_max:
                 self._warned_agent_ids.add(key)
-            logging.getLogger(__name__).warning(
-                "Unrecognized agent_id shape %r; falling through to primary "
-                "pool. Subsequent occurrences will be suppressed.",
-                agent_id,
-            )
+            now = time.monotonic()
+            if (
+                now - self._last_agent_pool_warning_at
+                >= self._agent_pool_warning_interval
+            ):
+                logging.getLogger(__name__).warning(
+                    "Unrecognized agent_id shape %r; falling through to "
+                    "primary pool. Further warnings suppressed for the next "
+                    "%.0f seconds.",
+                    agent_id,
+                    self._agent_pool_warning_interval,
+                )
+                self._last_agent_pool_warning_at = now
         return "primary"
 
     @property

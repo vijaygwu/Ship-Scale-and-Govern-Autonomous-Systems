@@ -3159,7 +3159,14 @@ class ErrorAggregator:
 # ============================================================================
 
 # What happened (problematic code)
-async def get_product_recommendation(user_query: str) -> str:
+async def _pedagogical_bad_get_product_recommendation(user_query: str) -> str:
+    """Pedagogical "do not do this" contrast for the pattern shown below.
+
+    Demonstrates what NOT to do; the correct pattern is defined below as
+    ``get_product_recommendation``. Renamed from ``get_product_recommendation``
+    to avoid colliding with the corrected definition at module level. This
+    function is intentionally suboptimal and is not called at runtime.
+    """
     # No retry policy, no circuit breaker
     return await llm_client.complete(user_query)
 

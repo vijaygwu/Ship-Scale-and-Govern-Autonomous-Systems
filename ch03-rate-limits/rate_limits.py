@@ -2224,14 +2224,18 @@ class GracefulDegradationManager:
         while True:
             now = time.monotonic()
             with self._lock:
-                # Remove expired entries without changing queue admission policy.
-                # Preserve the bounded-memory invariant by carrying the
-                # original maxlen through the rebuild.
-                self._request_queue = deque(
-                    (entry for entry in self._request_queue
-                     if entry["expires_at"] > now),
-                    maxlen=self._request_queue.maxlen,
-                )
+                # Drop expired entries from the head of the queue. The deque
+                # is always insertion-ordered by expires_at (FIFO with a fixed
+                # max_queue_wait TTL, see _try_queue), so once we hit a
+                # non-expired entry every remaining entry is also non-expired
+                # and we can stop. This is O(k) in the number expiring rather
+                # than O(n) over the whole queue, and avoids reallocating the
+                # deque on every iteration.
+                while (
+                    self._request_queue
+                    and self._request_queue[0]["expires_at"] <= now
+                ):
+                    self._request_queue.popleft()
 
                 if not self._request_queue:
                     break
