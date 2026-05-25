@@ -271,6 +271,7 @@ class ErrorClassifier:
 # ============================================================================
 
 import asyncio
+import atexit
 import contextvars
 import random
 import time
@@ -456,6 +457,11 @@ class RetryPolicy:
             cls._default_executor = ThreadPoolExecutor(
                 max_workers=4,
                 thread_name_prefix="retry-policy-default",
+            )
+            atexit.register(
+                cls._default_executor.shutdown,
+                wait=False,
+                cancel_futures=True,
             )
         if not cls._default_executor_warned:
             logger.warning(

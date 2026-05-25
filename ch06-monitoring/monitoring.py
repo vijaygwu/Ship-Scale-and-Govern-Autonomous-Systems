@@ -1693,6 +1693,7 @@ class PrometheusAgentMetrics:
         # A legacy ID shape would otherwise flood logs on every request.
         self._warned_agent_ids: set[str] = set()
         self._warned_agent_ids_max: int = 10000
+        self._agent_pool_fallthrough_count: int = 0
 
     def record_task_start(self, task_type: str, agent_id: str) -> None:
         """Record that a task has started."""
@@ -1861,6 +1862,7 @@ class PrometheusAgentMetrics:
         # operators can audit unexpected agent_id shapes that route to default.
         # We warn at most once per ID (bounded set) so a fleet with legacy IDs
         # does not flood logs on every request.
+        self._agent_pool_fallthrough_count += 1
         key = agent_id or ""
         if key not in self._warned_agent_ids:
             if len(self._warned_agent_ids) < self._warned_agent_ids_max:
@@ -1871,6 +1873,14 @@ class PrometheusAgentMetrics:
                 agent_id,
             )
         return "primary"
+
+    @property
+    def agent_pool_fallthrough_count(self) -> int:
+        """Count of agent_ids that fell through to the default 'primary' pool.
+        Sustained growth indicates misconfigured canary/shadow traffic or a
+        new agent_id naming scheme not yet mapped. Operators should monitor
+        this counter."""
+        return self._agent_pool_fallthrough_count
 
     @staticmethod
     def _tool_category(tool_name: str) -> str:

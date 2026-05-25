@@ -1562,12 +1562,19 @@ class AgentIdentityService:
         self._audit_dlq: deque[tuple[AuditEvent, Exception]] = deque(
             maxlen=1000
         )
+        self._audit_dlq_evicted: int = 0
+        self._audit_dlq_eviction_warned: bool = False
 
     @property
     def audit_dlq_size(self) -> int:
         """Number of audit events currently parked in the DLQ."""
         return len(self._audit_dlq)
-    
+
+    @property
+    def audit_dlq_evicted_count(self) -> int:
+        """Count of DLQ entries evicted due to maxlen overflow."""
+        return self._audit_dlq_evicted
+
     async def initialize(self) -> None:
         """Initialize the identity service."""
         # JWTs are signed with the vault-backed RSA key below. This separate
@@ -2759,6 +2766,16 @@ class AgentIdentityService:
                 return
             except Exception as exc:
                 if attempt == self._audit_max_retries - 1:
+                    if len(self._audit_dlq) >= (self._audit_dlq.maxlen or 0):
+                        self._audit_dlq_evicted += 1
+                        if not self._audit_dlq_eviction_warned:
+                            logger.warning(
+                                "audit DLQ at capacity (maxlen=%d); oldest "
+                                "entries are being evicted. Investigate "
+                                "audit pipeline health.",
+                                self._audit_dlq.maxlen,
+                            )
+                            self._audit_dlq_eviction_warned = True
                     self._audit_dlq.append((event, exc))
                     logger.critical(
                         "Audit event failed after %d retries; pushed to "
