@@ -803,8 +803,9 @@ class AWSSecretsManagerProvider(SecretBackendProvider):
                     for stages in version_stages.values()
                 ):
                     break
-                # Exponential backoff: 0.5, 1, 2, 4, 8, 8, 8, 8 seconds
-                # with full jitter per the AWS exponential-backoff guidance.
+                # Backoff cap sequence: 0.5, 1, 2, 4, 8, 8, 8, 8 seconds;
+                # actual sleep is random.uniform(0, cap) due to full jitter
+                # per the AWS exponential-backoff guidance.
                 delay = min(cap, base_delay * (2 ** attempt))
                 logger.debug(
                     f"rotation poll attempt={attempt} sleeping={delay:.2f}s"

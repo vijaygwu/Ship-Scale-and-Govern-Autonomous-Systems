@@ -2619,6 +2619,10 @@ except ImportError:  # pragma: no cover - optional structured logging package
 # Use a distinct name so this structlog logger does not shadow the stdlib
 # logger defined at module top (line 60). Code that emits structured events
 # uses `structured_logger`; plain stdlib logging continues to use `logger`.
+# (The chapter listing for src/lifecycle/shutdown.py re-binds `logger =
+# logging.getLogger(__name__)` immediately above this comment so the
+# standalone listing is runnable on its own; in this aggregated module the
+# module-top binding above already provides it.)
 structured_logger = structlog.get_logger()
 
 

@@ -1709,10 +1709,10 @@ class PrometheusAgentMetrics:
         # Suppress repeated warnings about the same unrecognized agent_id.
         # A legacy ID shape would otherwise flood logs on every request.
         # The bounded set caps memory for fleets with many distinct legacy
-        # IDs; the rate limiter below ensures that even fleets that exceed
-        # the set cap (so every new request sees an "unknown" ID) emit at
-        # most one warning per warning_interval seconds, instead of one per
-        # request.
+        # IDs; the rate limiter below bounds the warning rate even when
+        # fleets exceed the set cap (so every new request sees an "unknown"
+        # ID) to at most one warning per warning_interval seconds, instead
+        # of one per request.
         self._warned_agent_ids: set[str] = set()
         self._warned_agent_ids_max: int = 10000
         self._agent_pool_fallthrough_count: int = 0
