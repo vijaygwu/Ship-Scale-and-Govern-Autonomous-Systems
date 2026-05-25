@@ -349,7 +349,7 @@ class TokenRateLimiter:
             if len(self._usage_history) == self._usage_history.maxlen:
                 self._usage_history_dropped += 1
             self._usage_history.append({
-            "timestamp": time.monotonic(),
+                "timestamp": time.monotonic(),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens
             })
