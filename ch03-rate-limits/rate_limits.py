@@ -831,11 +831,22 @@ logger = logging.getLogger(__name__)
 
 
 class BudgetPeriod(Enum):
-    """Time periods for budget allocation."""
+    """Time periods for budget allocation.
+
+    Notes:
+        FIXED_30_DAYS is a rolling 30-day window, not a calendar month.
+        Choose this when the deployment treats spend as a fixed-length
+        rolling budget (e.g., a 30-day burn cap that resets relative to
+        the period_start timestamp). For calendar-aligned billing
+        (1st-of-month rollover, variable 28/29/30/31-day cycle), wire
+        a calendar-aware period upstream and pass the resolved start
+        and end as explicit timestamps; see operator notes in the
+        chapter text.
+    """
     HOURLY = "hourly"
     DAILY = "daily"
     WEEKLY = "weekly"
-    MONTHLY = "monthly"
+    FIXED_30_DAYS = "fixed_30_days"
 
 
 @dataclass
@@ -943,7 +954,7 @@ class Budget:
             return now >= self.period_start + timedelta(days=1)
         elif self.period == BudgetPeriod.WEEKLY:
             return now >= self.period_start + timedelta(weeks=1)
-        elif self.period == BudgetPeriod.MONTHLY:
+        elif self.period == BudgetPeriod.FIXED_30_DAYS:
             return now >= self.period_start + timedelta(days=30)
         return False
     
@@ -1925,7 +1936,7 @@ class GracefulDegradationManager:
             budget_reserved, budget_reservation, msg = (
                 self.budget_manager.reserve_spend(
                     budget_scopes,
-                    [BudgetPeriod.DAILY, BudgetPeriod.MONTHLY],
+                    [BudgetPeriod.DAILY, BudgetPeriod.FIXED_30_DAYS],
                     estimated_cost,
                 )
             )
@@ -2012,7 +2023,7 @@ class GracefulDegradationManager:
                 ) * 0.01
 
             for scope_type, scope_id in self._budget_scopes_for_request(request):
-                for period in [BudgetPeriod.DAILY, BudgetPeriod.MONTHLY]:
+                for period in [BudgetPeriod.DAILY, BudgetPeriod.FIXED_30_DAYS]:
                     within_budget, _, _ = self.budget_manager.check_budget(
                         scope_type, scope_id, period, estimated_cost
                     )
@@ -2157,7 +2168,7 @@ class GracefulDegradationManager:
     ) -> List[Dict]:
         """
         Process queued requests when capacity is available.
-        
+
         Args:
             processor: Function to process a request and return response.
                 Successful processors should record completion using the
@@ -2167,9 +2178,21 @@ class GracefulDegradationManager:
                 per-item timeout. Pass None to use the configuration; set the
                 configuration to None only if the processor enforces its own
                 deadline using the request's ``deadline_at`` field.
-            
+
         Returns:
             List of processed results
+
+        Operator note:
+            When future.cancel() returns False the worker is wedged inside
+            an uncancelable Python C-extension or syscall, so the executor
+            slot stays held until the call returns naturally. We surface
+            this case as the "queue_timeout_uncancelable" counter on
+            self._degradation_events; monitor it for sustained growth.
+            A rising counter means workers are not honoring deadlines and
+            the process likely needs a restart, since Python cannot force
+            a thread out of native code. Pair the counter with a worker
+            saturation alarm (slots held vs. configured capacity) so the
+            on-call sees both signals before throughput collapses.
         """
         results = []
         effective_timeout = (
@@ -3445,7 +3468,7 @@ class AgentCostGovernor:
         )
         self.budget_manager.allocate_budget(
             "organization", org_id,
-            BudgetPeriod.MONTHLY, monthly_budget
+            BudgetPeriod.FIXED_30_DAYS, monthly_budget
         )
     
     def configure_user(
@@ -3533,7 +3556,7 @@ class AgentCostGovernor:
         
         budget_reserved, budget_reservation, msg = self.budget_manager.reserve_spend(
             budget_scopes,
-            [BudgetPeriod.DAILY, BudgetPeriod.MONTHLY],
+            [BudgetPeriod.DAILY, BudgetPeriod.FIXED_30_DAYS],
             estimated_cost,
         )
         if not budget_reserved:

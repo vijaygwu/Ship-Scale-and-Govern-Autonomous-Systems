@@ -54,8 +54,10 @@ logger = logging.getLogger(__name__)
 # Block 1 (chapter listing #1)
 # ============================================================================
 
-# What the logs look like WITHOUT identity infrastructure
-{
+# What the logs look like WITHOUT identity infrastructure.
+# Assigned to a private name so static analyzers do not flag a bare
+# expression; the dict is illustrative, not used at runtime.
+_example_log_without_identity = {
     "timestamp": "2024-03-15T03:14:22Z",
     "event": "trade_executed",
     "symbol": "AAPL",
@@ -63,8 +65,10 @@ logger = logging.getLogger(__name__)
     "agent": "trading-agent"  # Which one? There are 12 instances.
 }
 
-# What the logs look like WITH identity infrastructure
-{
+# What the logs look like WITH identity infrastructure.
+# Same illustrative-only treatment: bound to a private name to keep
+# the module importable and lint-clean.
+_example_log_with_identity = {
     "timestamp": "2024-03-15T03:14:22Z",
     "event": "trade_executed",
     "symbol": "AAPL",
@@ -299,7 +303,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 import jwt
 from cryptography import x509
@@ -750,9 +754,14 @@ class IdentityStore:
         self._audit_log: deque[AuditEvent] = deque(maxlen=audit_log_capacity)
         # Eviction counter: increments each time a full deque drops its oldest
         # event on append. Exposed via the audit_events_dropped property so
-        # operators can spot silent compliance-log loss. A WARN is emitted the
-        # first time an eviction occurs to surface the condition immediately.
+        # operators can spot silent compliance-log loss. We re-emit a WARN
+        # periodically so a single early log line is not the only signal of
+        # sustained sink saturation: see log_audit_event for the cadence.
         self._audit_events_dropped: int = 0
+        # Re-warn every N evictions; the first eviction is always logged
+        # (counter == 1 satisfies % threshold == 1), then we emit every
+        # 1000 evictions so a wedged sink remains visible in operator logs.
+        self._eviction_warn_threshold: int = 1000
         self._revoked_certs: dict[str, datetime] = {}  # serial -> retain-until
         self._revoked_cert_expiry_heap: list[tuple[datetime, str]] = []
         self._max_revoked_cert_records = max_revoked_cert_records
@@ -1102,14 +1111,23 @@ class IdentityStore:
             self._audit_log.maxlen is not None
             and len(self._audit_log) == self._audit_log.maxlen
         ):
-            if self._audit_events_dropped == 0:
-                logger.warning(
-                    "IdentityStore audit log full (maxlen=%d); evicting oldest "
-                    "event. Configure a durable sink to retain compliance "
-                    "history.",
-                    self._audit_log.maxlen,
-                )
             self._audit_events_dropped += 1
+            # Re-emit periodically: the first eviction fires immediately
+            # (counter == 1) and we then re-warn every _eviction_warn_threshold
+            # evictions so a sustained sink outage stays visible instead of
+            # being silenced by a single boot-time WARN.
+            if (
+                self._audit_events_dropped
+                % self._eviction_warn_threshold
+            ) == 1:
+                logger.warning(
+                    "IdentityStore audit log evicting old events "
+                    "(maxlen=%d, total evicted: %d); investigate sink "
+                    "saturation and configure a durable sink to retain "
+                    "compliance history.",
+                    self._audit_log.maxlen,
+                    self._audit_events_dropped,
+                )
         self._audit_log.append(event)
 
     @property
@@ -1289,25 +1307,45 @@ class CertificateAuthority:
     - Revocation checking
     """
     
-    # Custom OID for agent extensions
-    # The arc 1.3.6.1.4.1 is IANA's Private Enterprise Numbers (PEN) space.
-    # Register your organization's PEN at https://pen.iana.org/ to obtain a
-    # unique arc. The example "99999" is illustrative only - replace with your
-    # registered PEN for production use. See ITU-T X.660 for OID structure.
+    # PEN OID arc for agent identity attributes. The 99999 arc below is a
+    # documented placeholder (the IANA Private Enterprise Numbers space under
+    # 1.3.6.1.4.1); deployers MUST replace it with their registered PEN
+    # obtained from https://pen.iana.org/pen/PenApplication.page. Pass a
+    # different arc to __init__ to override at runtime. See ITU-T X.660 for
+    # OID structure.
+    AGENT_ID_OID_ARC: ClassVar[str] = "1.3.6.1.4.1.99999.1"
+
+    # Default OIDs derived from the placeholder arc. Instance attributes set
+    # in __init__ override these when a custom arc is supplied.
     AGENT_ID_OID = x509.ObjectIdentifier("1.3.6.1.4.1.99999.1.1")
     AGENT_PERMISSIONS_OID = x509.ObjectIdentifier("1.3.6.1.4.1.99999.1.2")
     AGENT_OWNER_OID = x509.ObjectIdentifier("1.3.6.1.4.1.99999.1.3")
-    
+
     def __init__(
         self,
         key_vault: KeyVault,
         store: IdentityStore,
-        ca_key_id: str = "ca_intermediate"
+        ca_key_id: str = "ca_intermediate",
+        agent_id_oid_arc: Optional[str] = None,
     ):
         self.key_vault = key_vault
         self.store = store
         self.ca_key_id = ca_key_id
         self._ca_cert: Optional[x509.Certificate] = None
+
+        # Resolve OID arc (per-instance) and derive the three agent OIDs.
+        # When agent_id_oid_arc is None, fall back to the class-level
+        # placeholder so existing call sites keep working unchanged.
+        self.agent_id_oid_arc = agent_id_oid_arc or self.AGENT_ID_OID_ARC
+        self.AGENT_ID_OID = x509.ObjectIdentifier(
+            f"{self.agent_id_oid_arc}.1"
+        )
+        self.AGENT_PERMISSIONS_OID = x509.ObjectIdentifier(
+            f"{self.agent_id_oid_arc}.2"
+        )
+        self.AGENT_OWNER_OID = x509.ObjectIdentifier(
+            f"{self.agent_id_oid_arc}.3"
+        )
     
     async def initialize(
         self,
@@ -2842,7 +2880,12 @@ class AgentIdentityService:
                     # Full jitter on exponential backoff: synchronized
                     # transient failures (e.g., audit store outage) would
                     # otherwise produce a thundering-herd retry storm.
-                    backoff = 0.01 * (2 ** attempt)
+                    # Base scaled to ride out typical 1-2s audit-store
+                    # blips: 0.25s, 0.5s, 1.0s (capped at 2.0s). Worst-case
+                    # total across 3 attempts is ~3.5s with jitter, which
+                    # stays acceptable for an inline audit hop.
+                    base = 0.25 * (2 ** attempt)
+                    backoff = min(2.0, base)
                     await asyncio.sleep(random.uniform(0, backoff))
 
     async def get_audit_log(
@@ -2940,12 +2983,22 @@ class AgentAuthenticator:
 
 
 async def main():
-    """Demonstrate the identity service."""
-    
+    """Demonstrate the identity service.
+
+    Sets ENVIRONMENT=development and AGENT_ENV=development if not already
+    set so the production trip-wires (in-memory KeyVault refusal, empty
+    INTERNAL_NETWORK abort) do not fire in this pedagogical context.
+    Real deployments must set ENVIRONMENT/AGENT_ENV explicitly via the
+    deployment configuration so production behavior is the default and
+    the development overrides are never silently inherited.
+    """
+    os.environ.setdefault("ENVIRONMENT", "development")
+    os.environ.setdefault("AGENT_ENV", "development")
+
     print("=" * 70)
     print("Enterprise Agent Identity Service - Demo")
     print("=" * 70)
-    
+
     # Initialize components
     store = IdentityStore()
     key_vault = KeyVault()

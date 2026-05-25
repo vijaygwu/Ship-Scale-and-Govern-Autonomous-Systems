@@ -278,6 +278,7 @@ import time
 import threading
 from concurrent.futures import (
     Executor,
+    Future,
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,
 )
@@ -406,6 +407,18 @@ class SyncAttemptStillRunningError(TimeoutError):
     """Raised when a timed-out sync attempt cannot be confirmed stopped."""
 
 
+class ExecutorSaturatedError(RuntimeError):
+    """Raised when uncancelable in-flight futures hold every worker slot.
+
+    Signals that the underlying executor cannot accept new sync attempts
+    because previous timed-out operations are still running and could not
+    be cancelled. Callers should treat this as a backpressure signal:
+    fail fast, surface a clear error to clients, and avoid retrying until
+    the wedged work clears (typically by process restart, since Python
+    cannot force a thread out of native code).
+    """
+
+
 @dataclass
 class RetryPolicy:
     """
@@ -439,6 +452,17 @@ class RetryPolicy:
     retry_budget: Optional["RetryBudget"] = None
     attempt_timeout: Optional[float] = None
     sync_timeout_executor: Optional[Executor] = None
+    # Cap on outstanding uncancelable futures. When the set grows to this
+    # size we refuse new submissions rather than letting wedged workers
+    # silently consume executor capacity. Defaults to the default
+    # executor's worker count; override when supplying a larger pool.
+    uncancelable_saturation_limit: int = 4
+    # Set of futures whose .cancel() returned False, meaning the worker
+    # is still running. Discarded automatically when the future completes
+    # via add_done_callback. Default empty set per-instance.
+    _uncancelable_futures: Set[Future] = field(
+        default_factory=set, repr=False, compare=False
+    )
 
     # Shared lazy default executor used when ``attempt_timeout`` is set
     # but no ``sync_timeout_executor`` is supplied. ClassVar keeps the
@@ -642,9 +666,28 @@ class RetryPolicy:
         timeout bounds how long this retry loop waits for the result; if the
         callable is already running in a worker thread, cancellation may not
         stop that underlying work.
+
+        Tracks uncancelable in-flight futures: if a previous attempt timed
+        out with a non-cancellable future, the worker slot is still held.
+        We refuse new submissions once ``uncancelable_saturation_limit``
+        slots are wedged so callers see backpressure instead of silently
+        queuing behind work that may never complete.
         """
         if self.attempt_timeout is None:
             return operation()
+
+        # Pre-submit saturation check: if every slot is held by uncancelable
+        # work, fail fast rather than enqueue behind it. The check is best-
+        # effort under concurrency; the executor enforces the real cap.
+        if len(self._uncancelable_futures) >= self.uncancelable_saturation_limit:
+            raise ExecutorSaturatedError(
+                f"Cannot accept new sync attempts: "
+                f"{len(self._uncancelable_futures)} uncancelable futures "
+                f"are still holding worker slots (limit="
+                f"{self.uncancelable_saturation_limit}). The process likely "
+                "needs a restart since Python cannot force a thread out of "
+                "native code."
+            )
 
         executor = self.sync_timeout_executor or self._get_default_executor()
         future = executor.submit(operation)
@@ -657,14 +700,20 @@ class RetryPolicy:
                 f"of {self.attempt_timeout:.3f}s"
             )
             if not cancelled:
+                # Track the wedged future so we can refuse new submissions
+                # before they queue behind it. The done-callback removes
+                # the entry once the worker finally completes naturally.
+                self._uncancelable_futures.add(future)
+                future.add_done_callback(self._uncancelable_futures.discard)
                 # Log the orphaned future's identity so operators can
                 # correlate this wedge with later cleanup or thread dumps;
                 # id() is sufficient for in-process correlation.
                 logger.warning(
                     "Sync retry attempt timed out with uncancelable future "
-                    "future_id=%d timeout=%.3fs",
+                    "future_id=%d timeout=%.3fs uncancelable_count=%d",
                     id(future),
                     self.attempt_timeout,
+                    len(self._uncancelable_futures),
                 )
                 raise SyncAttemptStillRunningError(
                     f"{message}; underlying work is still running, so retrying "

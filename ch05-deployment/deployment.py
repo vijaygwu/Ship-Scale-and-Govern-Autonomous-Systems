@@ -105,6 +105,9 @@ METRICS_MAX_ATTEMPTS = int(os.environ.get("METRICS_MAX_ATTEMPTS", "2"))
 # clean RuntimeError on the first call so CloudWatch shows the cause.
 _anthropic_client: Anthropic | None = None
 _metrics_table = None
+# CloudWatch client used as a side-channel signal when the primary metric
+# write (DynamoDB) fails; lazy so cold-start cost is paid only on failure.
+_cloudwatch_client = None
 
 
 def _route_timeout_seconds(context: Any) -> float:
@@ -161,6 +164,23 @@ def _get_metrics_table():
             config=_metrics_config(),
         ).Table(table_name)
     return _metrics_table
+
+
+def _get_cloudwatch_client():
+    """Return a process-cached CloudWatch client for side-channel signals.
+
+    Used by the metrics-failure path to emit a lambda_metric_write_failure
+    counter so an alarm can page when the primary DynamoDB write is broken.
+    Lazy so the cold-start cost is paid only when something has already gone
+    wrong with the primary metrics sink.
+    """
+    global _cloudwatch_client
+    if _cloudwatch_client is None:
+        _cloudwatch_client = boto3.client(
+            "cloudwatch",
+            config=_metrics_config(),
+        )
+    return _cloudwatch_client
 
 
 class InquiryRouter:
@@ -261,15 +281,29 @@ def lambda_handler(event: dict, context: Any) -> dict:
                 "remaining_time_ms": context.get_remaining_time_in_millis()
             })
         except Exception as metrics_err:
-            # Best-effort: metric write must not fail the request, but should
-            # not be silent either. Log with full traceback so operators see
-            # chronic failures in CloudWatch Logs.
-            # TODO[prod]: also emit a CloudWatch alarm on metric_name=
-            # "lambda_metric_write_failure" so chronic failures page someone.
+            # Best-effort: metric write must not fail the request, but
+            # failures need operator visibility. Log with full traceback
+            # so chronic failures show up in CloudWatch Logs, then emit
+            # a side-channel CloudWatch counter so an alarm can be wired
+            # to lambda_metric_write_failure and page on sustained loss.
             logger.exception(
                 "CloudWatch metric write failed for request %s: %s",
                 context.aws_request_id, metrics_err,
             )
+            try:
+                _get_cloudwatch_client().put_metric_data(
+                    Namespace="AgentLambda",
+                    MetricData=[{
+                        "MetricName": "lambda_metric_write_failure",
+                        "Value": 1,
+                        "Unit": "Count",
+                    }],
+                )
+            except Exception:  # noqa: BLE001 -- side-channel must not crash
+                # If even the alarm hop fails, the logger.exception above
+                # is the last-resort signal. We swallow rather than fail
+                # the request that already succeeded upstream.
+                pass
         
         return {
             "statusCode": 200,
@@ -554,6 +588,12 @@ class BlueGreenDeployer:
     def __init__(self, config: DeploymentConfig):
         self.config = config
         self._client: Optional[httpx.Client] = None
+        # Snapshot of the selector value (e.g., "blue" or "green") that was
+        # active before switch_traffic() last ran. Captured before we mutate
+        # the Service so rollback() can restore the prior routing target
+        # even if get_active_version() would otherwise observe the new
+        # state and lose the original record.
+        self._previous_selector: Optional[str] = None
 
     # Make the deployer usable as a context manager so callers can ensure
     # the underlying HTTP connection pool is closed deterministically:
@@ -699,7 +739,25 @@ class BlueGreenDeployer:
         return self.config.validation_endpoint.format(version=version)
     
     def switch_traffic(self, target_version: str) -> None:
-        """Update service selector to route traffic to target version."""
+        """Update service selector to route traffic to target version.
+
+        Before mutating the Service, we snapshot the current selector value
+        into self._previous_selector so rollback() can restore the prior
+        routing target without re-reading the API server (which would
+        already reflect the mutation). The snapshot is best-effort: if
+        the pre-read fails we still proceed with the switch and surface a
+        warning, since refusing to deploy on a read failure is worse than
+        a degraded rollback path.
+        """
+        try:
+            self._previous_selector = self.get_active_version() or None
+        except Exception as e:  # pragma: no cover - defensive
+            self._previous_selector = None
+            print(
+                "WARNING: could not snapshot active selector before switch; "
+                f"rollback_to_previous() will be unavailable: {e}"
+            )
+
         patch = f'{{"spec":{{"selector":{{"version":"{target_version}"}}}}}}'
         # Service patches are tiny, fast writes; 30s is a hard upper bound.
         try:
@@ -718,6 +776,21 @@ class BlueGreenDeployer:
                 "traffic switch did not complete"
             ) from e
         print(f"Traffic switched to {target_version}")
+
+    def rollback_to_previous(self) -> None:
+        """Restore the selector value captured before the last switch_traffic.
+
+        Raises:
+            RuntimeError: if switch_traffic() never ran or its pre-read
+                failed, so no prior selector was recorded.
+        """
+        if not self._previous_selector:
+            raise RuntimeError(
+                "No prior selector snapshot; switch_traffic() never ran "
+                "or its pre-read failed. Use rollback() instead, which "
+                "infers the prior color from get_inactive_version()."
+            )
+        self.switch_traffic(self._previous_selector)
 
     def get_inflight_requests(self, version: str) -> Optional[int]:
         """Read the old color's in-flight request count from metrics."""
@@ -979,7 +1052,22 @@ class StageResult:
 
 @dataclass
 class CanaryConfig:
-    """Configuration for canary release."""
+    """Configuration for canary release.
+
+    Relative-comparison thresholds are exposed here so operators can tune
+    them per-deployment without editing analyzer code:
+
+    - ``success_rate_relative_floor`` (default 0.95): the canary's
+      success rate must be at least this fraction of the stable
+      baseline's success rate. 0.95 means "canary may be at most 5
+      percentage-points worse than stable".
+    - ``latency_relative_ceiling`` (default 1.20): the canary's p99
+      latency may be at most this multiple of stable's p99. 1.20 means
+      "canary may be at most 20 percent slower than stable".
+
+    Both numbers should be tuned to the SLO error budget the deployment
+    is willing to spend during the canary window.
+    """
     stages: list[CanaryStage] = field(default_factory=lambda: [
         CanaryStage(weight=5, duration_minutes=10, success_threshold=0.99),
         CanaryStage(weight=25, duration_minutes=15, success_threshold=0.99),
@@ -988,6 +1076,12 @@ class CanaryConfig:
     ])
     prometheus_url: str = "http://prometheus:9090"
     rollback_on_failure: bool = True
+    # Canary success rate must be >= this fraction of stable's success
+    # rate; otherwise the stage is marked DEGRADED.
+    success_rate_relative_floor: float = 0.95
+    # Canary p99 latency may be at most this multiple of stable's p99;
+    # otherwise the stage is marked DEGRADED.
+    latency_relative_ceiling: float = 1.20
 
 
 class CanaryAnalyzer:
@@ -998,6 +1092,8 @@ class CanaryAnalyzer:
         prometheus_url: str,
         query_max_attempts: int = 3,
         query_backoff_seconds: float = 0.2,
+        success_rate_relative_floor: float = 0.95,
+        latency_relative_ceiling: float = 1.20,
     ):
         if query_max_attempts < 1:
             raise ValueError("query_max_attempts must be >= 1")
@@ -1006,6 +1102,12 @@ class CanaryAnalyzer:
         self.prometheus_url = prometheus_url
         self.query_max_attempts = query_max_attempts
         self.query_backoff_seconds = query_backoff_seconds
+        # Relative-comparison thresholds: hoisted out of analyze() so
+        # operators can override per-deployment without editing the
+        # analyzer body. Defaults mirror CanaryConfig defaults; pass
+        # explicit values when constructing the analyzer from a config.
+        self.success_rate_relative_floor = success_rate_relative_floor
+        self.latency_relative_ceiling = latency_relative_ceiling
         self._client: httpx.Client | None = None
         self.last_diagnostics: list[str] = []
 
@@ -1121,17 +1223,27 @@ class CanaryAnalyzer:
         # Check absolute success rate
         if canary_success < success_threshold:
             return CanaryStatus.FAILED
-        
-        # Check relative degradation
-        if stable_success > 0 and canary_success < stable_success * 0.95:
+
+        # Check relative degradation against stable. The floor is taken
+        # from self.success_rate_relative_floor (default 0.95) so the
+        # threshold is configurable per-deployment via CanaryConfig.
+        if (
+            stable_success > 0
+            and canary_success < stable_success * self.success_rate_relative_floor
+        ):
             return CanaryStatus.DEGRADED
-        
-        # Check latency regression: 20% is a placeholder default that should
-        # be tuned to your SLO error budget. Different teams reasonably use
-        # 5%, 10%, or 25% depending on customer sensitivity.
-        if stable_latency > 0 and canary_latency > stable_latency * 1.2:
+
+        # Check latency regression: the ceiling is taken from
+        # self.latency_relative_ceiling (default 1.20) so each team can
+        # tune to its SLO error budget without editing analyzer code.
+        # Different teams reasonably use 1.05, 1.10, or 1.25 depending
+        # on customer sensitivity.
+        if (
+            stable_latency > 0
+            and canary_latency > stable_latency * self.latency_relative_ceiling
+        ):
             return CanaryStatus.DEGRADED
-        
+
         return CanaryStatus.HEALTHY
 
 
