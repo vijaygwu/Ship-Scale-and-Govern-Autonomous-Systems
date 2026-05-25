@@ -1354,6 +1354,15 @@ class CircuitBreakerRegistry:
                     cls._instance._breakers: "OrderedDict[str, CircuitBreaker]" = OrderedDict()
                     cls._instance._max_breakers = max_breakers
                     cls._instance._eviction_warned = False
+                    return cls._instance
+        if max_breakers != cls._instance._max_breakers:
+            logger.warning(
+                "CircuitBreakerRegistry already initialized with "
+                "max_breakers=%d; ignoring new value %d. Singleton "
+                "initialization is one-shot.",
+                cls._instance._max_breakers,
+                max_breakers,
+            )
         return cls._instance
 
     def register(

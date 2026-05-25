@@ -548,7 +548,7 @@ class MockLLM:
         })
 
         # Check for simulated error
-        if self._error_on_call == len(self._call_history) - 1:
+        if self._error_on_call == self._total_call_count - 1:
             raise self._error_type("Simulated error")
 
         return self._find_response(messages)
@@ -577,9 +577,9 @@ class MockLLM:
             "streaming": True,
         })
         
-        if self._error_on_call == len(self._call_history) - 1:
+        if self._error_on_call == self._total_call_count - 1:
             raise self._error_type("Simulated error")
-        
+
         response = self._find_response(messages)
         yield from self._generate_stream(response)
 

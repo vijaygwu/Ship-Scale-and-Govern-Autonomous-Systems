@@ -1280,8 +1280,8 @@ class SecretManager:
             for callback in self._rotation_callbacks.get(secret_id, []):
                 try:
                     callback(secret_id, metadata.version)
-                except Exception as e:
-                    logger.error(f"Rotation callback failed: {e}")
+                except Exception:
+                    logger.exception("Rotation callback failed")
             
             self._audit(
                 "secret_rotation",
@@ -1451,8 +1451,8 @@ class SecretManager:
         for secret_id, callback in due_callbacks:
             try:
                 callback(secret_id, "rotation_due")
-            except Exception as e:
-                logger.error(f"Rotation callback failed: {e}")
+            except Exception:
+                logger.exception("Rotation callback failed")
 
     def close(self) -> None:
         """Close the secret manager, stop monitoring, and drop cached secrets."""
