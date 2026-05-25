@@ -1393,6 +1393,16 @@ class RedisBackend(FlagBackend):
 
     def __del__(self) -> None:
         # Best-effort cleanup if callers forget to call close() explicitly.
+        # We refuse to run during interpreter shutdown because the order of
+        # __del__ calls is non-deterministic at that point: the redis client
+        # may already have torn down its socket module, and the backend's own
+        # __del__ may have already invoked close() against the same client.
+        # Production callers should manage lifetime via try/finally or a
+        # context manager; this remains as a guard against pure-development
+        # forgetfulness.
+        import sys as _sys
+        if _sys.is_finalizing():
+            return
         self.close()
 
 

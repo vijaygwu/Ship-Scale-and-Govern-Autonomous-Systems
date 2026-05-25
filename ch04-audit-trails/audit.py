@@ -1630,7 +1630,7 @@ chains, detecting any tampering or corruption.
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator

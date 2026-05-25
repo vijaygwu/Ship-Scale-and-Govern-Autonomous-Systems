@@ -2002,6 +2002,35 @@ class AgentTestHarness:
                 "results": [r.to_dict() for r in self._results],
             }, f, indent=2)
 
+    def close(self) -> None:
+        """Shut down the lazy synchronous-run executor if it was created.
+
+        Explicit shutdown is preferred over relying on garbage collection
+        because ``__del__`` ordering during interpreter shutdown is
+        non-deterministic. Callers should use ``try/finally`` or the
+        context-manager protocol below.
+        """
+        executor = getattr(self, "_sync_run_executor", None)
+        if executor is None:
+            return
+        lock = getattr(self, "_sync_run_lock", None)
+        if lock is not None:
+            with lock:
+                if getattr(self, "_sync_executor_closed", False):
+                    return
+                self._sync_executor_closed = True
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            # Shutdown should never raise; we have no recourse here.
+            pass
+
+    def __enter__(self) -> "AgentTestHarness":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
 
 class MetricsCollector:
     """Collects metrics from agent runs."""
