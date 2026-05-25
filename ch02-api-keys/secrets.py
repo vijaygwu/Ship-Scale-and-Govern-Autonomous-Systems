@@ -405,7 +405,7 @@ class SecretRetryExhaustedError(Exception):
 
     Distinct from the underlying transport error so callers can tell
     "we gave up after N attempts" apart from "this is a fatal error
-    that should not be retried" (e.g.\\ a Forbidden response).
+    that should not be retried" (e.g. a Forbidden response).
     """
     pass
 
