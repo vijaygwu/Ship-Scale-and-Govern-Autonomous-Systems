@@ -1490,7 +1490,7 @@ class BudgetManager:
                 hours_remaining = 168 - (
                     (datetime.now(timezone.utc) - budget.period_start).total_seconds() / 3600
                 )
-            else:  # Monthly
+            else:  # FIXED_30_DAYS
                 hours_remaining = 720 - (
                     (datetime.now(timezone.utc) - budget.period_start).total_seconds() / 3600
                 )
