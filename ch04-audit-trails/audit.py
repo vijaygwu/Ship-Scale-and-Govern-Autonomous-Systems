@@ -83,6 +83,7 @@ Code Navigation (line numbers are approximate):
 
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -223,49 +224,75 @@ class PIITokenizer:
     Replaces detected PII with tokens that can be resolved through
     a separate, access-controlled mapping service.
 
-    Note on cache eviction: when the bounded LRU cache evicts under
-    pressure, re-tokenization of the same PII yields a new token. For
-    audit consistency across long time-windows, either persist the
-    mapping to durable storage (the access-controlled service) or use
-    a deterministic hash-based token instead of the random uuid4 token
-    used here.
+    Tokens are deterministic: we compute HMAC-SHA256(secret, plaintext)
+    and use the leading 16 hex characters as the token suffix. The same
+    plaintext therefore maps to the same token across cache evictions,
+    process restarts, and parallel workers, as long as the same secret
+    is in scope. The cache is a performance optimization, not a
+    correctness mechanism. Rotate the secret to invalidate all tokens
+    at once.
     """
-    
-    def __init__(self, detector: PIIDetector | None = None):
+
+    def __init__(
+        self,
+        secret: bytes,
+        detector: PIIDetector | None = None,
+    ):
+        if not secret or len(secret) < 16:
+            raise ValueError(
+                "PIITokenizer requires a secret of at least 16 bytes. "
+                "Generate one via secrets.token_bytes(32) and store it "
+                "alongside other rotation-managed secrets; tokens become "
+                "linkable across processes and restarts only when the "
+                "same secret is in scope."
+            )
+        self._secret = secret
         self._detector = detector
         # Bounded LRU keeps the in-process plaintext->token map from growing
-        # without bound. In production, persist this mapping (encrypted) in
-        # the access-controlled service described in the class docstring and
+        # without bound. Eviction is safe because tokens are deterministic:
+        # re-tokenizing the same plaintext after eviction returns the same
+        # token. In production, persist this mapping (encrypted) in the
+        # access-controlled service described in the class docstring and
         # look up on demand rather than retaining plaintext PII in memory.
         from cachetools import LRUCache
         self._token_map: LRUCache = LRUCache(maxsize=10000)
         self._lock = threading.Lock()
-    
+
     def tokenize(self, value: str) -> str:
         """Replace PII with tokens."""
         if not self._detector:
             return value
-        
+
         detections = self._detector.detect(value)
         if not detections:
             return value
-        
+
         # Process detections in reverse order to preserve positions
         result = value
         for start, end, pii_type in sorted(detections, reverse=True):
             original = value[start:end]
             token = self._get_or_create_token(original, pii_type)
             result = result[:start] + token + result[end:]
-        
+
         return result
-    
+
     def _get_or_create_token(self, original: str, pii_type: str) -> str:
-        """Get existing token or create new one for PII value."""
+        """Get existing token or create new one for PII value.
+
+        Deterministic: HMAC-SHA256(secret, plaintext)[:16] hex chars so
+        the same plaintext maps to the same token across cache evictions,
+        process restarts, and parallel workers (assuming they share the
+        secret). The cache becomes a performance optimization, not a
+        correctness mechanism.
+        """
         with self._lock:
             if original not in self._token_map:
-                token_id = hashlib.sha256(
-                    f"{original}:{uuid4()}".encode()
-                ).hexdigest()[:12]
+                digest = hmac.new(
+                    self._secret,
+                    original.encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+                token_id = digest[:16]
                 self._token_map[original] = f"[PII:{pii_type}:{token_id}]"
             return self._token_map[original]
 
@@ -371,6 +398,13 @@ class _SinkChainState:
     previous_hash: str = "genesis"
     next_write_sequence_num: int = 1
     disabled_reason: str | None = None
+    # Timestamp at which the sink was disabled, used to drive auto-recovery
+    # after the cooldown elapses. None whenever the sink is enabled.
+    disabled_at: datetime | None = None
+    # Per-sink cooldown before the next write attempts the sink again. Five
+    # minutes is a reasonable default that absorbs transient outages without
+    # hammering a sink that is still degraded.
+    cooldown_seconds: float = 300.0
     condition: threading.Condition = field(
         default_factory=threading.Condition,
         repr=False,
@@ -612,6 +646,45 @@ class AuditLogger:
         a metric-shaped dict ``{'sink_name', 'failure_count', 'last_error'}``.
         Intended for wiring to chapter 6's ``PrometheusAgentMetrics``."""
         self._failure_counter_hook = hook
+
+    def _resolve_sink_state(self, sink_name: str) -> _SinkChainState:
+        """Locate a sink's chain state by class name (the operator-visible id).
+
+        The lookup matches against ``type(sink).__name__`` for each
+        configured sink. Names must be unique within an AuditLogger; if
+        callers run multiple sinks of the same type they should subclass
+        for distinct names.
+        """
+        for sink, state in zip(self._sinks, self._sink_chain_states):
+            if type(sink).__name__ == sink_name:
+                return state
+        raise KeyError(f"Unknown sink: {sink_name}")
+
+    def reset_sink(self, sink_name: str) -> None:
+        """Operator-callable: re-enable a previously disabled sink immediately.
+
+        Resets the ``disabled_reason`` and ``disabled_at`` fields so the next
+        write attempts the sink again. Use after fixing whatever caused the
+        original disable; otherwise wait for the cooldown-driven auto-recovery
+        path to retry on its own schedule.
+        """
+        state = self._resolve_sink_state(sink_name)
+        with state.condition:
+            state.disabled_reason = None
+            state.disabled_at = None
+        logging.info(
+            "Sink %s manually reset; will retry on next write", sink_name,
+        )
+
+    def set_sink_cooldown(
+        self, sink_name: str, cooldown_seconds: float,
+    ) -> None:
+        """Override the auto-recovery cooldown for a specific sink."""
+        if cooldown_seconds < 0:
+            raise ValueError("cooldown_seconds must be non-negative")
+        state = self._resolve_sink_state(sink_name)
+        with state.condition:
+            state.cooldown_seconds = cooldown_seconds
     
     @contextmanager
     def session(
@@ -782,6 +855,22 @@ class AuditLogger:
                 timestamp=timestamp,
             )
 
+            # Auto-recovery: if the sink has been disabled long enough that its
+            # cooldown elapsed, clear the disable so the next write attempts
+            # the sink again. A still-broken sink will re-disable immediately
+            # after the failed write; a transient outage is now self-healing.
+            if state.disabled_at is not None:
+                elapsed = (
+                    datetime.now(timezone.utc) - state.disabled_at
+                ).total_seconds()
+                if elapsed >= state.cooldown_seconds:
+                    logging.info(
+                        "Sink %s cooldown expired (%.0fs); attempting recovery",
+                        type(sink).__name__, elapsed,
+                    )
+                    state.disabled_reason = None
+                    state.disabled_at = None
+
             disabled_reason = state.disabled_reason
 
         if disabled_reason is not None:
@@ -815,6 +904,9 @@ class AuditLogger:
                     )
                 else:
                     state.disabled_reason = "write failed before acknowledgement"
+                    # Start the cooldown clock so auto-recovery can re-enable
+                    # the sink once the timeout elapses.
+                    state.disabled_at = datetime.now(timezone.utc)
                 state.next_write_sequence_num += 1
                 state.condition.notify_all()
 

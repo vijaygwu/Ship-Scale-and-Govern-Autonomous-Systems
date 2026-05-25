@@ -1517,6 +1517,7 @@ from typing import Optional, Dict, List, Callable, Any, Tuple
 from enum import Enum
 from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import statistics
 import time
 import logging
 import uuid
@@ -1634,6 +1635,13 @@ class GracefulDegradationManager:
     )
     _queue_processor_slots: threading.BoundedSemaphore = field(
         init=False,
+        repr=False,
+    )
+    # Rolling window of recent processor latencies in seconds. Bounded at 100
+    # samples so a long-running process keeps a representative recent view
+    # instead of an all-time average dragged by stale tail latency.
+    _processing_latency: "deque[float]" = field(
+        default_factory=lambda: deque(maxlen=100),
         repr=False,
     )
 
@@ -1831,7 +1839,7 @@ class GracefulDegradationManager:
             self._request_queue.append(queue_entry)
 
             queue_position = len(self._request_queue)
-            estimated_wait = self._estimate_queue_wait()
+            estimated_wait = self._estimate_queue_wait(queue_position)
 
             return {
                 "success": True,
@@ -2097,11 +2105,21 @@ class GracefulDegradationManager:
             self._last_delay = delay
         return delay
     
-    def _estimate_queue_wait(self) -> float:
-        """Estimate queue wait time based on processing rate."""
-        # Simple estimate: 5 seconds per queued item
+    def _estimate_queue_wait(self, queue_position: int) -> float:
+        """Estimate wait time for an item at the given queue position.
+
+        Uses the rolling average of recent processing latencies (last 100
+        items). Falls back to a 5-second default until enough history
+        accumulates so freshly started managers still return a sane number
+        instead of zero.
+        """
         with self._lock:
-            return len(self._request_queue) * 5.0
+            samples = list(self._processing_latency)
+        if not samples:
+            avg_latency = 5.0  # fallback when no telemetry available yet
+        else:
+            avg_latency = statistics.mean(samples)
+        return queue_position * avg_latency
     
     def _compute_cache_key(self, request: Dict) -> str:
         """Generate a cache key for a request."""
@@ -2262,6 +2280,7 @@ class GracefulDegradationManager:
                 self._request_queue.popleft()
 
             processor_request = governed_request
+            processor_start = time.monotonic()
             if effective_timeout is not None:
                 processor_request = {
                     **governed_request,
@@ -2323,6 +2342,15 @@ class GracefulDegradationManager:
                 except Exception:
                     self._refund_reserved_capacity(processor_request)
                     raise
+
+            # Record processing latency for the rolling queue-wait estimate.
+            # Only successful, non-timed-out runs contribute, so a stuck
+            # processor cannot poison the rolling average and stall callers
+            # with permanently inflated wait predictions.
+            if not timed_out:
+                processor_elapsed = time.monotonic() - processor_start
+                with self._lock:
+                    self._processing_latency.append(processor_elapsed)
 
             if timed_out:
                 if refund_after_timeout:

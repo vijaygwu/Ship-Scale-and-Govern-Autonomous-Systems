@@ -303,7 +303,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, Callable, ClassVar, Optional
 
 import jwt
 from cryptography import x509
@@ -762,6 +762,10 @@ class IdentityStore:
         # (counter == 1 satisfies % threshold == 1), then we emit every
         # 1000 evictions so a wedged sink remains visible in operator logs.
         self._eviction_warn_threshold: int = 1000
+        # Optional Prometheus-style hook fired on each audit-deque eviction.
+        # Operators wire this to ch06's PrometheusAgentMetrics so chronic
+        # audit-log saturation is dashboard-visible, not just log-visible.
+        self._audit_events_dropped_hook: Optional[Callable[[dict], None]] = None
         self._revoked_certs: dict[str, datetime] = {}  # serial -> retain-until
         self._revoked_cert_expiry_heap: list[tuple[datetime, str]] = []
         self._max_revoked_cert_records = max_revoked_cert_records
@@ -1128,13 +1132,35 @@ class IdentityStore:
                     self._audit_log.maxlen,
                     self._audit_events_dropped,
                 )
+            if self._audit_events_dropped_hook is not None:
+                try:
+                    self._audit_events_dropped_hook({
+                        "evicted_count": self._audit_events_dropped,
+                        "event_type": getattr(
+                            event, "event_type", "unknown"
+                        ),
+                    })
+                except Exception:  # noqa: BLE001 -- hook must not crash audit pipeline
+                    logger.exception(
+                        "audit_events_dropped_hook raised; suppressed"
+                    )
         self._audit_log.append(event)
 
     @property
     def audit_events_dropped(self) -> int:
         """Number of audit events silently evicted by deque overflow."""
         return self._audit_events_dropped
-    
+
+    def set_audit_events_dropped_hook(
+        self,
+        hook: Callable[[dict], None],
+    ) -> None:
+        """Register a callback invoked on each audit-deque eviction with a
+        metric-shaped dict {'evicted_count': int, 'event_type': str}. Intended
+        for wiring to ch06 PrometheusAgentMetrics so chronic audit-log
+        saturation is dashboard-visible."""
+        self._audit_events_dropped_hook = hook
+
     async def query_audit_log(
         self,
         agent_id: Optional[str] = None,

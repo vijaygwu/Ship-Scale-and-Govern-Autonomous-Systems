@@ -2533,9 +2533,9 @@ class SIEMAuditLogger(AuditLogger):
 
         Returns ``False`` if the queue could not drain or the worker could not
         stop before the timeout. Any events still waiting in the delivery queue
-        after a flush timeout are moved into the failed-event buffer so callers
-        can retry them with ``drain_failed_events()`` instead of losing them on
-        process exit.
+        after a flush timeout or a worker-join timeout are moved into the
+        failed-event buffer so callers can retry them with
+        ``drain_failed_events()`` instead of losing them on process exit.
         """
         if timeout < 0:
             raise ValueError("timeout must be >= 0")
@@ -2548,7 +2548,7 @@ class SIEMAuditLogger(AuditLogger):
         buffered_count = 0
         if not drained:
             self._shutdown_event.set()
-            buffered_count = self._buffer_undrained_queue(
+            buffered_count += self._buffer_undrained_queue(
                 "SIEM audit logger closed before delivery queue drained"
             )
             logger.error(
@@ -2570,8 +2570,16 @@ class SIEMAuditLogger(AuditLogger):
 
         stopped = not self._worker_thread.is_alive()
         if not stopped:
-            logger.error(
-                "SIEM audit worker did not stop before close timeout",
+            # Always drain any remaining events to the DLQ on join-timeout,
+            # whether or not the queue drained cleanly earlier. Events sitting
+            # behind a wedged worker would otherwise be silently lost when the
+            # caller drops its reference to this logger.
+            buffered_count += self._buffer_undrained_queue(
+                "SIEM audit worker did not exit before close timeout"
+            )
+            logger.warning(
+                "SIEM audit worker did not stop before close timeout; "
+                "remaining queue contents buffered to DLQ.",
                 extra={
                     "client_id": self._client_id,
                     "queue_drained": drained,

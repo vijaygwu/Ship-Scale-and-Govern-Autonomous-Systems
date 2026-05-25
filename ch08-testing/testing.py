@@ -364,6 +364,9 @@ class MockLLM:
         # suites; raise it for replay-heavy integration runs.
         self._max_history = max_history
         self._call_history: deque[dict[str, Any]] = deque(maxlen=max_history)
+        # Separate, unbounded counter so call_count stays accurate after
+        # the ring buffer saturates and starts evicting old records.
+        self._total_call_count: int = 0
         # Track silent eviction so property-based tests don't lose evidence
         # without warning the developer.
         self._evicted_count: int = 0
@@ -386,6 +389,7 @@ class MockLLM:
                     stacklevel=3,
                 )
         self._call_history.append(entry)
+        self._total_call_count += 1
 
     @property
     def evicted_count(self) -> int:
@@ -436,13 +440,19 @@ class MockLLM:
         """Reset the mock to initial state."""
         self._call_index = 0
         self._call_history.clear()
+        self._total_call_count = 0
         self._evicted_count = 0
         self._eviction_warned = False
-    
+
     @property
     def call_count(self) -> int:
-        """Number of times the mock has been called."""
-        return len(self._call_history)
+        """Total number of model calls; unbounded counter.
+
+        For inspecting the most recent calls, use call_history; that
+        deque is bounded at max_history (default 1000) but call_count
+        reflects the total regardless of history truncation.
+        """
+        return self._total_call_count
     
     @property
     def call_history(self) -> list[dict[str, Any]]:
@@ -754,6 +764,7 @@ import ast
 import operator
 import pytest
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -818,21 +829,35 @@ class ToolRegistry:
 
 
 class Agent:
-    """Small deterministic agent used only by this flat companion file."""
+    """Small deterministic agent used only by this flat companion file.
+
+    conversation_history is bounded at max_history (default 10000) to
+    prevent unbounded memory growth across long-running run()
+    invocations; max_context_messages truncates per-call context but
+    the underlying history needs its own bound.
+    """
 
     def __init__(
         self,
         llm: MockLLM,
         tools: ToolRegistry,
         config: AgentConfig | None = None,
+        max_history: int = 10000,
     ) -> None:
         self.llm = llm
         self.tools = tools
         self.config = config or AgentConfig()
-        self.conversation_history: list[dict[str, Any]] = []
+        self.max_history = max_history
+        self.conversation_history: deque[dict[str, Any]] = deque(
+            maxlen=max_history,
+        )
 
     def _messages_for(self, user_message: str) -> list[dict[str, Any]]:
-        history = self.conversation_history[-self.config.max_context_messages:]
+        # deque doesn't support slicing, so materialize the trailing
+        # window through a list copy first.
+        history = list(self.conversation_history)[
+            -self.config.max_context_messages:
+        ]
         return [
             {"role": "system", "content": "You are a helpful test agent."},
             *history,
@@ -879,13 +904,17 @@ class Agent:
             if not response.tool_calls:
                 final_response = response.content or ""
                 messages.append({"role": "assistant", "content": final_response})
-                self.conversation_history = [
+                # Refill the bounded deque in place so the maxlen bound is
+                # preserved across run() invocations.
+                trimmed = [
                     m for m in messages if m["role"] != "system"
                 ][-self.config.max_context_messages:]
+                self.conversation_history.clear()
+                self.conversation_history.extend(trimmed)
                 return SimpleAgentResult(
                     final_response=final_response,
                     tool_calls=tool_calls,
-                    conversation_history=self.conversation_history,
+                    conversation_history=list(self.conversation_history),
                     has_error=has_error,
                     error=error,
                 )
@@ -915,7 +944,7 @@ class Agent:
             final_response="Stopped after reaching the iteration limit.",
             tool_calls=tool_calls,
             task_completed=False,
-            conversation_history=self.conversation_history,
+            conversation_history=list(self.conversation_history),
             has_error=True,
             error=RuntimeError("iteration limit reached"),
         )
@@ -1920,7 +1949,7 @@ class AgentTestHarness:
                 final_response=result.final_response,
                 tool_calls=result.tool_calls,
                 task_completed=result.task_completed,
-                conversation_history=agent.conversation_history,
+                conversation_history=list(agent.conversation_history),
                 metadata=result.metadata,
             )
             

@@ -1383,6 +1383,7 @@ Supports multiple backends and provides type-safe flag access.
 """
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -1640,8 +1641,11 @@ class FeatureFlagManager:
         self.backends = backends
         self.cache_ttl_seconds = cache_ttl_seconds
         # Bounded TTL cache prevents unbounded growth while ensuring Redis or
-        # LaunchDarkly kill-switch changes are observed promptly.
-        self._cache: dict[str, tuple[Any, float]] = {}
+        # LaunchDarkly kill-switch changes are observed promptly. Backed by an
+        # OrderedDict so eviction is true LRU rather than insertion-order
+        # FIFO; this matters when one hot key is read repeatedly and would
+        # otherwise be evicted before colder neighbours.
+        self._cache: "OrderedDict[str, tuple[Any, float]]" = OrderedDict()
         self._cache_max_size = 100_000
         self._cache_lock = threading.RLock()
 
@@ -1656,6 +1660,8 @@ class FeatureFlagManager:
             if expires_at <= time.monotonic():
                 self._cache.pop(cache_key, None)
                 return False, None
+            # Mark as recently used so it survives the next eviction sweep.
+            self._cache.move_to_end(cache_key, last=True)
             return True, value
 
     def _set_cached(self, cache_key: str, value: Any) -> None:
@@ -1664,12 +1670,15 @@ class FeatureFlagManager:
             return
 
         with self._cache_lock:
-            # Evict an arbitrary entry once over the bound (simple FIFO via
-            # iteration order; use a dedicated cache if eviction policy matters).
-            if len(self._cache) >= self._cache_max_size:
+            # LRU eviction via OrderedDict.move_to_end: re-write of an
+            # existing key marks it recently used; otherwise evict the
+            # least-recently-used entry (first item) before insertion.
+            if cache_key in self._cache:
+                self._cache.move_to_end(cache_key, last=True)
+            elif len(self._cache) >= self._cache_max_size:
                 try:
-                    self._cache.pop(next(iter(self._cache)))
-                except StopIteration:
+                    self._cache.popitem(last=False)
+                except KeyError:
                     pass
             self._cache[cache_key] = (
                 value,

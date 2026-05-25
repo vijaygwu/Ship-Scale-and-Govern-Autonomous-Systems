@@ -123,7 +123,10 @@ def audit_module(import_chapter):
 
 def test_audit_session_writes_tokenized_tamper_evident_chain(audit_module):
     sink = MemorySink()
-    tokenizer = audit_module.PIITokenizer(detector=EmailDetector())
+    tokenizer = audit_module.PIITokenizer(
+        secret=b"unit-test-pii-secret-32-bytes-okx",
+        detector=EmailDetector(),
+    )
     logger = audit_module.AuditLogger(
         agent_id="agent-audit-test",
         agent_version="1.0.0",
